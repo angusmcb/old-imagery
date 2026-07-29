@@ -185,13 +185,18 @@ class WayBack:
         }
         url = layer.metadata_query_url(tile.level) + "?" + _query_string(query)
         payload = self._json(url)
+        # Fall back to the release date when the metadata service gives us
+        # nothing usable.  _json returns None on a failed or unparseable
+        # response; the try covers a payload that parsed but is shaped
+        # differently from what we expect.
         date = layer.date
-        try:
-            millis = payload["features"][0]["attributes"]["SRC_DATE2"]
-            if millis is not None:
-                date = _dt.datetime.fromtimestamp(millis / 1000, _dt.timezone.utc).date()
-        except (TypeError, KeyError, IndexError):
-            pass
+        if payload is not None:
+            try:
+                millis = payload["features"][0]["attributes"]["SRC_DATE2"]
+                if millis is not None:
+                    date = _dt.datetime.fromtimestamp(millis / 1000, _dt.timezone.utc).date()
+            except (TypeError, KeyError, IndexError):
+                pass
 
         with self._lock:
             self._date_cache[key] = date
@@ -272,9 +277,9 @@ class WayBack:
 
         # A release published before min_date cannot contain imagery captured
         # after it, so those releases can be dropped outright.
-        layers = [l for l in self.layers if min_date is None or l.date >= min_date]
+        layers = [layer for layer in self.layers if min_date is None or layer.date >= min_date]
         # Oldest first, so the max_date short-circuit below can cut the tail.
-        layers.sort(key=lambda l: l.date)
+        layers.sort(key=lambda layer: layer.date)
         if not layers:
             return []
 
@@ -310,9 +315,12 @@ class WayBack:
             with lock:
                 if matched:
                     wanted.extend(matched)
-                elif saw_later:
+                elif saw_later:  # noqa: SIM102
                     # Nothing here was captured before max_date, so no later
-                    # release will have anything either.
+                    # release will have anything either.  Left nested rather
+                    # than collapsed: whether this is a saw_later case, and
+                    # whether it is the earliest such date, are separate
+                    # questions, and merging them buries this comment.
                     if cancel_after[0] is None or layer.date < cancel_after[0]:
                         cancel_after[0] = layer.date
 
@@ -424,7 +432,11 @@ class WayBack:
             return None
         try:
             frame = gpd.read_file(io.BytesIO(raw))
-        except Exception:
+        except Exception:  # noqa: BLE001
+            # Deliberately broad: read_file dispatches to GDAL/pyogrio drivers
+            # whose failure modes on unexpected bytes are not a stable, listable
+            # set.  One unreadable release degrades to None rather than
+            # aborting the whole availability call.
             return None
         rows = _rows_to_dated_geometries(frame)
         return rows[0][1] if rows else None
@@ -474,7 +486,9 @@ def _rows_to_dated_geometries(frame) -> list[tuple[_dt.date, object]]:
         frame = frame.to_crs("EPSG:4326")
 
     out: list[tuple[_dt.date, object]] = []
-    for date_value, geom in zip(frame.get("SRC_DATE2"), frame.geometry):
+    # strict=True is safe: both operands are columns of the same frame and so
+    # are equal length by construction; a mismatch would mean real corruption.
+    for date_value, geom in zip(frame.get("SRC_DATE2"), frame.geometry, strict=True):
         if geom is None or date_value is None:
             continue
         date = _coerce_date(date_value)
@@ -482,7 +496,7 @@ def _rows_to_dated_geometries(frame) -> list[tuple[_dt.date, object]]:
             continue
         if not geom.is_valid:
             # Capture footprints are routinely self-intersecting.
-            geom = make_valid(geom)
+            geom = make_valid(geom)  # noqa: PLW2901 — intentional narrowing rebind
             if geom.is_empty:
                 continue
         out.append((date, geom))

@@ -8,8 +8,8 @@ from __future__ import annotations
 import datetime as _dt
 import struct
 import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 MAX_LEVEL = 30
 TILE_SIZE = 256
@@ -78,7 +78,7 @@ class KeyholeTile:
 
     # -- construction ------------------------------------------------------
     @classmethod
-    def from_row_col(cls, row: int, col: int, level: int) -> "KeyholeTile":
+    def from_row_col(cls, row: int, col: int, level: int) -> KeyholeTile:
         num_tiles = validate_level(level)
         if not (0 <= row < num_tiles) or not (0 <= col < num_tiles):
             raise ValueError(f"row/col out of range for level {level}")
@@ -92,7 +92,7 @@ class KeyholeTile:
         return cls("".join(chars))
 
     @classmethod
-    def from_lat_lon(cls, lat: float, lon: float, level: int) -> "KeyholeTile":
+    def from_lat_lon(cls, lat: float, lon: float, level: int) -> KeyholeTile:
         return cls.from_row_col(_deg_to_row_col(lat, level), _deg_to_row_col(lon, level), level)
 
     # -- addressing --------------------------------------------------------
@@ -127,12 +127,12 @@ class KeyholeTile:
     def column(self) -> int:
         return self.row_col[1]
 
-    def parent(self) -> "KeyholeTile":
+    def parent(self) -> KeyholeTile:
         if self.level == 0:
             raise ValueError("The root tile has no parent")
         return KeyholeTile(self.path[:-1])
 
-    def index_paths(self) -> Iterator["KeyholeTile"]:
+    def index_paths(self) -> Iterator[KeyholeTile]:
         """The intermediate packet paths between the root and this tile."""
         for end in range(_SUBINDEX_MAX_SZ, len(self.path), _SUBINDEX_MAX_SZ):
             yield KeyholeTile(self.path[:end])
@@ -354,7 +354,9 @@ def _traverse(quanta, channels, nodes, node_index: int, qt_path: str, is_root: b
 
     for i in range(4):
         if children & (1 << i):
-            node_index = _traverse(quanta, channels, nodes, node_index + 1, qt_path + str(i), is_root)
+            node_index = _traverse(
+                quanta, channels, nodes, node_index + 1, qt_path + str(i), is_root
+            )
     return node_index
 
 

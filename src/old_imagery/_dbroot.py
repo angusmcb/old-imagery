@@ -65,9 +65,7 @@ class DbRoot:
         raw = client.get(self._dbroot_url(database), max_age=_DBROOT_MAX_AGE)
         enc = _proto.EncryptedDbRootProto.FromString(raw)
         self._key = enc.encryption_data
-        self.proto = _proto.DbRootProto.FromString(
-            decompress(decrypt(enc.dbroot_data, self._key))
-        )
+        self.proto = _proto.DbRootProto.FromString(decompress(decrypt(enc.dbroot_data, self._key)))
 
     # -- construction ------------------------------------------------------
     @staticmethod
@@ -88,8 +86,7 @@ class DbRoot:
         if self.database is Database.DEFAULT:
             return f"https://kh.google.com/flatfile?q2-{tile.path}-q.{epoch}"
         return (
-            f"https://khmdb.google.com/flatfile?db={self.database.value}"
-            f"&qp-{tile.path}-q.{epoch}"
+            f"https://khmdb.google.com/flatfile?db={self.database.value}&qp-{tile.path}-q.{epoch}"
         )
 
     def _get_packet(self, tile: KeyholeTile, epoch: int):

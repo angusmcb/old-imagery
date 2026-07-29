@@ -207,9 +207,7 @@ def availability(
 
 def _use_region_query(backend, n_tiles: int, method: str = "auto") -> bool:
     if method not in ("auto", "region", "per-tile"):
-        raise ValueError(
-            f"Unknown method {method!r}; expected 'auto', 'region' or 'per-tile'"
-        )
+        raise ValueError(f"Unknown method {method!r}; expected 'auto', 'region' or 'per-tile'")
     if method == "per-tile":
         return False
     supported = hasattr(backend, "dated_regions")
@@ -450,7 +448,11 @@ def _decode_image(raw: bytes) -> np.ndarray | None:
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
             with MemoryFile(raw, ext=".jpg") as mem, mem.open() as src:
                 arr = src.read()
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Deliberately broad: a tile's bytes come from a remote service and may
+        # be truncated, HTML, or a format GDAL rejects in driver-specific ways.
+        # An undecodable tile is left black and masked out, per the README, so
+        # one bad tile must not abort the mosaic.
         return None
 
     if arr.dtype != np.uint8:

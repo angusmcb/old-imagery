@@ -57,7 +57,7 @@ def test_google_download_bounds_match_the_aoi() -> None:
     zoom = 18
     ds = old_imagery.download(AOI, zoom=zoom, date="2020-01-01")
     tolerance = 360.0 / (256 * 2**zoom)
-    for got, want in zip(ds.bounds, (AOI.bounds[0], AOI.bounds[1], AOI.bounds[2], AOI.bounds[3])):
+    for got, want in zip(ds.bounds, AOI.bounds, strict=True):
         assert got == pytest.approx(want, abs=tolerance)
 
 
@@ -118,5 +118,5 @@ def test_both_providers_agree_on_extent() -> None:
     esri = old_imagery.download(AOI, zoom=17, date="2016-06-01", provider="esri")
     esri_4326 = transform_bounds(esri.crs, "EPSG:4326", *esri.bounds)
 
-    for a, b in zip(google.bounds, esri_4326):
+    for a, b in zip(google.bounds, esri_4326, strict=True):
         assert a == pytest.approx(b, abs=1e-4)

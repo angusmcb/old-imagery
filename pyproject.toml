@@ -48,7 +48,22 @@ Issues = "https://github.com/angusmcb/old-imagery/issues"
 [project.optional-dependencies]
 test = ["pytest>=7", "pyproj>=3.4"]
 # grpcio-tools supplies protoc for tools/regen_descriptors.py.
-dev = ["pytest>=7", "pyproj>=3.4", "grpcio-tools>=1.60", "ruff>=0.4", "build", "twine>=6.1"]
+dev = [
+    "pytest>=7",
+    "pyproj>=3.4",
+    "grpcio-tools>=1.60",
+    # Floor kept in step with the pinned rev in .pre-commit-config.yaml.
+    "ruff>=0.16",
+    "mypy>=1.8",
+    # Third-party stubs. affine and rasterio have none, and are handled by the
+    # per-module overrides in [tool.mypy].
+    "types-protobuf",
+    "types-shapely",
+    "types-geopandas",
+    "pre-commit>=3.5",
+    "build",
+    "twine>=6.1",
+]
 
 [tool.hatch.build.targets.wheel]
 # _descriptors/*.desc live inside the package and are picked up automatically.
@@ -76,5 +91,61 @@ markers = [
 ]
 addopts = "-m 'not network'"
 
+[tool.mypy]
+# No python_version pin: numpy's bundled stubs use PEP 695 `type` statements,
+# so pinning to our 3.10 floor makes mypy fail parsing numpy itself. mypy
+# therefore follows the interpreter it runs under (3.12 in CI). The cost is
+# that 3.10-specific typing problems are not caught here; the pytest matrix
+# still exercises 3.10 at runtime.
+# Scoped to shipped code. The test suite deliberately passes wrong types to
+# assert the errors they raise, substitutes fake clients, and reaches for
+# private attributes — type-checking it would fight what the tests are for.
+files = ["src/old_imagery", "tools"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+check_untyped_defs = true
+strict_equality = true
+no_implicit_reexport = true
+
+# Not yet enabled: disallow_untyped_defs / disallow_any_generics. Turning on
+# full `strict` today reports 61 errors, 38 of them missing annotations — a
+# worthwhile ratchet, but a separate piece of work from setting up the check.
+
+[[tool.mypy.overrides]]
+# No stubs published and no py.typed marker upstream.
+module = ["affine", "rasterio.*", "rasterio"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
+# Ruff formats Python blocks inside Markdown. The README aligns trailing
+# comments in its examples on purpose, and a formatter should not quietly
+# rewrite prose, so keep it to real source files.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+# Pinned explicitly: ruff's implicit default set has widened across releases,
+# and CI should not start failing because a new ruff shipped new rules.
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade (py310+)
+    "B",    # bugbear
+    "SIM",  # simplify
+    "BLE",  # blind except
+    "PLW",  # pylint warnings
+    "RUF",  # ruff-specific
+]
+ignore = [
+    # __all__ is grouped by role (public API, constants, types, exceptions),
+    # which carries more information than alphabetical order.
+    "RUF022",
+    # __slots__ mirrors the __init__ signature order; sorting would divorce it.
+    "RUF023",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["old_imagery"]

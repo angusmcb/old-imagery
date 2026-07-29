@@ -113,7 +113,8 @@ def test_row_col_roundtrip(row: int, col: int, level: int, path: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "row,col,level", [(0, 0, -1), (0, -1, 0), (-1, 0, 0), (1 << 10, 0, 10), (0, 1 << 10, 10), (0, 0, 31)]
+    "row,col,level",
+    [(0, 0, -1), (0, -1, 0), (-1, 0, 0), (1 << 10, 0, 10), (0, 1 << 10, 10), (0, 0, 31)],
 )
 def test_row_col_out_of_range(row: int, col: int, level: int) -> None:
     """Mirrors upstream KeyholeTileTests.TilesOutOfRange."""
@@ -241,7 +242,7 @@ def test_parse_binary_packet_single_node() -> None:
     node = parsed.node_at(0)
     assert node is not None and node.has_image
     assert node.cache_node_epoch == 11
-    assert [(l.type, l.layer_epoch, l.provider) for l in node.layers] == [(0, 7, 3)]
+    assert [(lyr.type, lyr.layer_epoch, lyr.provider) for lyr in node.layers] == [(0, 7, 3)]
 
 
 def test_parse_binary_packet_walks_children() -> None:

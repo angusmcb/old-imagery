@@ -167,7 +167,9 @@ def _layer(layer_id: int, release: str) -> Layer:
 
 
 def _millis(date: dt.date) -> int:
-    return int(dt.datetime(date.year, date.month, date.day, tzinfo=dt.timezone.utc).timestamp() * 1000)
+    return int(
+        dt.datetime(date.year, date.month, date.day, tzinfo=dt.timezone.utc).timestamp() * 1000
+    )
 
 
 def _esrijson(oid: int, date: dt.date) -> bytes:
@@ -224,7 +226,11 @@ class RegionClient:
         self.date_queries.append(layer_id)
         rows = self.per_layer.get(layer_id, [])
         return json.dumps(
-            {"features": [{"attributes": {"OBJECTID": o, "SRC_DATE2": _millis(d)}} for d, o in rows]}
+            {
+                "features": [
+                    {"attributes": {"OBJECTID": o, "SRC_DATE2": _millis(d)}} for d, o in rows
+                ]
+            }
         ).encode()
 
     def get(self, url, *, max_age=None):  # pragma: no cover - unused here
@@ -238,7 +244,7 @@ def _wayback_with(layers, per_layer):
     wb = WayBack.__new__(WayBack)
     wb._client = client
     wb.layers = layers
-    wb._by_id = {l.id: l for l in layers}
+    wb._by_id = {layer.id: layer for layer in layers}
     wb._date_cache = {}
     wb._lock = threading.Lock()
     return wb, client

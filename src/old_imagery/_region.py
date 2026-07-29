@@ -9,7 +9,8 @@ provider-agnostic.
 from __future__ import annotations
 
 import math
-from typing import Iterable, Protocol, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Protocol
 
 from affine import Affine
 from shapely.geometry import box
@@ -34,12 +35,12 @@ def normalize_aoi(geometry: BaseGeometry) -> BaseGeometry:
         raise ValueError("The area of interest is empty")
 
     minx, miny, maxx, maxy = geometry.bounds
-    if not (-180.0 <= minx and maxx <= 180.0):
+    if not (minx >= -180.0 and maxx <= 180.0):
         raise ValueError(
             "Longitudes must lie within [-180, 180]. Split areas of interest "
             "that cross the antimeridian and query each part separately."
         )
-    if not (-90.0 <= miny and maxy <= 90.0):
+    if not (miny >= -90.0 and maxy <= 90.0):
         raise ValueError("Latitudes must lie within [-90, 90]")
     return geometry
 
@@ -149,9 +150,10 @@ class MercatorTile:
         return hash((self.row, self.column, self.level))
 
     def __eq__(self, other) -> bool:
-        return (
-            isinstance(other, MercatorTile)
-            and (self.row, self.column, self.level) == (other.row, other.column, other.level)
+        return isinstance(other, MercatorTile) and (self.row, self.column, self.level) == (
+            other.row,
+            other.column,
+            other.level,
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -172,7 +174,9 @@ class MercatorGrid:
     crs = "EPSG:3857"
     max_level = 23
 
-    def tiles(self, aoi: BaseGeometry, level: int, max_tiles: int = MAX_TILES) -> list[MercatorTile]:
+    def tiles(
+        self, aoi: BaseGeometry, level: int, max_tiles: int = MAX_TILES
+    ) -> list[MercatorTile]:
         if not (0 <= level <= self.max_level):
             raise ValueError(f"zoom must be in [0, {self.max_level}] for Esri Wayback")
         n = 1 << level

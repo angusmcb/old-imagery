@@ -143,7 +143,7 @@ class CachedHttpClient:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "CachedHttpClient":
+    def __enter__(self) -> CachedHttpClient:
         return self
 
     def __exit__(self, *exc) -> None:

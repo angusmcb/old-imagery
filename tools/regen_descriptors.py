@@ -45,7 +45,9 @@ def compile_one(name: str, out_dir: Path) -> Path:
         f"--descriptor_set_out={fds_path}",
         str(PROTO_DIR / f"{name}.proto"),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # check=False: the returncode is inspected below so protoc's stderr can be
+    # surfaced verbatim rather than buried in a CalledProcessError.
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         sys.exit(f"protoc failed for {name}.proto:\n{proc.stderr}")
 
@@ -68,9 +70,7 @@ def index(fdp: descriptor_pb2.FileDescriptorProto):
     def walk(msgs, prefix: str) -> None:
         for m in msgs:
             full = f"{prefix}.{m.name}"
-            messages[full] = {
-                f.number: (f.name, f.type, f.label, f.type_name) for f in m.field
-            }
+            messages[full] = {f.number: (f.name, f.type, f.label, f.type_name) for f in m.field}
             for e in m.enum_type:
                 enums[f"{full}.{e.name}"] = {v.name: v.number for v in e.value}
             walk(m.nested_type, full)

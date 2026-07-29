@@ -187,8 +187,12 @@ def test_download_picks_the_closest_date(stub) -> None:
 def test_download_honours_before_and_after(stub) -> None:
     stub(StubBackend([D1, D2]))
     mid = "2010-01-01"
-    assert old_imagery.download(AOI, ZOOM, mid, date_match="before").tags()["dates"] == D1.isoformat()
-    assert old_imagery.download(AOI, ZOOM, mid, date_match="after").tags()["dates"] == D2.isoformat()
+    assert (
+        old_imagery.download(AOI, ZOOM, mid, date_match="before").tags()["dates"] == D1.isoformat()
+    )
+    assert (
+        old_imagery.download(AOI, ZOOM, mid, date_match="after").tags()["dates"] == D2.isoformat()
+    )
 
 
 def test_download_exact_match_failure_is_an_error(stub) -> None:
@@ -284,7 +288,9 @@ def test_method_region_forces_the_region_query_below_the_threshold(stub) -> None
 
 def test_method_per_tile_forces_probing_above_the_threshold(stub) -> None:
     backend = stub(RegionBackend([(D1, AOI)]))
-    gdf = old_imagery.availability(AOI, REGION_ZOOM, provider="esri", method="per-tile", max_tiles=10_000)
+    gdf = old_imagery.availability(
+        AOI, REGION_ZOOM, provider="esri", method="per-tile", max_tiles=10_000
+    )
 
     assert gdf.attrs["n_aoi_tiles"] >= api.ESRI_REGION_QUERY_MIN_TILES
     assert gdf.attrs["method"] == "per-tile"
@@ -347,7 +353,12 @@ def test_region_query_unions_footprints_sharing_a_date(stub) -> None:
 def test_region_query_passes_date_bounds_to_the_backend(stub) -> None:
     backend = stub(RegionBackend([(D1, AOI)]))
     old_imagery.availability(
-        AOI, REGION_ZOOM, provider="esri", min_date="2000-01-01", max_date="2020-01-01", max_tiles=10_000
+        AOI,
+        REGION_ZOOM,
+        provider="esri",
+        min_date="2000-01-01",
+        max_date="2020-01-01",
+        max_tiles=10_000,
     )
     assert backend.seen_kwargs == {
         "min_date": dt.date(2000, 1, 1),
