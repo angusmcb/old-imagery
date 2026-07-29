@@ -38,13 +38,12 @@ dependencies = [
     "affine>=2.3",
 ]
 
-# TODO before the first upload: point these at the public repository. GPL-3.0
-# distribution requires recipients be able to get the corresponding source, and
-# PyPI renders these as sidebar links.
-# [project.urls]
-# Homepage = "https://github.com/<user>/gehist"
-# Source = "https://github.com/<user>/gehist"
-# Issues = "https://github.com/<user>/gehist/issues"
+# GPL-3.0 distribution requires recipients be able to get the corresponding
+# source; PyPI renders these as sidebar links.
+[project.urls]
+Homepage = "https://github.com/angusmcb/old-imagery"
+Source = "https://github.com/angusmcb/old-imagery"
+Issues = "https://github.com/angusmcb/old-imagery/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "pyproj>=3.4"]

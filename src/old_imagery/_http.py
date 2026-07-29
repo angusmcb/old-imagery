@@ -14,7 +14,7 @@ DEFAULT_CACHE_DIR = Path(
     os.environ.get("OLD_IMAGERY_CACHE_DIR", Path.home() / ".cache" / "old-imagery")
 )
 
-_USER_AGENT = "old_imagery/0.1 (+https://github.com/Mbucari/GEHistoricalImagery)"
+_USER_AGENT = "old-imagery/0.1 (+https://github.com/angusmcb/old-imagery)"
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _BACKOFF = 0.5
 
