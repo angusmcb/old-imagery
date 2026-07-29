@@ -1,0 +1,88 @@
+old-imagery
+Copyright (C) 2026 the old-imagery contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+
+THIRD-PARTY MATERIAL
+====================
+
+1. GEHistoricalImagery -- GPL-3.0-or-later
+------------------------------------------
+   https://github.com/Mbucari/GEHistoricalImagery
+   Copyright (C) Mbucari and contributors
+
+   old-imagery is a Python port of the protocol layer of GEHistoricalImagery, a .NET
+   CLI by Mbucari. The Keyhole quadtree addressing, packet decryption, dbRoot
+   handling and Esri Wayback logic in src/old_imagery/ are ports of that project's
+   LibGoogleEarth and LibEsri assemblies and are derivative works of it.
+
+   Because GEHistoricalImagery is licensed under the GNU General Public License
+   version 3, old-imagery as a whole is distributed under the same terms.
+
+   The following files are copied verbatim from that project and carry its
+   copyright:
+
+     tests/data/RootIndexDictionary.json
+     tests/data/SubIndexDictionary.json
+         from test/LibGoogleEarthTest/ -- pre-computed quadtree subindex
+         fixtures, used unmodified so this port can be checked node-for-node
+         against the C# implementation.
+
+   Changes made in this port: translation from C# to Python; replacement of the
+   command line interface with a library API (`availability` and `download`);
+   shapely geometry input and GeoDataFrame/rasterio output; a disk response
+   cache; an Esri region-query availability path. Upstream's `info` and `dump`
+   commands, DXF output, terrain meshes, the non-time-machine databases and the
+   `--layer-date` flag are not ported.
+
+2. Google Earth Enterprise -- Apache-2.0
+-----------------------------------------
+   https://github.com/google/earthenterprise
+   Copyright 2017 Google Inc.
+
+   proto/dbroot_v2.proto is copied unmodified from
+   earth_enterprise/src/keyhole/proto/dbroot/dbroot_v2.proto and retains its
+   Apache License 2.0 header. It is used to generate
+   src/old_imagery/_descriptors/dbroot_v2.desc.
+
+   A copy of the Apache License 2.0 is available at
+   http://www.apache.org/licenses/LICENSE-2.0
+
+3. Keyhole quadtree packet schema
+----------------------------------
+   proto/quadtreeset.proto describes the wire format of the quadtree packets
+   served by kh.google.com and khmdb.google.com. Google has not published this
+   schema: the Earth Enterprise open-source release includes dbroot_v2.proto
+   but not quadtreeset, whose original internal name -- "quadtreeset.protodevel"
+   -- survives in descriptors embedded in Google Earth client binaries.
+
+   The field numbers, types and enum values were read out of the serialized
+   FileDescriptorProto embedded in the protoc-generated C# shipped by
+   GEHistoricalImagery (item 1 above), and transcribed into .proto source so
+   that the schema is reviewable and the generated descriptor is reproducible.
+   See tools/regen_descriptors.py.
+
+
+TRADEMARKS
+==========
+
+Google and Google Earth are trademarks of Google LLC. Esri, ArcGIS and World
+Imagery Wayback are trademarks of Environmental Systems Research Institute, Inc.
+They are used here only to identify the services this software interoperates
+with, in a descriptive sense. This project is not affiliated with, endorsed by,
+sponsored by or connected to either company.
+
+
+IMAGERY
+=======
+
+This software retrieves imagery; it does not license it. Imagery obtained
+through old-imagery remains the copyright of Google, Esri, or their respective
+imagery providers, and is subject to those providers' terms of service.
+Determining whether a given use is permitted is the responsibility of the
+person running the software. See the "Imagery rights and terms of service"
+section of README.md.

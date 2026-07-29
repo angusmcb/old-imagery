@@ -1,0 +1,92 @@
+// Keyhole quadtree packet wire format.
+//
+// Unlike dbroot_v2.proto, this schema was never published by Google: the
+// Google Earth Enterprise open-source release (github.com/google/earthenterprise)
+// ships dbroot_v2.proto but not quadtreeset, whose original internal name --
+// "quadtreeset.protodevel" -- is preserved in the descriptors embedded in
+// Google Earth client binaries.
+//
+// This file is a transcription of that schema into readable source. The field
+// numbers, types, labels and enum values are a description of the bytes that
+// kh.google.com and khmdb.google.com put on the wire; they were read out of the
+// serialized FileDescriptorProto embedded in the protoc-generated C# shipped by
+// Mbucari/GEHistoricalImagery (GPL-3.0), which this project is a port of. Only
+// the messages and fields needed to walk the quadtree are described here.
+//
+// Transcribed as source so the schema is reviewable and the generated
+// descriptor is reproducible, rather than being carried as an opaque blob.
+// Verified against the previous descriptor field-by-field: see
+// tools/regen_descriptors.py.
+
+syntax = "proto2";
+
+package keyhole;
+
+message QuadtreeChannel {
+  required int32 type = 1;
+  required int32 channel_epoch = 2;
+}
+
+message QuadtreeImageryTimedTile {
+  required int32 milliseconds = 1;
+  required int32 timed_tile_epoch = 2;
+  optional int32 provider = 3;
+}
+
+message QuadtreeImageryDatedTile {
+  // Capture date, packed as (year << 9) | (month << 5) | day.
+  required int32 date = 1;
+  required int32 dated_tile_epoch = 2;
+  // 0 means the imagery for this date lives in the Imagery layer instead.
+  required int32 provider = 3;
+  repeated QuadtreeImageryTimedTile timed_tiles = 4;
+}
+
+message QuadtreeImageryDates {
+  repeated QuadtreeImageryDatedTile dated_tile = 1;
+  optional int32 shared_tile_date = 2;
+  repeated int32 coarse_tile_dates = 3;
+  optional int32 shared_tile_milliseconds = 4;
+}
+
+message QuadtreeLayer {
+  enum LayerType {
+    LAYER_TYPE_IMAGERY = 0;
+    LAYER_TYPE_TERRAIN = 1;
+    LAYER_TYPE_VECTOR = 2;
+    LAYER_TYPE_IMAGERY_HISTORY = 3;
+  }
+
+  required LayerType type = 1;
+  required int32 layer_epoch = 2;
+  optional int32 provider = 3;
+  optional QuadtreeImageryDates dates_layer = 4;
+}
+
+message QuadtreeNode {
+  enum NodeFlags {
+    option allow_alias = true;
+
+    NODE_FLAGS_CHILD_COUNT = 4;
+    NODE_FLAGS_CACHE_BIT = 4;
+    NODE_FLAGS_DRAWABLE_BIT = 5;
+    NODE_FLAGS_IMAGE_BIT = 6;
+    NODE_FLAGS_TERRAIN_BIT = 7;
+  }
+
+  optional int32 flags = 1;
+  optional int32 cache_node_epoch = 2;
+  repeated QuadtreeLayer layer = 3;
+  repeated QuadtreeChannel channel = 4;
+}
+
+message QuadtreePacket {
+  required int32 packet_epoch = 1;
+
+  // A proto2 group, not a nested message: the wire encoding differs, so this
+  // must stay a group for packets to parse.
+  repeated group SparseQuadtreeNode = 2 {
+    required int32 index = 3;
+    required QuadtreeNode Node = 4;
+  }
+}

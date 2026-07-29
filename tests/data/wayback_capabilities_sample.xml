@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Capabilities xmlns="https://www.opengis.net/wmts/1.0"
+xmlns:ows="https://www.opengis.net/ows/1.1"
+xmlns:xlink="https://www.w3.org/1999/xlink"
+xmlns:xsi="https://www.w3.org/2001/XMLSchema-instance"
+xmlns:gml="https://www.opengis.net/gml"
+xsi:schemaLocation="https://www.opengis.net/wmts/1.0 https://schemas.opengis.net/wmts/1.0/wmtsGetCapabilities_response.xsd"
+version="1.0.0">
+<ows:ServiceIdentification>
+<ows:Title>Wayback</ows:Title>
+<ows:ServiceType>OGC WMTS</ows:ServiceType>
+<ows:ServiceTypeVersion>1.0.0</ows:ServiceTypeVersion>
+</ows:ServiceIdentification>
+<ows:OperationsMetadata>
+<ows:Operation name="GetCapabilities">
+<ows:DCP>
+<ows:HTTP>
+<ows:Get xlink:href="https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml">
+<ows:Constraint name="GetEncoding">
+<ows:AllowedValues>
+<ows:Value>RESTful</ows:Value>
+</ows:AllowedValues>
+</ows:Constraint>
+</ows:Get>
+</ows:HTTP>
+</ows:DCP>
+</ows:Operation>
+<ows:Operation name="GetTile">
+<ows:DCP>
+<ows:HTTP>
+<ows:Get xlink:href="https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/tile/1.0.0/">
+<ows:Constraint name="GetEncoding">
+<ows:AllowedValues>
+<ows:Value>RESTful</ows:Value>
+</ows:AllowedValues>
+</ows:Constraint>
+</ows:Get>
+</ows:HTTP>
+</ows:DCP>
+</ows:Operation>
+</ows:OperationsMetadata>
+<Contents>
+
+<Layer>
+<ows:Title>World Imagery (Wayback 2026-06-30)</ows:Title> <ows:Identifier>WB_2026_R06</ows:Identifier>
+<ows:BoundingBox crs="urn:ogc:def:crs:EPSG::3857">
+<ows:LowerCorner>-2.003750722959434E7 -2.003750722959434E7</ows:LowerCorner>
+<ows:UpperCorner>2.003750722959434E7 2.003750722959434E7</ows:UpperCorner>
+</ows:BoundingBox> <ows:WGS84BoundingBox crs="urn:ogc:def:crs:OGC:2:84">
+<ows:LowerCorner>-179.99999000000003 -85.051129</ows:LowerCorner>
+<ows:UpperCorner>179.99999000000003 85.051129</ows:UpperCorner>
+</ows:WGS84BoundingBox>
+<Style isDefault="true"><ows:Title>Default</ows:Title><ows:Identifier>default</ows:Identifier></Style>
+<Format>image/jpeg</Format>
+<TileMatrixSetLink><TileMatrixSet>default028mm</TileMatrixSet></TileMatrixSetLink>
+<TileMatrixSetLink><TileMatrixSet>GoogleMapsCompatible</TileMatrixSet></TileMatrixSetLink>
+<ResourceURL format="image/jpeg" resourceType="tile" template="https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/{TileMatrixSet}/MapServer/tile/32246/{TileMatrix}/{TileRow}/{TileCol}"/>
+</Layer>
+<Layer>
+<ows:Title>World Imagery (Wayback 2026-05-28)</ows:Title> <ows:Identifier>WB_2026_R05</ows:Identifier>
+<ows:BoundingBox crs="urn:ogc:def:crs:EPSG::3857">
+<ows:LowerCorner>-2.003750722959434E7 -2.003750722959434E7</ows:LowerCorner>
+<ows:UpperCorner>2.003750722959434E7 2.003750722959434E7</ows:UpperCorner>
+</ows:BoundingBox> <ows:WGS84BoundingBox crs="urn:ogc:def:crs:OGC:2:84">
+<ows:LowerCorner>-179.99999000000003 -85.051129</ows:LowerCorner>
+<ows:UpperCorner>179.99999000000003 85.051129</ows:UpperCorner>
+</ows:WGS84BoundingBox>
+<Style isDefault="true"><ows:Title>Default</ows:Title><ows:Identifier>default</ows:Identifier></Style>
+<Format>image/jpeg</Format>
+<TileMatrixSetLink><TileMatrixSet>default028mm</TileMatrixSet></TileMatrixSetLink>
+<TileMatrixSetLink><TileMatrixSet>GoogleMapsCompatible</TileMatrixSet></TileMatrixSetLink>
+<ResourceURL format="image/jpeg" resourceType="tile" template="https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/{TileMatrixSet}/MapServer/tile/10842/{TileMatrix}/{TileRow}/{TileCol}"/>
+</Layer>
+  </Contents>
+</Capabilities>
