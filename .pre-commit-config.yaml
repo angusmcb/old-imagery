@@ -1,0 +1,46 @@
+# Install with:  pip install -e ".[dev]" && pre-commit install
+# Run over everything:  pre-commit run --all-files
+
+# tests/data/ holds fixtures copied verbatim from upstream
+# (Mbucari/GEHistoricalImagery) — they are what makes "this port agrees with
+# the C# implementation node-for-node" checkable, and NOTICE records them as
+# unmodified. Whitespace fixers must not touch them.
+exclude: ^tests/data/
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Pinned, and kept in step with the ruff floor in [dev]. Ruff's implicit
+    # default rule set has widened across releases; pyproject pins `select`
+    # explicitly so this rev and a local `ruff` agree on what is enforced.
+    rev: v0.16.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      # Deliberately a local/system hook rather than mirrors-mypy. mypy needs
+      # the project's own dependency tree to resolve types, and listing that
+      # tree again under additional_dependencies would give two dependency
+      # sets to keep in step — one of which silently drifts. This runs the
+      # mypy from your dev install, so it sees exactly what CI sees.
+      - id: mypy
+        name: mypy (requires `pip install -e ".[dev]"`)
+        entry: mypy
+        language: system
+        types: [python]
+        # Scope comes from `files` in [tool.mypy]; passing changed filenames
+        # would override it and check the wrong set.
+        pass_filenames: false

@@ -117,7 +117,7 @@ Responses are cached on disk under `~/.cache/old-imagery` (override with `$OLD_I
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]" && pre-commit install
 ```
 
 ```bash
@@ -126,6 +126,18 @@ pytest -m network       # 9 live tests against Google and Esri
 ```
 
 Run the network tests sparingly and against small AOIs — they hit the live services.
+
+### Linting and types
+
+`ruff` (lint + format) and `mypy` run on every commit via [pre-commit](.pre-commit-config.yaml), and again in CI:
+
+```bash
+pre-commit run --all-files
+```
+
+The mypy hook runs from your dev install rather than an isolated environment, so `pip install -e ".[dev]"` is a prerequisite — that way it resolves the same dependency tree CI does, instead of a second list that can drift.
+
+mypy covers `src/` and `tools/`, not `tests/`: the suite deliberately passes wrong types to assert the errors they raise, and substitutes fake HTTP clients. Full `strict` is not on yet — it reports 61 findings, 38 of them missing annotations.
 
 The offline suite includes upstream's own pre-computed quadtree subindex fixtures (`test/LibGoogleEarthTest/*IndexDictionary.json`), so a passing run means this port agrees with the C# implementation node-for-node.
 
