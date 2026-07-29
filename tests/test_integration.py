@@ -110,6 +110,39 @@ def test_esri_region_query_dates_are_capture_not_release() -> None:
     assert len(capture_dates - release_dates) > len(capture_dates) / 2
 
 
+def test_esri_exact_wayback_release_selection() -> None:
+    """Release mode must target one exact published snapshot and label it clearly."""
+    from old_imagery._esri import WayBack
+    from old_imagery._http import CachedHttpClient
+
+    small = box(-122.3965, 37.7940, -122.3945, 37.7955)
+    with CachedHttpClient() as client:
+        release = WayBack(client).layers[0]
+
+    gdf = old_imagery.availability(
+        small,
+        zoom=17,
+        provider="esri",
+        esri_wayback_release_date=release.date,
+    )
+    assert gdf.attrs["selection_mode"] == "esri-wayback-release"
+    assert gdf.attrs["esri_wayback_release_date"] == release.date
+    if len(gdf):
+        assert (gdf["providers"] == release.title).all()
+
+    ds = old_imagery.download(
+        small,
+        zoom=17,
+        provider="esri",
+        esri_wayback_release_date=release.date,
+    )
+    tags = ds.tags()
+    assert tags["selection_mode"] == "esri-wayback-release"
+    assert tags["esri_wayback_release_date"] == release.date.isoformat()
+    assert tags["esri_wayback_release_title"] == release.title
+    assert (ds.dataset_mask() > 0).all()
+
+
 def test_both_providers_agree_on_extent() -> None:
     """Independent grids must georeference the same AOI to the same place."""
     from rasterio.warp import transform_bounds

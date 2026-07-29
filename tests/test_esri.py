@@ -109,12 +109,41 @@ def test_dated_tiles_empty_when_no_layer_has_data() -> None:
     assert wb.dated_tiles(TILE) == []
 
 
-def test_dated_tiles_falls_back_to_release_date_without_metadata() -> None:
+def test_dated_tiles_omits_imagery_without_capture_metadata() -> None:
     wb, _ = _wayback({"/tilemap/": {"data": [1]}})
-    results = wb.dated_tiles(TILE)
-    assert results
-    # With no SRC_DATE2 available the layer's own release date is used.
-    assert all(r.date is not None for r in results)
+    assert wb.dated_tiles(TILE) == []
+
+
+def test_missing_capture_metadata_is_cached() -> None:
+    wb, client = _wayback({"/tilemap/": {"data": [1]}})
+    layer = wb.layers[0]
+
+    assert wb._capture_date(layer, TILE) is None
+    first_query_count = sum("/query" in url for url in client.requested)
+    assert wb._capture_date(layer, TILE) is None
+    assert sum("/query" in url for url in client.requested) == first_query_count
+
+
+def test_release_at_requires_an_exact_publication_date() -> None:
+    wb, _ = _wayback({})
+    release = wb.layers[1]
+
+    assert wb.release_at(release.date) is release
+    with pytest.raises(ValueError, match=r"No Esri Wayback release.*previous:.*next:"):
+        wb.release_at(release.date + dt.timedelta(days=1))
+
+
+def test_tile_at_release_keeps_the_requested_layer_and_capture_date() -> None:
+    captured = dt.datetime(2011, 3, 4, tzinfo=dt.timezone.utc)
+    millis = int(captured.timestamp() * 1000)
+    wb, _ = _wayback({"/query": {"features": [{"attributes": {"SRC_DATE2": millis}}]}})
+    release = wb.layers[1]
+
+    result = wb.tile_at_release(TILE, release)
+    assert result.layer is release
+    assert result.provider == release.id
+    assert result.date == dt.date(2011, 3, 4)
+    assert f"/tile/{release.id}/" in result.asset_url
 
 
 def test_dated_tiles_uses_metadata_capture_date() -> None:

@@ -129,8 +129,7 @@ def test_availability_reports_partial_coverage(stub) -> None:
     gdf = old_imagery.availability(AOI, ZOOM)
     assert gdf["n_tiles"].iloc[0] == len(tiles) - 1
     assert gdf["coverage"].iloc[0] == pytest.approx((len(tiles) - 1) / len(tiles))
-    # Still "complete": no other date covers the missing tile either.
-    assert bool(gdf["complete"].iloc[0])
+    assert not bool(gdf["complete"].iloc[0])
 
 
 def test_availability_empty_when_no_imagery(stub) -> None:
@@ -140,6 +139,8 @@ def test_availability_empty_when_no_imagery(stub) -> None:
     assert len(gdf) == 0
     assert list(gdf.columns) == api.AVAILABILITY_COLUMNS
     assert gdf.crs == "EPSG:4326"
+    assert gdf.attrs["n_aoi_tiles"] == len(tiles)
+    assert gdf.attrs["method"] == "per-tile"
 
 
 def test_availability_records_attrs(stub) -> None:
@@ -148,6 +149,7 @@ def test_availability_records_attrs(stub) -> None:
     assert gdf.attrs["zoom"] == ZOOM
     assert gdf.attrs["provider"] == "google"
     assert gdf.attrs["n_aoi_tiles"] > 0
+    assert gdf.attrs["selection_mode"] == "capture-date"
 
 
 # --------------------------------------------------------------------------
@@ -160,8 +162,10 @@ def test_download_returns_georeferenced_rgb(stub) -> None:
     assert ds.count == 3
     assert ds.dtypes == ("uint8", "uint8", "uint8")
     assert ds.crs == "EPSG:4326"
+    assert ds.tags()["selection_mode"] == "capture-date"
     assert ds.tags()["dates"] == D2.isoformat()
     assert ds.tags()["tiles_missing"] == "0"
+    assert ds.tags()["tiles_capture_date_unknown"] == "0"
     assert (ds.dataset_mask() > 0).all()
     # JPEG is lossy, but a flat fill must survive round-tripping.
     assert ds.read(1).mean() == pytest.approx(200, abs=2)
@@ -254,6 +258,173 @@ class RegionBackend(StubBackend):
         self.region_calls += 1
         self.seen_kwargs = {"min_date": min_date, "max_date": max_date}
         return [(d, g, "Wayback release") for d, g in self.regions]
+
+
+@dataclass(frozen=True)
+class StubRelease:
+    id: int
+    date: dt.date
+    title: str
+
+
+class ReleaseBackend(StubBackend):
+    """An Esri-shaped backend serving one exact Wayback release."""
+
+    def __init__(self, release_date, capture_date, **kwargs):
+        super().__init__([capture_date], **kwargs)
+        self.release = StubRelease(
+            id=42,
+            date=release_date,
+            title=f"World Imagery (Wayback {release_date.isoformat()})",
+        )
+        self.capture_date = capture_date
+        self.dated_tile_calls = 0
+        self.release_tile_calls = 0
+
+    def release_at(self, release_date):
+        if release_date != self.release.date:
+            raise ValueError(f"No Esri Wayback release was published on {release_date}")
+        return self.release
+
+    def tile_at_release(self, tile, release):
+        assert release is self.release
+        self.release_tile_calls += 1
+        return StubDated(tile, self.capture_date, release.id)
+
+    def dated_tiles(self, tile):
+        self.dated_tile_calls += 1
+        return super().dated_tiles(tile)
+
+
+RELEASE_DATE = dt.date(2014, 2, 20)
+
+
+def test_availability_can_select_one_exact_esri_release(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+    gdf = old_imagery.availability(
+        AOI,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_date=RELEASE_DATE,
+    )
+
+    assert list(gdf["date"]) == [D1]
+    assert (gdf["providers"] == backend.release.title).all()
+    assert gdf.attrs["selection_mode"] == "esri-wayback-release"
+    assert gdf.attrs["method"] == "esri-wayback-release"
+    assert gdf.attrs["esri_wayback_release_date"] == RELEASE_DATE
+    assert gdf.attrs["esri_wayback_release_title"] == backend.release.title
+    assert backend.release_tile_calls == gdf.attrs["n_aoi_tiles"]
+    assert backend.dated_tile_calls == 0
+
+
+def test_release_availability_omits_unknown_capture_dates_but_keeps_metadata(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, None))
+    gdf = old_imagery.availability(
+        AOI,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_date=RELEASE_DATE,
+    )
+
+    assert len(gdf) == 0
+    assert gdf.attrs["selection_mode"] == "esri-wayback-release"
+    assert gdf.attrs["esri_wayback_release_date"] == RELEASE_DATE
+    assert backend.release_tile_calls == gdf.attrs["n_aoi_tiles"]
+
+
+def test_download_can_select_one_exact_esri_release(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1, colors={D1: 77}))
+    ds = old_imagery.download(
+        AOI,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_date=RELEASE_DATE,
+    )
+
+    tags = ds.tags()
+    assert tags["selection_mode"] == "esri-wayback-release"
+    assert tags["esri_wayback_release_date"] == RELEASE_DATE.isoformat()
+    assert tags["esri_wayback_release_title"] == backend.release.title
+    assert tags["dates"] == D1.isoformat()
+    assert "target_date" not in tags
+    assert "date_match" not in tags
+    assert ds.read(1).mean() == pytest.approx(77, abs=2)
+    assert backend.dated_tile_calls == 0
+
+
+def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
+    stub(ReleaseBackend(RELEASE_DATE, None))
+    ds = old_imagery.download(
+        AOI,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_date=RELEASE_DATE,
+    )
+    tags = ds.tags()
+    assert "dates" not in tags
+    assert tags["tiles_capture_date_unknown"] == tags["tiles_total"]
+    assert (ds.dataset_mask() > 0).all()
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        (
+            {"provider": "google", "esri_wayback_release_date": RELEASE_DATE},
+            "requires provider='esri'",
+        ),
+        (
+            {
+                "provider": "esri",
+                "esri_wayback_release_date": RELEASE_DATE,
+                "min_date": D1,
+            },
+            "cannot be combined with min_date or max_date",
+        ),
+        (
+            {
+                "provider": "esri",
+                "esri_wayback_release_date": RELEASE_DATE,
+                "method": "per-tile",
+            },
+            "method cannot be set",
+        ),
+    ],
+)
+def test_release_availability_rejects_mixed_selection_modes(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        old_imagery.availability(AOI, ZOOM, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        (
+            {"provider": "google", "esri_wayback_release_date": RELEASE_DATE},
+            "requires provider='esri'",
+        ),
+        (
+            {
+                "provider": "esri",
+                "date": D1,
+                "esri_wayback_release_date": RELEASE_DATE,
+            },
+            "Choose either date",
+        ),
+        (
+            {
+                "provider": "esri",
+                "esri_wayback_release_date": RELEASE_DATE,
+                "date_match": "exact",
+            },
+            "date_match cannot be set",
+        ),
+    ],
+)
+def test_release_download_rejects_mixed_selection_modes(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        old_imagery.download(AOI, ZOOM, **kwargs)
 
 
 def test_region_query_used_above_the_tile_threshold(stub) -> None:
@@ -371,6 +542,8 @@ def test_region_query_with_no_results_is_empty(stub) -> None:
     gdf = old_imagery.availability(AOI, REGION_ZOOM, provider="esri", max_tiles=10_000)
     assert len(gdf) == 0
     assert list(gdf.columns) == api.AVAILABILITY_COLUMNS
+    assert gdf.attrs["n_aoi_tiles"] > 0
+    assert gdf.attrs["method"] == "region-query"
 
 
 def test_region_query_drops_footprints_outside_the_aoi(stub) -> None:

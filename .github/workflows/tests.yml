@@ -45,7 +45,7 @@ jobs:
           pip install -e ".[test]"
 
       - name: Run offline tests
-        # pyproject sets addopts = -m 'not network', so the 9 live tests are
+        # pyproject sets addopts = -m 'not network', so the 10 live tests are
         # deselected by default. CI must never hit Google's or Esri's endpoints:
         # they are rate-limited, non-deterministic, and their terms restrict
         # automated access. Run those locally, against small AOIs.

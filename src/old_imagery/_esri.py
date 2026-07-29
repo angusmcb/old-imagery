@@ -164,14 +164,12 @@ class WayBack:
         except (RequestFailed, ValueError, UnicodeDecodeError):
             return None
 
-    def _capture_date(self, layer: Layer, tile: MercatorTile) -> _dt.date:
-        """The true capture date of ``tile`` in ``layer``, via the metadata service."""
+    def _capture_date(self, layer: Layer, tile: MercatorTile) -> _dt.date | None:
+        """The true capture date of ``tile`` in ``layer``, or ``None`` if unavailable."""
         key = (layer.id, tile.level, tile.row, tile.column)
         with self._lock:
             if key in self._date_cache:
-                cached = self._date_cache[key]
-                if cached is not None:
-                    return cached
+                return self._date_cache[key]
 
         lon, lat = tile.center
         query = {
@@ -185,11 +183,10 @@ class WayBack:
         }
         url = layer.metadata_query_url(tile.level) + "?" + _query_string(query)
         payload = self._json(url)
-        # Fall back to the release date when the metadata service gives us
-        # nothing usable.  _json returns None on a failed or unparseable
-        # response; the try covers a payload that parsed but is shaped
-        # differently from what we expect.
-        date = layer.date
+        # A release date is not an image capture date. If the metadata service
+        # gives us nothing usable, omit this version rather than silently
+        # changing the meaning of every date exposed by the public API.
+        date = None
         if payload is not None:
             try:
                 millis = payload["features"][0]["attributes"]["SRC_DATE2"]
@@ -201,6 +198,47 @@ class WayBack:
         with self._lock:
             self._date_cache[key] = date
         return date
+
+    def release_at(self, release_date: _dt.date) -> Layer:
+        """Return the Wayback release published on exactly ``release_date``.
+
+        Exact matching is deliberate: callers selecting a release snapshot
+        should never be moved silently to a different publication date.
+        """
+        for layer in self.layers:
+            if layer.date == release_date:
+                return layer
+
+        earlier = max(
+            (layer.date for layer in self.layers if layer.date < release_date), default=None
+        )
+        later = min(
+            (layer.date for layer in self.layers if layer.date > release_date), default=None
+        )
+        neighbours = ", ".join(
+            f"{label} {value.isoformat()}"
+            for label, value in (("previous:", earlier), ("next:", later))
+            if value is not None
+        )
+        detail = f" ({neighbours})" if neighbours else ""
+        raise ValueError(
+            f"No Esri Wayback release was published on {release_date.isoformat()}{detail}"
+        )
+
+    def tile_at_release(self, tile: MercatorTile, layer: Layer) -> DatedEsriTile:
+        """The tile served by one exact Wayback release snapshot.
+
+        Unlike :meth:`dated_tiles`, this does not search or fall back across
+        releases. The capture date may be unknown, but the requested layer is
+        retained so downloading always targets that exact published snapshot.
+        """
+        return DatedEsriTile(
+            tile=tile,
+            date=self._capture_date(layer, tile),
+            provider=layer.id,
+            epoch=layer.id,
+            layer=layer,
+        )
 
     # -- provider interface ------------------------------------------------
     def dated_tiles(self, tile: MercatorTile) -> list[DatedEsriTile]:
@@ -235,6 +273,8 @@ class WayBack:
                 continue
 
             date = self._capture_date(effective, tile)
+            if date is None:
+                continue
             if last_date is not None and last_layer is not None and last_date != date:
                 # Emit only when the tile's imagery actually changed, so each
                 # entry is the earliest release carrying that imagery.

@@ -8,9 +8,9 @@ This is a Python port of the protocol layer of [Mbucari/GEHistoricalImagery](htt
 >
 > **This library retrieves imagery. It does not license it.**
 >
-> Imagery you fetch with `old-imagery` stays the copyright of Google, Esri, or their imagery providers, and their terms of service govern what you may do with it. Google's terms restrict automated access to their services, and both providers restrict bulk extraction and redistribution of imagery. **Whether a particular use is permitted is your call to make, and your responsibility** — check the terms, and get permission where you need it. Research, archival and journalistic uses are not automatically exempt.
+> Imagery you fetch with `old-imagery` stays the copyright of Google, Esri, or their imagery providers, and their terms of service govern what you may do with it. [Google Earth's terms](https://maps.google.com/intl/en_all/help/terms_maps-earth/) prohibit mass downloads and bulk feeds; Esri content may carry provider-specific rights and restrictions. **Whether a particular use is permitted is your call to make, and your responsibility** — check the current terms and item details, and get permission where you need it. Research, archival and journalistic uses are not automatically exempt.
 >
-> The library ships conservative defaults (a `max_tiles` guard, on-disk caching to avoid refetching, 16 concurrent requests) but it cannot tell whether your use is allowed. Consider the licensed alternatives first: [Google Earth Engine](https://earthengine.google.com/) and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) both offer sanctioned access to historical imagery.
+> The library defaults to at most 1,000 tiles, caches responses to avoid refetching, and uses 16 concurrent requests, but it cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
 >
 > **Not affiliated with Google or Esri.** Google and Google Earth are trademarks of Google LLC; Esri, ArcGIS and World Imagery Wayback are trademarks of Environmental Systems Research Institute, Inc. They are named here only to identify the services this software talks to. This project is not affiliated with, endorsed by, or sponsored by either company.
 
@@ -24,11 +24,16 @@ aoi = box(-122.4020, 37.7900, -122.3880, 37.7990)   # SF Embarcadero, EPSG:4326
 dates = old_imagery.availability(aoi, zoom=17)
 print(dates[["date", "coverage", "complete", "providers"]].head())
 
-# Fetch a mosaic for one of those dates.
-with old_imagery.download(aoi, zoom=17, date="1938-08-01") as src:
+# Fetch exactly one of the dates availability returned.
+target = dates.iloc[-1]["date"]  # oldest capture in this example
+with old_imagery.download(aoi, zoom=17, date=target, date_match="exact") as src:
     rgb = src.read()            # (3, H, W) uint8
     transform = src.transform   # georeferenced, EPSG:4326
 ```
+
+Pass `provider="esri"` to both calls to use Esri Wayback instead. Every AOI is
+interpreted as longitude/latitude in **EPSG:4326**; shapely geometries do not
+carry a CRS, so reproject before calling the library.
 
 ## Install
 
@@ -36,30 +41,102 @@ with old_imagery.download(aoi, zoom=17, date="1938-08-01") as src:
 pip install old-imagery
 ```
 
-Requires Python 3.10+. Everything comes from wheels — `rasterio` bundles its own GDAL, so there is no system GDAL to install and no `protoc` build step.
+Requires Python 3.10+. On supported Linux, macOS and Windows platforms, pip
+normally installs a `rasterio` wheel containing GDAL, so a separate system GDAL
+is not needed. Source installs of rasterio may require GDAL development files.
+The `old-imagery` package itself needs no `protoc` build step.
 
 ## API
 
-### `availability(aoi, zoom, *, min_date=None, max_date=None, provider="google", method="auto", ...)`
+### `availability`
 
-Returns a `GeoDataFrame` in EPSG:4326, one row per capture date, newest first:
+```python
+availability(
+    aoi: BaseGeometry,
+    zoom: int,
+    *,
+    min_date: date | str | None = None,
+    max_date: date | str | None = None,
+    provider: str = "google",
+    method: str = "auto",
+    esri_wayback_release_date: date | str | None = None,
+    max_workers: int = 16,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 1_000,
+) -> geopandas.GeoDataFrame
+```
+
+`aoi` is a shapely `BaseGeometry` interpreted in EPSG:4326. Date bounds are
+inclusive. The function returns a `GeoDataFrame` in EPSG:4326, one row per
+capture date, newest first:
 
 | column | meaning |
 | --- | --- |
 | `date` | **image capture date** — see the note below |
 | `n_tiles` | AOI tiles carrying imagery from that date |
 | `coverage` | `n_tiles` as a fraction of the AOI's tiles |
-| `complete` | date alone yields a gap-free mosaic |
+| `complete` | date covers every AOI tile (`coverage == 1.0`); measured at tile resolution, not a guarantee that every point is covered |
 | `providers` | imagery provider / release names, where known |
 | `geometry` | covered area, clipped to the AOI |
 
-`gdf.attrs` records `zoom`, `provider`, `n_aoi_tiles` and `method`.
+`gdf.attrs` records `zoom`, `provider`, `n_aoi_tiles`, `method` and
+`selection_mode`. Normal capture-date searches use
+`selection_mode="capture-date"`; `method` is `"per-tile"`, `"region-query"`,
+or `"none"` when the AOI selects no tiles.
 
 ### Dates always mean capture, never release
 
-Every `date` in this library — in `availability`, in `download`, in the raster tags — is the date the imagery was **captured**.
+The `date` argument, every `date` returned by `availability`, and every value in
+the raster `dates` tag is the date the imagery was **captured**. In normal
+capture-date mode, Esri imagery versions whose capture metadata is unavailable
+are omitted; a Wayback release date is never substituted for a missing capture
+date.
 
-This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)"`) is when Esri published a snapshot of the basemap; the imagery inside it may have been flown years earlier. In one San Francisco tile, imagery captured `2010-10-26` first appeared in the `2014-02-20` release. Upstream's CLI has a `--layer-date` flag that reinterprets `--date` as a release date; that flag is deliberately **not** ported, so there is no way to accidentally mix the two here. Release titles appear in the `providers` column as context only.
+This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)"`) is when Esri published a snapshot of the basemap; the imagery inside it may have been flown years earlier. In one San Francisco tile, imagery captured `2010-10-26` first appeared in the `2014-02-20` release. The `date` argument is never reinterpreted as a release date.
+
+### Explicit Esri release snapshots
+
+If you specifically need the basemap as it appeared in one published Wayback
+snapshot, use the deliberately explicit `esri_wayback_release_date` keyword:
+
+```python
+release = "2014-02-20"
+
+# Which capture dates were visible in this exact published snapshot?
+snapshot = old_imagery.availability(
+    aoi,
+    zoom=17,
+    provider="esri",
+    esri_wayback_release_date=release,
+)
+
+# Download pixels from that exact snapshot, irrespective of capture date.
+with old_imagery.download(
+    aoi,
+    zoom=17,
+    provider="esri",
+    esri_wayback_release_date=release,
+) as src:
+    print(src.tags()["selection_mode"])  # "esri-wayback-release"
+```
+
+This option requires an **exact published release date**; it never chooses a
+nearby release silently. It is Esri-only. `availability` rejects capture-date
+bounds or a non-default `method` in this mode. `download` requires `date=None`
+(the default) and rejects a non-default `date_match`. These combinations are
+errors rather than ambiguous requests.
+
+Release-mode availability still returns rows by **capture date**. Its
+`gdf.attrs` records `selection_mode="esri-wayback-release"`,
+`method="esri-wayback-release"`, `esri_wayback_release_date`, and the release
+title. Release-mode downloads record the same selection mode, release date, and
+title in raster tags instead of `target_date` and `date_match`.
+
+An exact release download may contain a tile whose capture metadata is missing.
+The pixels are retained because the requested snapshot is unambiguous, but the
+tile contributes no value to the `dates` tag and is counted in
+`tiles_capture_date_unknown`. Release-mode availability cannot assign such a
+tile to a capture-date row, so it omits it.
 
 ### How availability is resolved
 
@@ -68,10 +145,11 @@ This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)
 Esri has two ways to resolve availability, selected by `method`:
 
 - `"per-tile"` — probe each tile against every Wayback release. Coverage is quantised to whole tiles.
-- `"region"` — one query per release against the metadata feature service. Returns **true capture footprints**, so `geometry` is exact and zoom-independent.
+- `"region"` — one query per release against the metadata feature service. Returns provider-reported capture footprints, so `geometry` is not quantised to tiles and is zoom-independent.
 - `"auto"` (default) — `"region"` at or above `ESRI_REGION_QUERY_MIN_TILES` (50) tiles, `"per-tile"` below.
 
-`gdf.attrs["method"]` reports which ran. Google only has a per-tile path and ignores `method`.
+`gdf.attrs["method"]` reports `"per-tile"` or `"region-query"` according to
+which path ran. Google only has a per-tile path and ignores `method`.
 
 Which is faster is **not** obvious from request counts — per-tile issues far more requests, but they are small and run 16-wide, while each region query hits a slow metadata service. Measured against the live service, cold cache, seconds:
 
@@ -84,9 +162,26 @@ Per-tile wins by 2–3× on small areas; region wins on large ones. Run-to-run v
 
 `n_tiles`, `coverage` and `complete` stay tile-based in both paths, so the numbers remain comparable across methods and providers.
 
-### `download(aoi, zoom, date, *, date_match="closest", provider="google", ...)`
+### `download`
 
-Returns an open, in-memory **3-band uint8 RGB** `rasterio.DatasetReader` covering the AOI's bounding box, snapped to tile pixels.
+```python
+download(
+    aoi: BaseGeometry,
+    zoom: int,
+    date: date | str | None = None,
+    *,
+    date_match: str = "closest",
+    provider: str = "google",
+    esri_wayback_release_date: date | str | None = None,
+    max_workers: int = 16,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 1_000,
+) -> rasterio.DatasetReader
+```
+
+`aoi` is a shapely `BaseGeometry` interpreted in EPSG:4326. The function returns
+an open, in-memory **3-band uint8 RGB** `rasterio.DatasetReader` covering the
+AOI's bounding box, snapped to tile pixels.
 
 The CRS is each provider's **native tile grid** — `EPSG:4326` for Google, `EPSG:3857` for Esri — so no resampling happens on the way out. Reproject with `rasterio.warp` if you need something else.
 
@@ -94,17 +189,44 @@ The CRS is each provider's **native tile grid** — `EPSG:4326` for Google, `EPS
 
 ```python
 ds.tags()
-# {'dates': '1993-07-10', 'target_date': '1993-07-10', 'date_match': 'closest',
-#  'zoom': '18', 'provider': 'google', 'tiles_total': '15', 'tiles_missing': '0'}
+# {'selection_mode': 'capture-date', 'dates': '1993-07-10',
+#  'target_date': '1993-07-10', 'date_match': 'closest', 'zoom': '18',
+#  'provider': 'google', 'tiles_total': '15', 'tiles_missing': '0',
+#  'tiles_capture_date_unknown': '0'}
 ```
 
 Tiles with no imagery are left black and excluded by the dataset mask, so use `ds.dataset_mask()` or `ds.read(masked=True)` to ignore gaps.
 
-Both functions also take `max_workers` (default 16), `cache_dir`, and `max_tiles` (a guard against accidentally requesting a continent). Transient HTTP failures are retried; a request that still fails raises `old_imagery.RequestFailed`, and callers degrade one tile or one release rather than aborting the whole call.
+To save the in-memory result without changing its pixels or georeferencing:
+
+```python
+from rasterio.shutil import copy as rio_copy
+
+with old_imagery.download(aoi, 17, target, date_match="exact") as src:
+    rio_copy(src, "mosaic.tif", driver="GTiff")
+```
+
+Both functions also take `max_workers` (default 16), `cache_dir`, and
+`max_tiles` (default 1,000), which limits the tile grid spanned by the AOI's
+bounding box. `download` holds the RGB mosaic and its mask in memory: 1,000 full
+tiles require about 250 MiB for those raw buffers, plus the in-memory GeoTIFF
+and decoding overhead. Raise the guard only after estimating the resulting
+memory and request cost.
+
+Transient HTTP failures are retried. Failures for an individual tile, packet,
+or Wayback release are treated as missing data so one bad response does not
+usually abort the whole call. A failure while loading the initial Google
+dbRoot or Esri capabilities document raises `old_imagery.RequestFailed`.
 
 ## Caching
 
-Responses are cached on disk under `~/.cache/old-imagery` (override with `$OLD_IMAGERY_CACHE_DIR` or the `cache_dir` argument; pass `cache_dir=None` to disable). Keyhole assets are addressed by epoch and therefore immutable, so cache entries never go stale; only dbRoot and the Esri capabilities document are re-fetched, daily and weekly respectively.
+Responses are cached on disk under `~/.cache/old-imagery` (override with
+`$OLD_IMAGERY_CACHE_DIR` before importing the package, or with the `cache_dir`
+argument; pass `cache_dir=None` to disable). Keyhole assets are addressed by
+epoch and therefore immutable, so cache entries never go stale; only dbRoot and
+the Esri capabilities document are re-fetched, daily and weekly respectively.
+There is no automatic size limit or eviction policy, so long-running workflows
+should monitor or periodically remove this directory.
 
 ## Notes and limitations
 
@@ -112,6 +234,11 @@ Responses are cached on disk under `~/.cache/old-imagery` (override with `$OLD_I
 - **Esri is slow either way.** Wayback exposes no bulk per-tile date query, so the per-tile path probes ~195 releases per tile (~58 requests per tile) and the region path issues ~195 metadata queries plus one footprint fetch per capture date. Both take tens of seconds on a cold cache — see the table above. Google is far quicker than either.
 - **Zoom limits.** `availability` and `download` reject zooms above **21 for Google** and **20 for Esri Wayback** — the deepest levels at which each service actually publishes imagery, per [upstream's docs](https://github.com/Mbucari/GEHistoricalImagery/blob/master/docs/availability.md). The tile schemes themselves address deeper (Keyhole to level 30, Web Mercator to 23, matching upstream's `KeyholeTile.MaxLevel` and `EsriTile.MaxLevel`), but those levels return well-formed tiles carrying no imagery while costing 4× the requests per level, so they raise rather than fail quietly. The caps are readable as `old_imagery.MAX_IMAGERY_ZOOM`. Upstream's CLI instead applies one `[1,23]` bound to both providers; that follows from its single shared `--zoom` flag rather than from either service's limits, so it is not what is enforced here.
 - **Undated imagery.** Google tiles sometimes carry a provider's undated default imagery. It is excluded from `availability` (matching upstream) but is used by `download` as a last-resort fallback, in which case it contributes nothing to the `dates` tag.
+- **Missing Esri capture metadata.** Normal capture-date searches omit an Esri
+  imagery version when its metadata service does not provide a usable capture
+  date. Exact release downloads retain its pixels and count the tile in
+  `tiles_capture_date_unknown`. Its Wayback release date is never used as a
+  substitute capture date.
 - Only `availability` and `download` are ported. Upstream's `info`, `dump`, DXF output, terrain meshes, and the non-time-machine databases (Mars, Moon, Sky) are not.
 
 ## Development
@@ -121,8 +248,8 @@ pip install -e ".[dev]" && pre-commit install
 ```
 
 ```bash
-pytest                  # 164 offline tests, no network
-pytest -m network       # 9 live tests against Google and Esri
+pytest                  # 178 offline tests, no network
+pytest -m network       # 10 live tests against Google and Esri
 ```
 
 Run the network tests sparingly and against small AOIs — they hit the live services.
@@ -137,7 +264,10 @@ pre-commit run --all-files
 
 The mypy hook runs from your dev install rather than an isolated environment, so `pip install -e ".[dev]"` is a prerequisite — that way it resolves the same dependency tree CI does, instead of a second list that can drift.
 
-mypy covers `src/` and `tools/`, not `tests/`: the suite deliberately passes wrong types to assert the errors they raise, and substitutes fake HTTP clients. Full `strict` is not on yet — it reports 61 findings, 38 of them missing annotations.
+mypy covers `src/` and `tools/`, not `tests/`: the suite deliberately passes
+wrong types to assert the errors they raise, and substitutes fake HTTP clients.
+Full `strict` is not enabled yet; the regular check still validates annotated
+code and checks function bodies.
 
 The offline suite includes upstream's own pre-computed quadtree subindex fixtures (`test/LibGoogleEarthTest/*IndexDictionary.json`), so a passing run means this port agrees with the C# implementation node-for-node.
 
@@ -154,13 +284,23 @@ The two schemas have different provenance:
 - **`dbroot_v2.proto`** is Google's own, copied unmodified from [google/earthenterprise](https://github.com/google/earthenterprise) (`earth_enterprise/src/keyhole/proto/dbroot/dbroot_v2.proto`) with its Apache-2.0 header intact.
 - **`quadtreeset.proto`** has no published upstream. Earth Enterprise ships `dbroot_v2.proto` but not quadtreeset, whose internal name — `quadtreeset.protodevel` — survives in descriptors embedded in Google Earth clients. This file is a transcription of that schema into readable source: the field numbers, types and enum values were read out of the `FileDescriptorProto` embedded in upstream's `protoc`-generated C#.
 
-`regen_descriptors.py` diffs every regenerated descriptor against the committed one and refuses to write if any message, field number, type, label or enum value would be lost; purely additive upstream changes are reported and allowed. `--check` verifies the committed blobs match `proto/` without writing, which is worth running in CI.
+`regen_descriptors.py` diffs every regenerated descriptor against the committed
+one and refuses to write if any message, field number, type, label or enum value
+would be lost; purely additive upstream changes are reported and allowed.
+`--check` verifies the committed blobs match `proto/` without writing, and CI
+runs that check.
 
 ## Licence
 
 **GPL-3.0-only.** See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-This is a port of [GEHistoricalImagery](https://github.com/Mbucari/GEHistoricalImagery) by Mbucari, which is GPL-3.0. A port is a derivative work, so old-imagery is distributed under the same licence — it cannot be MIT or BSD. **If you link `old-imagery` into your own program, the GPL's terms apply to that program too.** If that is a problem for you, the imagery is also reachable through [Google Earth Engine](https://earthengine.google.com/) and [Esri's Wayback](https://livingatlas.arcgis.com/wayback/) under their own terms.
+This is a port of [GEHistoricalImagery](https://github.com/Mbucari/GEHistoricalImagery)
+by Mbucari, which is GPL-3.0-or-later. This project exercises the GPLv3 option
+and distributes the combined work as GPL-3.0-only. If you distribute a program
+combined with `old-imagery`, the GPL's terms apply to the combined work; private
+use does not by itself require publication. If that does not fit your intended
+distribution, use independently licensed imagery from an official data
+provider instead.
 
 `proto/dbroot_v2.proto` is Apache-2.0, copyright 2017 Google Inc. The test fixtures in `tests/data/` are copied from upstream — see [tests/data/README.md](tests/data/README.md). Full attribution and a list of changes made in this port are in [NOTICE](NOTICE).
 

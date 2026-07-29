@@ -2,9 +2,8 @@ old-imagery
 Copyright (C) 2026 the old-imagery contributors
 
 This program is free software: you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version. See LICENSE for the full text.
+the terms of version 3 of the GNU General Public License as published by the
+Free Software Foundation. See LICENSE for the full text.
 
 
 THIRD-PARTY MATERIAL
@@ -20,8 +19,10 @@ THIRD-PARTY MATERIAL
    handling and Esri Wayback logic in src/old_imagery/ are ports of that project's
    LibGoogleEarth and LibEsri assemblies and are derivative works of it.
 
-   Because GEHistoricalImagery is licensed under the GNU General Public License
-   version 3, old-imagery as a whole is distributed under the same terms.
+   GEHistoricalImagery permits use under GPL version 3 or any later version.
+   This project exercises the version 3 option and distributes the combined
+   old-imagery work as GPL-3.0-only. Copied upstream material retains its
+   original GPL-3.0-or-later grant.
 
    The following files are copied verbatim from that project and carry its
    copyright:
@@ -35,9 +36,11 @@ THIRD-PARTY MATERIAL
    Changes made in this port: translation from C# to Python; replacement of the
    command line interface with a library API (`availability` and `download`);
    shapely geometry input and GeoDataFrame/rasterio output; a disk response
-   cache; an Esri region-query availability path. Upstream's `info` and `dump`
-   commands, DXF output, terrain meshes, the non-time-machine databases and the
-   `--layer-date` flag are not ported.
+   cache; an Esri region-query availability path. Upstream's `--layer-date`
+   behavior is exposed as the separate, explicit
+   `esri_wayback_release_date` keyword instead of reinterpreting `date`.
+   Upstream's `info` and `dump` commands, DXF output, terrain meshes and the
+   non-time-machine databases are not ported.
 
 2. Google Earth Enterprise -- Apache-2.0
 -----------------------------------------
@@ -84,5 +87,4 @@ This software retrieves imagery; it does not license it. Imagery obtained
 through old-imagery remains the copyright of Google, Esri, or their respective
 imagery providers, and is subject to those providers' terms of service.
 Determining whether a given use is permitted is the responsibility of the
-person running the software. See the "Imagery rights and terms of service"
-section of README.md.
+person running the software. See "Before you use this" in README.md.

@@ -111,31 +111,43 @@ def availability(
     max_date: DateLike | None = None,
     provider: str = "google",
     method: str = "auto",
+    esri_wayback_release_date: DateLike | None = None,
     max_workers: int = 16,
-    cache_dir: str | os.PathLike | None = DEFAULT_CACHE_DIR,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = MAX_TILES,
 ) -> gpd.GeoDataFrame:
     """Find which imagery dates are available over an area.
 
     Parameters
     ----------
-    aoi:
+    aoi : shapely.geometry.base.BaseGeometry
         Area of interest as a shapely geometry in EPSG:4326 (lon/lat degrees).
-    zoom:
+    zoom : int
         Tile zoom level.  Availability is reported at tile granularity, so a
         higher zoom gives finer date boundaries and costs more requests.
-    min_date, max_date:
+    min_date, max_date : datetime.date | str | None
         Optional inclusive bounds on capture date.
-    provider:
+    provider : str
         ``"google"`` for Google Earth historical imagery, ``"esri"`` for the
         Esri World Imagery Wayback archive.
-    method:
+    method : str
         How Esri availability is resolved. ``"auto"`` (default) picks
         ``"region"`` for areas of at least ``ESRI_REGION_QUERY_MIN_TILES``
-        tiles and ``"per-tile"`` below that. ``"region"`` returns exact capture
-        footprints and is faster on large areas but 2-3x slower on small ones;
-        ``"per-tile"`` reports coverage quantised to whole tiles. Ignored for
-        Google, which only has a per-tile path.
+        tiles and ``"per-tile"`` below that. ``"region"`` returns
+        provider-reported capture footprints and is faster on large areas but
+        2-3x slower on small ones; ``"per-tile"`` reports coverage quantised to
+        whole tiles. Ignored for Google, which only has a per-tile path.
+    esri_wayback_release_date : datetime.date | str | None
+        Select one exact Esri Wayback publication snapshot instead of searching
+        by capture date. Requires ``provider="esri"`` and cannot be combined
+        with ``min_date``, ``max_date`` or a non-default ``method``.
+    max_workers : int
+        Maximum number of concurrent HTTP requests. Default 16.
+    cache_dir : str | os.PathLike[str] | None
+        On-disk response cache. Pass ``None`` to disable caching.
+    max_tiles : int
+        Maximum number of tile-grid cells spanned by the AOI's bounding box.
+        Default 1,000.
 
     Returns
     -------
@@ -149,11 +161,12 @@ def availability(
         ``coverage``
             ``n_tiles`` as a fraction of the AOI's tiles.
         ``complete``
-            True when that date covers every AOI tile that has imagery on
-            *any* date, i.e. the date alone yields a gap-free mosaic.
+            True when that date covers every AOI tile (equivalent to
+            ``coverage == 1.0``). This is a tile-resolution measure, not a
+            guarantee that every point in the AOI has imagery.
         ``providers``
-            Imagery provider names, where known. Empty for Esri's region-query
-            path, which reports capture footprints rather than releases.
+            Google imagery provider names or Esri Wayback release titles,
+            where known.
         ``geometry``
             The covered area, clipped to the AOI.
 
@@ -164,21 +177,52 @@ def availability(
         undated default imagery) are excluded, matching upstream behaviour.
 
         ``gdf.attrs`` records ``zoom``, ``provider``, ``n_aoi_tiles`` and
-        ``method``. ``method`` is ``"per-tile"`` or ``"region-query"``: for
-        Esri, areas of at least ``ESRI_REGION_QUERY_MIN_TILES`` tiles use a
-        region-wide capture-footprint query, whose cost is independent of area
-        and whose ``geometry`` is the true footprint rather than a union of
-        whole tiles. Google always uses the per-tile path.
+        ``method``. Normal capture-date searches report ``"per-tile"`` or
+        ``"region-query"``. Exact Esri release selection reports
+        ``"esri-wayback-release"`` and also records
+        ``esri_wayback_release_date`` and ``esri_wayback_release_title``.
     """
     aoi = normalize_aoi(aoi)
     _validate_zoom(zoom, provider)
     min_d, max_d = _as_date(min_date), _as_date(max_date)
+    release_d = _as_date(esri_wayback_release_date)
+    if release_d is not None:
+        if provider != "esri":
+            raise ValueError(
+                "esri_wayback_release_date requires provider='esri'; "
+                "it selects an Esri publication snapshot, not a capture date"
+            )
+        if min_d is not None or max_d is not None:
+            raise ValueError(
+                "esri_wayback_release_date cannot be combined with min_date or max_date; "
+                "the release snapshot reports its own capture dates"
+            )
+        if method != "auto":
+            raise ValueError(
+                "method cannot be set with esri_wayback_release_date; "
+                "release selection uses its own exact-layer path"
+            )
     backend, client = _backend(provider, cache_dir)
 
     try:
+        release_layer = backend.release_at(release_d) if release_d is not None else None
         tiles = backend.grid.tiles(aoi, zoom, max_tiles)
         if not tiles:
-            return _empty_availability(zoom, provider)
+            if release_layer is None:
+                return _empty_availability(zoom, provider)
+            gdf = _empty_availability(
+                zoom,
+                provider,
+                method="esri-wayback-release",
+                selection_mode="esri-wayback-release",
+            )
+            _set_release_attrs(gdf, release_layer)
+            return gdf
+
+        if release_layer is not None:
+            return _availability_at_esri_release(
+                backend, release_layer, aoi, tiles, zoom, provider, max_workers
+            )
 
         if _use_region_query(backend, len(tiles), method):
             return _availability_by_region(
@@ -187,14 +231,11 @@ def availability(
 
         by_date: dict[_dt.date, set] = defaultdict(set)
         providers: dict[_dt.date, set[int]] = defaultdict(set)
-        tiles_with_data: set = set()
         lock = threading.Lock()
 
         def work(tile) -> None:
             dated = backend.dated_tiles(tile)
             with lock:
-                if dated:
-                    tiles_with_data.add(tile)
                 for d in dated:
                     if d.date is None:
                         continue
@@ -209,9 +250,8 @@ def availability(
             list(pool.map(work, tiles))
 
         if not by_date:
-            return _empty_availability(zoom, provider)
+            return _empty_availability(zoom, provider, len(tiles), "per-tile")
 
-        n_any = len(tiles_with_data) or len(tiles)
         rows = []
         for date in sorted(by_date, reverse=True):
             date_tiles = by_date[date]
@@ -223,7 +263,7 @@ def availability(
                     "date": date,
                     "n_tiles": len(date_tiles),
                     "coverage": len(date_tiles) / len(tiles),
-                    "complete": len(date_tiles) >= n_any,
+                    "complete": len(date_tiles) == len(tiles),
                     "providers": ", ".join(names),
                     "geometry": dissolve(date_tiles).intersection(aoi),
                 }
@@ -248,15 +288,67 @@ def _use_region_query(backend, n_tiles: int, method: str = "auto") -> bool:
     return supported and n_tiles >= ESRI_REGION_QUERY_MIN_TILES
 
 
+def _availability_at_esri_release(
+    backend, release_layer, aoi, tiles, zoom, provider, max_workers
+) -> gpd.GeoDataFrame:
+    """Capture dates visible in one exact Esri Wayback release snapshot."""
+    by_date: dict[_dt.date, set] = defaultdict(set)
+    lock = threading.Lock()
+
+    def work(tile) -> None:
+        candidate = backend.tile_at_release(tile, release_layer)
+        if candidate.date is None:
+            return
+        with lock:
+            by_date[candidate.date].add(tile)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(work, tiles))
+
+    if not by_date:
+        gdf = _empty_availability(
+            zoom,
+            provider,
+            len(tiles),
+            method="esri-wayback-release",
+            selection_mode="esri-wayback-release",
+        )
+        _set_release_attrs(gdf, release_layer)
+        return gdf
+
+    rows = [
+        {
+            "date": date,
+            "n_tiles": len(by_date[date]),
+            "coverage": len(by_date[date]) / len(tiles),
+            "complete": len(by_date[date]) == len(tiles),
+            "providers": release_layer.title,
+            "geometry": dissolve(by_date[date]).intersection(aoi),
+        }
+        for date in sorted(by_date, reverse=True)
+    ]
+    gdf = _finish_availability(
+        rows,
+        zoom,
+        provider,
+        len(tiles),
+        method="esri-wayback-release",
+        selection_mode="esri-wayback-release",
+    )
+    _set_release_attrs(gdf, release_layer)
+    return gdf
+
+
 def _availability_by_region(
     backend, aoi, tiles, zoom, provider, min_d, max_d, max_workers
 ) -> gpd.GeoDataFrame:
     """Availability from region-wide capture-footprint queries.
 
-    Produces the same columns as the per-tile path.  ``geometry`` is the true
-    capture footprint clipped to the AOI rather than a union of whole tiles,
-    while ``n_tiles`` / ``coverage`` / ``complete`` stay tile-based so the two
-    paths and the two providers remain directly comparable.
+    Produces the same columns as the per-tile path.  ``geometry`` is the
+    provider-reported capture footprint clipped to the AOI rather than a union
+    of whole tiles, while ``n_tiles`` / ``coverage`` / ``complete`` stay
+    tile-based so the two paths and the two providers remain directly
+    comparable.
     """
     from shapely.ops import unary_union
 
@@ -264,7 +356,7 @@ def _availability_by_region(
         aoi, zoom, min_date=min_d, max_date=max_d, max_workers=max_workers
     )
     if not regions:
-        return _empty_availability(zoom, provider)
+        return _empty_availability(zoom, provider, len(tiles), "region-query")
 
     by_date: dict[_dt.date, list] = defaultdict(list)
     titles: dict[_dt.date, set[str]] = defaultdict(set)
@@ -289,15 +381,14 @@ def _availability_by_region(
         tiles_by_date[date] = covered
 
     if not geometry_by_date:
-        return _empty_availability(zoom, provider)
+        return _empty_availability(zoom, provider, len(tiles), "region-query")
 
-    n_any = len(set().union(*tiles_by_date.values()))
     rows = [
         {
             "date": date,
             "n_tiles": len(tiles_by_date[date]),
             "coverage": len(tiles_by_date[date]) / len(tiles),
-            "complete": len(tiles_by_date[date]) >= n_any,
+            "complete": len(tiles_by_date[date]) == len(tiles),
             "providers": ", ".join(sorted(titles.get(date, ()))),
             "geometry": geometry_by_date[date],
         }
@@ -306,18 +397,50 @@ def _availability_by_region(
     return _finish_availability(rows, zoom, provider, len(tiles), "region-query")
 
 
-def _finish_availability(rows, zoom, provider, n_tiles, method) -> gpd.GeoDataFrame:
+def _finish_availability(
+    rows,
+    zoom,
+    provider,
+    n_tiles,
+    method,
+    selection_mode: str = "capture-date",
+) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(rows, columns=AVAILABILITY_COLUMNS, geometry="geometry", crs=WGS84)
-    gdf.attrs.update(zoom=zoom, provider=provider, n_aoi_tiles=n_tiles, method=method)
+    gdf.attrs.update(
+        zoom=zoom,
+        provider=provider,
+        n_aoi_tiles=n_tiles,
+        method=method,
+        selection_mode=selection_mode,
+    )
     return gdf
 
 
-def _empty_availability(zoom: int, provider: str) -> gpd.GeoDataFrame:
+def _empty_availability(
+    zoom: int,
+    provider: str,
+    n_tiles: int = 0,
+    method: str = "none",
+    selection_mode: str = "capture-date",
+) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(
         {name: [] for name in AVAILABILITY_COLUMNS}, geometry="geometry", crs=WGS84
     )
-    gdf.attrs.update(zoom=zoom, provider=provider, n_aoi_tiles=0, method="none")
+    gdf.attrs.update(
+        zoom=zoom,
+        provider=provider,
+        n_aoi_tiles=n_tiles,
+        method=method,
+        selection_mode=selection_mode,
+    )
     return gdf
+
+
+def _set_release_attrs(gdf: gpd.GeoDataFrame, layer) -> None:
+    gdf.attrs.update(
+        esri_wayback_release_date=layer.date,
+        esri_wayback_release_title=layer.title,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -326,31 +449,48 @@ def _empty_availability(zoom: int, provider: str) -> gpd.GeoDataFrame:
 def download(
     aoi: BaseGeometry,
     zoom: int,
-    date: DateLike,
+    date: DateLike | None = None,
     *,
     date_match: str = "closest",
     provider: str = "google",
+    esri_wayback_release_date: DateLike | None = None,
     max_workers: int = 16,
-    cache_dir: str | os.PathLike | None = DEFAULT_CACHE_DIR,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = MAX_TILES,
 ) -> rasterio.DatasetReader:
     """Download and mosaic historical imagery over an area.
 
     Parameters
     ----------
-    aoi:
+    aoi : shapely.geometry.base.BaseGeometry
         Area of interest as a shapely geometry in EPSG:4326 (lon/lat degrees).
         The output covers the AOI's bounding box, snapped to tile pixels.
-    zoom:
+    zoom : int
         Tile zoom level.  Ground resolution is roughly ``156543 / 2**zoom``
         metres per pixel at the equator.
-    date:
-        Target capture date (``datetime.date`` or ISO string).
-    date_match:
+    date : datetime.date | str | None
+        Target capture date (``datetime.date`` or ISO string). Required for
+        normal capture-date selection and forbidden when selecting an exact
+        Esri Wayback release.
+    date_match : str
         How to resolve tiles lacking imagery on the exact target date:
         ``"closest"`` (default), ``"exact"``, ``"before"`` or ``"after"``.
         Matching happens per tile, so a mosaic may mix dates; the dates
         actually used are recorded in the dataset tags.
+    provider : str
+        ``"google"`` for Google Earth historical imagery, ``"esri"`` for the
+        Esri World Imagery Wayback archive.
+    esri_wayback_release_date : datetime.date | str | None
+        Force imagery from the exact Esri Wayback release published on this
+        date. Requires ``provider="esri"`` and ``date=None``. ``date_match``
+        must remain at its default and is not used in this mode.
+    max_workers : int
+        Maximum number of concurrent HTTP requests. Default 16.
+    cache_dir : str | os.PathLike[str] | None
+        On-disk response cache. Pass ``None`` to disable caching.
+    max_tiles : int
+        Maximum number of tile-grid cells spanned by the AOI's bounding box.
+        Default 1,000.
 
     Returns
     -------
@@ -362,9 +502,13 @@ def download(
 
         Tiles with no imagery are left black and excluded by the dataset mask,
         so use ``ds.dataset_mask()`` or ``ds.read(masked=True)`` to ignore gaps.
-        Dataset tags carry ``dates`` (comma-separated dates actually used),
-        ``target_date``, ``date_match``, ``zoom``, ``provider``, ``tiles_total``
-        and ``tiles_missing``.
+        Dataset tags always carry ``selection_mode``, ``zoom``, ``provider``,
+        ``tiles_total``, ``tiles_missing`` and
+        ``tiles_capture_date_unknown``. ``dates`` contains comma-separated
+        capture dates when at least one is known. Capture-date mode also
+        records ``target_date`` and ``date_match``. Release mode instead
+        records ``esri_wayback_release_date`` and
+        ``esri_wayback_release_title``.
 
     Raises
     ------
@@ -374,11 +518,29 @@ def download(
     _validate_zoom(zoom, provider)
     aoi = normalize_aoi(aoi)
     target = _as_date(date)
-    if target is None:
+    release_d = _as_date(esri_wayback_release_date)
+    if release_d is not None:
+        if provider != "esri":
+            raise ValueError(
+                "esri_wayback_release_date requires provider='esri'; "
+                "it selects an Esri publication snapshot, not a capture date"
+            )
+        if target is not None:
+            raise ValueError(
+                "Choose either date (capture-date mode) or esri_wayback_release_date "
+                "(exact release mode), not both"
+            )
+        if date_match != "closest":
+            raise ValueError(
+                "date_match cannot be set with esri_wayback_release_date; "
+                "the exact release layer is used without date fallback"
+            )
+    elif target is None:
         raise ValueError("A target date is required")
     backend, client = _backend(provider, cache_dir)
 
     try:
+        release_layer = backend.release_at(release_d) if release_d is not None else None
         grid = backend.grid
         tiles = grid.tiles(aoi, zoom, max_tiles)
         if not tiles:
@@ -391,11 +553,16 @@ def download(
         mask = np.zeros((height, width), dtype=np.uint8)
         used_dates: set[_dt.date] = set()
         missing = 0
+        unknown_capture_dates = 0
         lock = threading.Lock()
 
         def work(tile) -> None:
-            nonlocal missing
-            result = _fetch_tile(backend, tile, target, date_match)
+            nonlocal missing, unknown_capture_dates
+            if release_layer is not None:
+                result = _fetch_release_tile(backend, tile, release_layer)
+            else:
+                assert target is not None
+                result = _fetch_tile(backend, tile, target, date_match)
             if result is None:
                 with lock:
                     missing += 1
@@ -413,11 +580,18 @@ def download(
                 mask[y0 - top : y1 - top, x0 - left : x1 - left] = 255
                 if tile_date is not None:
                     used_dates.add(tile_date)
+                else:
+                    unknown_capture_dates += 1
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             list(pool.map(work, tiles))
 
         if not mask.any():
+            if release_layer is not None:
+                raise ValueError(
+                    f"No imagery found in Esri Wayback release "
+                    f"{release_layer.date.isoformat()} over this area at zoom {zoom}"
+                )
             raise ValueError(
                 f"No imagery found for {target} over this area at zoom {zoom} "
                 f"with date_match={date_match!r}"
@@ -436,15 +610,28 @@ def download(
         ) as dst:
             dst.write(rgb)
             dst.write_mask(mask)
-            dst.update_tags(
+            tags = dict(
                 dates=",".join(d.isoformat() for d in sorted(used_dates)),
-                target_date=target.isoformat(),
-                date_match=date_match,
                 zoom=str(zoom),
                 provider=provider,
                 tiles_total=str(len(tiles)),
                 tiles_missing=str(missing),
+                tiles_capture_date_unknown=str(unknown_capture_dates),
             )
+            if release_layer is not None:
+                tags.update(
+                    selection_mode="esri-wayback-release",
+                    esri_wayback_release_date=release_layer.date.isoformat(),
+                    esri_wayback_release_title=release_layer.title,
+                )
+            else:
+                assert target is not None
+                tags.update(
+                    selection_mode="capture-date",
+                    target_date=target.isoformat(),
+                    date_match=date_match,
+                )
+            dst.update_tags(**tags)
 
         dataset = memfile.open()
         # Keep the backing MemoryFile alive for as long as the reader is used.
@@ -469,6 +656,17 @@ def _fetch_tile(backend, tile, target: _dt.date, date_match: str):
         if arr is not None:
             return arr, candidate.date
     return None
+
+
+def _fetch_release_tile(backend, tile, release_layer):
+    """Return ``(array, capture_date)`` from one exact Esri release, or ``None``."""
+    candidate = backend.tile_at_release(tile, release_layer)
+    try:
+        raw = backend.download_tile_image(candidate)
+    except (RequestFailed, OSError, ValueError):
+        return None
+    arr = _decode_image(raw)
+    return None if arr is None else (arr, candidate.date)
 
 
 def _decode_image(raw: bytes) -> np.ndarray | None:

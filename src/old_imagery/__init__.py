@@ -3,13 +3,13 @@
 Copyright (C) 2026 the old-imagery contributors
 
 This program is free software: you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version.  It is distributed WITHOUT ANY WARRANTY, without even the implied
-warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-General Public License (LICENSE) for details.
+the terms of version 3 of the GNU General Public License as published by the
+Free Software Foundation. It is distributed WITHOUT ANY WARRANTY, without even
+the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU General Public License (LICENSE) for details.
 
-Ported from Mbucari/GEHistoricalImagery (GPL-3.0); see NOTICE for attribution.
+Ported from Mbucari/GEHistoricalImagery (GPL-3.0-or-later); see NOTICE for
+attribution. The combined old-imagery work is GPL-3.0-only.
 This library retrieves imagery but does not license it — imagery remains the
 copyright of Google, Esri or their providers, and their terms of service apply.
 
@@ -22,8 +22,10 @@ two functions for use from Python rather than a command line tool:
 >>> dates = old_imagery.availability(aoi, zoom=18)                 # doctest: +SKIP
 >>> img = old_imagery.download(aoi, zoom=18, date="1993-07-10")    # doctest: +SKIP
 
-Every date this package reports or accepts is an **image capture date**, never
-a provider's publication or release date.
+The ``date`` argument and every date this package reports is an **image capture
+date**, never a provider's publication or release date. Exact Esri Wayback
+snapshots are selected separately and explicitly with
+``esri_wayback_release_date``.
 """
 
 from ._dbroot import Database, DatedTile, DbRoot
