@@ -83,6 +83,38 @@ def _as_date(value: DateLike | None) -> _dt.date | None:
     return _dt.date.fromisoformat(str(value))
 
 
+def _release_selector(
+    release_id: str | None,
+    as_of_date: DateLike | None,
+) -> tuple[str | None, str | _dt.date | None]:
+    """Validate and normalise the mutually exclusive Esri release selectors."""
+    as_of_d = _as_date(as_of_date)
+    selectors: list[tuple[str, str | _dt.date]] = []
+    if release_id is not None:
+        if not release_id:
+            raise ValueError("esri_wayback_release_id cannot be empty")
+        selectors.append(("identifier", release_id))
+    if as_of_d is not None:
+        selectors.append(("visible-on-or-before", as_of_d))
+    if len(selectors) > 1:
+        raise ValueError(
+            "Set only one Esri Wayback release selector: "
+            "esri_wayback_release_id or esri_wayback_as_of_date"
+        )
+    return selectors[0] if selectors else (None, None)
+
+
+def _resolve_release(backend, resolution: str | None, value: str | _dt.date | None):
+    """Resolve one validated release selector against an Esri backend."""
+    if resolution is None:
+        return None
+    if resolution == "identifier":
+        assert isinstance(value, str)
+        return backend.release_by_identifier(value)
+    assert isinstance(value, _dt.date)
+    return backend.release_on_or_before(value)
+
+
 def _backend(provider: str, cache_dir: str | os.PathLike | None):
     """Build a provider backend and the HTTP client that owns its connections."""
     client = CachedHttpClient(cache_dir)
@@ -111,7 +143,8 @@ def availability(
     max_date: DateLike | None = None,
     provider: str = "google",
     method: str = "auto",
-    esri_wayback_release_date: DateLike | None = None,
+    esri_wayback_release_id: str | None = None,
+    esri_wayback_as_of_date: DateLike | None = None,
     max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = MAX_TILES,
@@ -137,10 +170,16 @@ def availability(
         provider-reported capture footprints and is faster on large areas but
         2-3x slower on small ones; ``"per-tile"`` reports coverage quantised to
         whole tiles. Ignored for Google, which only has a per-tile path.
-    esri_wayback_release_date : datetime.date | str | None
-        Select one exact Esri Wayback publication snapshot instead of searching
-        by capture date. Requires ``provider="esri"`` and cannot be combined
-        with ``min_date``, ``max_date`` or a non-default ``method``.
+    esri_wayback_release_id : str | None
+        Select one exact Esri Wayback snapshot by its stable catalogue
+        identifier, for example ``"WB_2026_R03"``. This is the preferred exact
+        release selector.
+    esri_wayback_as_of_date : datetime.date | str | None
+        Select the latest WMTS snapshot dated on or before this date. This is
+        an explicit release-catalogue lookup, not capture-date matching.
+        Release selectors are mutually exclusive, require ``provider="esri"``,
+        and cannot be combined with capture-date bounds or a non-default
+        ``method``.
     max_workers : int
         Maximum number of concurrent HTTP requests. Default 16.
     cache_dir : str | os.PathLike[str] | None
@@ -178,50 +217,69 @@ def availability(
 
         ``gdf.attrs`` records ``zoom``, ``provider``, ``n_aoi_tiles`` and
         ``method``. Normal capture-date searches report ``"per-tile"`` or
-        ``"region-query"``. Exact Esri release selection reports
-        ``"esri-wayback-release"`` and also records
-        ``esri_wayback_release_date`` and ``esri_wayback_release_title``.
+        ``"region-query"``. Esri release selection reports
+        ``"esri-wayback-release"`` and also records the resolved release ID,
+        catalogue date, title, and resolution method.
     """
     aoi = normalize_aoi(aoi)
     _validate_zoom(zoom, provider)
     min_d, max_d = _as_date(min_date), _as_date(max_date)
-    release_d = _as_date(esri_wayback_release_date)
-    if release_d is not None:
+    release_resolution, release_value = _release_selector(
+        esri_wayback_release_id,
+        esri_wayback_as_of_date,
+    )
+    if release_resolution is not None:
         if provider != "esri":
             raise ValueError(
-                "esri_wayback_release_date requires provider='esri'; "
-                "it selects an Esri publication snapshot, not a capture date"
+                "Esri Wayback release selectors require provider='esri'; "
+                "they select publication snapshots, not capture dates"
             )
         if min_d is not None or max_d is not None:
             raise ValueError(
-                "esri_wayback_release_date cannot be combined with min_date or max_date; "
+                "Esri Wayback release selectors cannot be combined with "
+                "min_date or max_date; "
                 "the release snapshot reports its own capture dates"
             )
         if method != "auto":
             raise ValueError(
-                "method cannot be set with esri_wayback_release_date; "
+                "method cannot be set with an Esri Wayback release selector; "
                 "release selection uses its own exact-layer path"
             )
     backend, client = _backend(provider, cache_dir)
 
     try:
-        release_layer = backend.release_at(release_d) if release_d is not None else None
+        release_layer = _resolve_release(backend, release_resolution, release_value)
         tiles = backend.grid.tiles(aoi, zoom, max_tiles)
         if not tiles:
             if release_layer is None:
                 return _empty_availability(zoom, provider)
+            assert release_resolution is not None
             gdf = _empty_availability(
                 zoom,
                 provider,
                 method="esri-wayback-release",
                 selection_mode="esri-wayback-release",
             )
-            _set_release_attrs(gdf, release_layer)
+            _set_release_attrs(
+                gdf,
+                release_layer,
+                release_resolution,
+                esri_wayback_as_of_date,
+            )
             return gdf
 
         if release_layer is not None:
+            assert release_resolution is not None
             return _availability_at_esri_release(
-                backend, release_layer, aoi, tiles, zoom, provider, max_workers
+                backend,
+                release_layer,
+                aoi,
+                tiles,
+                zoom,
+                provider,
+                max_workers,
+                release_resolution,
+                esri_wayback_as_of_date,
             )
 
         if _use_region_query(backend, len(tiles), method):
@@ -289,7 +347,15 @@ def _use_region_query(backend, n_tiles: int, method: str = "auto") -> bool:
 
 
 def _availability_at_esri_release(
-    backend, release_layer, aoi, tiles, zoom, provider, max_workers
+    backend,
+    release_layer,
+    aoi,
+    tiles,
+    zoom,
+    provider,
+    max_workers,
+    release_resolution,
+    as_of_date,
 ) -> gpd.GeoDataFrame:
     """Capture dates visible in one exact Esri Wayback release snapshot."""
     by_date: dict[_dt.date, set] = defaultdict(set)
@@ -313,7 +379,7 @@ def _availability_at_esri_release(
             method="esri-wayback-release",
             selection_mode="esri-wayback-release",
         )
-        _set_release_attrs(gdf, release_layer)
+        _set_release_attrs(gdf, release_layer, release_resolution, as_of_date)
         return gdf
 
     rows = [
@@ -335,7 +401,7 @@ def _availability_at_esri_release(
         method="esri-wayback-release",
         selection_mode="esri-wayback-release",
     )
-    _set_release_attrs(gdf, release_layer)
+    _set_release_attrs(gdf, release_layer, release_resolution, as_of_date)
     return gdf
 
 
@@ -436,11 +502,20 @@ def _empty_availability(
     return gdf
 
 
-def _set_release_attrs(gdf: gpd.GeoDataFrame, layer) -> None:
+def _set_release_attrs(
+    gdf: gpd.GeoDataFrame,
+    layer,
+    resolution: str,
+    as_of_date: DateLike | None = None,
+) -> None:
     gdf.attrs.update(
-        esri_wayback_release_date=layer.date,
+        esri_wayback_release_id=layer.identifier,
+        esri_wayback_catalogue_date=layer.date,
         esri_wayback_release_title=layer.title,
+        esri_wayback_release_resolution=resolution,
     )
+    if as_of_date is not None:
+        gdf.attrs["esri_wayback_as_of_date"] = _as_date(as_of_date)
 
 
 # --------------------------------------------------------------------------
@@ -453,7 +528,8 @@ def download(
     *,
     date_match: str = "closest",
     provider: str = "google",
-    esri_wayback_release_date: DateLike | None = None,
+    esri_wayback_release_id: str | None = None,
+    esri_wayback_as_of_date: DateLike | None = None,
     max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = MAX_TILES,
@@ -480,10 +556,15 @@ def download(
     provider : str
         ``"google"`` for Google Earth historical imagery, ``"esri"`` for the
         Esri World Imagery Wayback archive.
-    esri_wayback_release_date : datetime.date | str | None
-        Force imagery from the exact Esri Wayback release published on this
-        date. Requires ``provider="esri"`` and ``date=None``. ``date_match``
-        must remain at its default and is not used in this mode.
+    esri_wayback_release_id : str | None
+        Force imagery from the exact Esri Wayback release with this stable
+        identifier, for example ``"WB_2026_R03"``. This is the preferred exact
+        release selector.
+    esri_wayback_as_of_date : datetime.date | str | None
+        Force imagery from the latest WMTS release dated on or before this
+        date. This is release-catalogue resolution, not capture-date matching.
+        Release selectors are mutually exclusive, require ``provider="esri"``
+        and ``date=None``, and do not use ``date_match``.
     max_workers : int
         Maximum number of concurrent HTTP requests. Default 16.
     cache_dir : str | os.PathLike[str] | None
@@ -507,8 +588,8 @@ def download(
         ``tiles_capture_date_unknown``. ``dates`` contains comma-separated
         capture dates when at least one is known. Capture-date mode also
         records ``target_date`` and ``date_match``. Release mode instead
-        records ``esri_wayback_release_date`` and
-        ``esri_wayback_release_title``.
+        records the resolved Esri release ID, catalogue date, title, and
+        resolution method.
 
     Raises
     ------
@@ -518,21 +599,24 @@ def download(
     _validate_zoom(zoom, provider)
     aoi = normalize_aoi(aoi)
     target = _as_date(date)
-    release_d = _as_date(esri_wayback_release_date)
-    if release_d is not None:
+    release_resolution, release_value = _release_selector(
+        esri_wayback_release_id,
+        esri_wayback_as_of_date,
+    )
+    if release_resolution is not None:
         if provider != "esri":
             raise ValueError(
-                "esri_wayback_release_date requires provider='esri'; "
-                "it selects an Esri publication snapshot, not a capture date"
+                "Esri Wayback release selectors require provider='esri'; "
+                "they select publication snapshots, not capture dates"
             )
         if target is not None:
             raise ValueError(
-                "Choose either date (capture-date mode) or esri_wayback_release_date "
-                "(exact release mode), not both"
+                "Choose either date (capture-date mode) or one Esri Wayback "
+                "release selector, not both"
             )
         if date_match != "closest":
             raise ValueError(
-                "date_match cannot be set with esri_wayback_release_date; "
+                "date_match cannot be set with an Esri Wayback release selector; "
                 "the exact release layer is used without date fallback"
             )
     elif target is None:
@@ -540,7 +624,7 @@ def download(
     backend, client = _backend(provider, cache_dir)
 
     try:
-        release_layer = backend.release_at(release_d) if release_d is not None else None
+        release_layer = _resolve_release(backend, release_resolution, release_value)
         grid = backend.grid
         tiles = grid.tiles(aoi, zoom, max_tiles)
         if not tiles:
@@ -619,11 +703,18 @@ def download(
                 tiles_capture_date_unknown=str(unknown_capture_dates),
             )
             if release_layer is not None:
+                assert release_resolution is not None
                 tags.update(
                     selection_mode="esri-wayback-release",
-                    esri_wayback_release_date=release_layer.date.isoformat(),
+                    esri_wayback_release_id=release_layer.identifier,
+                    esri_wayback_catalogue_date=release_layer.date.isoformat(),
                     esri_wayback_release_title=release_layer.title,
+                    esri_wayback_release_resolution=release_resolution,
                 )
+                if esri_wayback_as_of_date is not None:
+                    as_of_d = _as_date(esri_wayback_as_of_date)
+                    assert as_of_d is not None
+                    tags["esri_wayback_as_of_date"] = as_of_d.isoformat()
             else:
                 assert target is not None
                 tags.update(

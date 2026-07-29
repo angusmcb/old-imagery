@@ -23,9 +23,9 @@ two functions for use from Python rather than a command line tool:
 >>> img = old_imagery.download(aoi, zoom=18, date="1993-07-10")    # doctest: +SKIP
 
 The ``date`` argument and every date this package reports is an **image capture
-date**, never a provider's publication or release date. Exact Esri Wayback
-snapshots are selected separately and explicitly with
-``esri_wayback_release_date``.
+date**, never a provider's publication or release date. Esri Wayback snapshots
+are selected separately and explicitly by stable release identifier or an
+as-of catalogue date.
 """
 
 from ._dbroot import Database, DatedTile, DbRoot

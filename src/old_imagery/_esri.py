@@ -199,30 +199,30 @@ class WayBack:
             self._date_cache[key] = date
         return date
 
-    def release_at(self, release_date: _dt.date) -> Layer:
-        """Return the Wayback release published on exactly ``release_date``.
-
-        Exact matching is deliberate: callers selecting a release snapshot
-        should never be moved silently to a different publication date.
-        """
+    def release_by_identifier(self, identifier: str) -> Layer:
+        """Return the exact release with stable WMTS ``identifier``."""
         for layer in self.layers:
-            if layer.date == release_date:
+            if layer.identifier == identifier:
                 return layer
-
-        earlier = max(
-            (layer.date for layer in self.layers if layer.date < release_date), default=None
-        )
-        later = min(
-            (layer.date for layer in self.layers if layer.date > release_date), default=None
-        )
-        neighbours = ", ".join(
-            f"{label} {value.isoformat()}"
-            for label, value in (("previous:", earlier), ("next:", later))
-            if value is not None
-        )
-        detail = f" ({neighbours})" if neighbours else ""
         raise ValueError(
-            f"No Esri Wayback release was published on {release_date.isoformat()}{detail}"
+            f"No Esri Wayback release has identifier {identifier!r}; "
+            "expected a catalogue identifier such as 'WB_2026_R03'"
+        )
+
+    def release_on_or_before(self, visible_date: _dt.date) -> Layer:
+        """Return the latest WMTS release dated on or before ``visible_date``."""
+        matches = [layer for layer in self.layers if layer.date <= visible_date]
+        if matches:
+            return max(matches, key=lambda layer: layer.date)
+
+        earliest = min((layer.date for layer in self.layers), default=None)
+        detail = (
+            f"; the earliest catalogue release is {earliest.isoformat()}"
+            if earliest is not None
+            else ""
+        )
+        raise ValueError(
+            f"No Esri Wayback release was visible on or before {visible_date.isoformat()}{detail}"
         )
 
     def tile_at_release(self, tile: MercatorTile, layer: Layer) -> DatedEsriTile:

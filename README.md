@@ -59,7 +59,8 @@ availability(
     max_date: date | str | None = None,
     provider: str = "google",
     method: str = "auto",
-    esri_wayback_release_date: date | str | None = None,
+    esri_wayback_release_id: str | None = None,
+    esri_wayback_as_of_date: date | str | None = None,
     max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
@@ -96,41 +97,69 @@ This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)
 
 ### Explicit Esri release snapshots
 
-If you specifically need the basemap as it appeared in one published Wayback
-snapshot, use the deliberately explicit `esri_wayback_release_date` keyword:
+If you specifically need the basemap as it appeared in one Wayback snapshot,
+use a deliberately explicit release selector. These options never change the
+meaning of the ordinary capture-date arguments.
+
+For an exact known release, prefer its stable `WB_YYYY_RNN` identifier:
 
 ```python
-release = "2014-02-20"
+release_id = "WB_2026_R03"
 
-# Which capture dates were visible in this exact published snapshot?
+# Which capture dates were visible in this exact release?
 snapshot = old_imagery.availability(
     aoi,
     zoom=17,
     provider="esri",
-    esri_wayback_release_date=release,
+    esri_wayback_release_id=release_id,
 )
 
-# Download pixels from that exact snapshot, irrespective of capture date.
+# Download pixels from that exact release, irrespective of capture date.
 with old_imagery.download(
     aoi,
     zoom=17,
     provider="esri",
-    esri_wayback_release_date=release,
+    esri_wayback_release_id=release_id,
 ) as src:
     print(src.tags()["selection_mode"])  # "esri-wayback-release"
 ```
 
-This option requires an **exact published release date**; it never chooses a
-nearby release silently. It is Esri-only. `availability` rejects capture-date
-bounds or a non-default `method` in this mode. `download` requires `date=None`
-(the default) and rejects a non-default `date_match`. These combinations are
-errors rather than ambiguous requests.
+To resolve an arbitrary service date, use the visibly different
+`esri_wayback_as_of_date` selector:
+
+```python
+# Latest WMTS release dated no later than 2026-03-26.
+with old_imagery.download(
+    aoi,
+    zoom=17,
+    provider="esri",
+    esri_wayback_as_of_date="2026-03-26",
+) as src:
+    print(src.tags()["esri_wayback_release_id"])       # "WB_2026_R03"
+    print(src.tags()["esri_wayback_catalogue_date"])  # "2026-03-25"
+```
+
+The as-of rule is deterministic: choose the catalogue release with the greatest
+date that is less than or equal to the requested date, and never choose a future
+release. This handles Esri's known one-day inconsistency for `WB_2026_R03`:
+other Esri configuration calls it `2026-03-26`, while the WMTS title calls it
+`2026-03-25`.
+
+Use `esri_wayback_release_id` when the release is known, or
+`esri_wayback_as_of_date` when the service date is known. The two release
+selectors are mutually exclusive and Esri-only.
+`availability` rejects capture-date bounds or a non-default `method` in release
+mode. `download` requires `date=None` (the default) and rejects a non-default
+`date_match`. These combinations are errors rather than ambiguous requests.
 
 Release-mode availability still returns rows by **capture date**. Its
 `gdf.attrs` records `selection_mode="esri-wayback-release"`,
-`method="esri-wayback-release"`, `esri_wayback_release_date`, and the release
-title. Release-mode downloads record the same selection mode, release date, and
-title in raster tags instead of `target_date` and `date_match`.
+`method="esri-wayback-release"`, the resolved
+`esri_wayback_release_id`, `esri_wayback_catalogue_date`,
+`esri_wayback_release_title`, and `esri_wayback_release_resolution`.
+Release-mode downloads record the same fields in raster tags instead of
+`target_date` and `date_match`. As-of results additionally record the requested
+`esri_wayback_as_of_date`.
 
 An exact release download may contain a tile whose capture metadata is missing.
 The pixels are retained because the requested snapshot is unambiguous, but the
@@ -172,7 +201,8 @@ download(
     *,
     date_match: str = "closest",
     provider: str = "google",
-    esri_wayback_release_date: date | str | None = None,
+    esri_wayback_release_id: str | None = None,
+    esri_wayback_as_of_date: date | str | None = None,
     max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
@@ -248,7 +278,7 @@ pip install -e ".[dev]" && pre-commit install
 ```
 
 ```bash
-pytest                  # 178 offline tests, no network
+pytest                  # 184 offline tests, no network
 pytest -m network       # 10 live tests against Google and Esri
 ```
 

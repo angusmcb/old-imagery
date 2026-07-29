@@ -110,23 +110,28 @@ def test_esri_region_query_dates_are_capture_not_release() -> None:
     assert len(capture_dates - release_dates) > len(capture_dates) / 2
 
 
-def test_esri_exact_wayback_release_selection() -> None:
-    """Release mode must target one exact published snapshot and label it clearly."""
+def test_esri_wayback_release_selection() -> None:
+    """Stable-ID and as-of modes target and clearly label one release."""
     from old_imagery._esri import WayBack
     from old_imagery._http import CachedHttpClient
 
     small = box(-122.3965, 37.7940, -122.3945, 37.7955)
     with CachedHttpClient() as client:
-        release = WayBack(client).layers[0]
+        wayback = WayBack(client)
+        release = wayback.layers[0]
+        assert wayback.release_by_identifier(release.identifier) is release
+        assert wayback.release_on_or_before(release.date) is release
 
     gdf = old_imagery.availability(
         small,
         zoom=17,
         provider="esri",
-        esri_wayback_release_date=release.date,
+        esri_wayback_release_id=release.identifier,
     )
     assert gdf.attrs["selection_mode"] == "esri-wayback-release"
-    assert gdf.attrs["esri_wayback_release_date"] == release.date
+    assert gdf.attrs["esri_wayback_release_id"] == release.identifier
+    assert gdf.attrs["esri_wayback_catalogue_date"] == release.date
+    assert gdf.attrs["esri_wayback_release_resolution"] == "identifier"
     if len(gdf):
         assert (gdf["providers"] == release.title).all()
 
@@ -134,12 +139,15 @@ def test_esri_exact_wayback_release_selection() -> None:
         small,
         zoom=17,
         provider="esri",
-        esri_wayback_release_date=release.date,
+        esri_wayback_as_of_date=release.date,
     )
     tags = ds.tags()
     assert tags["selection_mode"] == "esri-wayback-release"
-    assert tags["esri_wayback_release_date"] == release.date.isoformat()
+    assert tags["esri_wayback_release_id"] == release.identifier
+    assert tags["esri_wayback_catalogue_date"] == release.date.isoformat()
     assert tags["esri_wayback_release_title"] == release.title
+    assert tags["esri_wayback_release_resolution"] == "visible-on-or-before"
+    assert tags["esri_wayback_as_of_date"] == release.date.isoformat()
     assert (ds.dataset_mask() > 0).all()
 
 

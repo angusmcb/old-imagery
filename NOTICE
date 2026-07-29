@@ -36,9 +36,10 @@ THIRD-PARTY MATERIAL
    Changes made in this port: translation from C# to Python; replacement of the
    command line interface with a library API (`availability` and `download`);
    shapely geometry input and GeoDataFrame/rasterio output; a disk response
-   cache; an Esri region-query availability path. Upstream's `--layer-date`
-   behavior is exposed as the separate, explicit
-   `esri_wayback_release_date` keyword instead of reinterpreting `date`.
+   cache; an Esri region-query availability path. Upstream's release-selection
+   behavior is exposed through separate, explicit keywords for a stable release
+   identifier or the latest catalogue release on or before a date, instead of
+   reinterpreting the capture-date argument.
    Upstream's `info` and `dump` commands, DXF output, terrain meshes and the
    non-time-machine databases are not ported.
 

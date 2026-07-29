@@ -263,6 +263,7 @@ class RegionBackend(StubBackend):
 @dataclass(frozen=True)
 class StubRelease:
     id: int
+    identifier: str
     date: dt.date
     title: str
 
@@ -274,6 +275,7 @@ class ReleaseBackend(StubBackend):
         super().__init__([capture_date], **kwargs)
         self.release = StubRelease(
             id=42,
+            identifier="WB_2014_R01",
             date=release_date,
             title=f"World Imagery (Wayback {release_date.isoformat()})",
         )
@@ -281,9 +283,14 @@ class ReleaseBackend(StubBackend):
         self.dated_tile_calls = 0
         self.release_tile_calls = 0
 
-    def release_at(self, release_date):
-        if release_date != self.release.date:
-            raise ValueError(f"No Esri Wayback release was published on {release_date}")
+    def release_by_identifier(self, identifier):
+        if identifier != self.release.identifier:
+            raise ValueError(f"No Esri Wayback release has identifier {identifier}")
+        return self.release
+
+    def release_on_or_before(self, visible_date):
+        if visible_date < self.release.date:
+            raise ValueError(f"No Esri Wayback release was visible on or before {visible_date}")
         return self.release
 
     def tile_at_release(self, tile, release):
@@ -299,21 +306,25 @@ class ReleaseBackend(StubBackend):
 RELEASE_DATE = dt.date(2014, 2, 20)
 
 
-def test_availability_can_select_one_exact_esri_release(stub) -> None:
+def test_availability_can_select_latest_release_visible_on_or_before_date(stub) -> None:
+    requested = RELEASE_DATE + dt.timedelta(days=1)
     backend = stub(ReleaseBackend(RELEASE_DATE, D1))
     gdf = old_imagery.availability(
         AOI,
         ZOOM,
         provider="esri",
-        esri_wayback_release_date=RELEASE_DATE,
+        esri_wayback_as_of_date=requested,
     )
 
     assert list(gdf["date"]) == [D1]
     assert (gdf["providers"] == backend.release.title).all()
     assert gdf.attrs["selection_mode"] == "esri-wayback-release"
     assert gdf.attrs["method"] == "esri-wayback-release"
-    assert gdf.attrs["esri_wayback_release_date"] == RELEASE_DATE
+    assert gdf.attrs["esri_wayback_release_id"] == backend.release.identifier
+    assert gdf.attrs["esri_wayback_catalogue_date"] == RELEASE_DATE
     assert gdf.attrs["esri_wayback_release_title"] == backend.release.title
+    assert gdf.attrs["esri_wayback_release_resolution"] == "visible-on-or-before"
+    assert gdf.attrs["esri_wayback_as_of_date"] == requested
     assert backend.release_tile_calls == gdf.attrs["n_aoi_tiles"]
     assert backend.dated_tile_calls == 0
 
@@ -324,28 +335,30 @@ def test_release_availability_omits_unknown_capture_dates_but_keeps_metadata(stu
         AOI,
         ZOOM,
         provider="esri",
-        esri_wayback_release_date=RELEASE_DATE,
+        esri_wayback_release_id=backend.release.identifier,
     )
 
     assert len(gdf) == 0
     assert gdf.attrs["selection_mode"] == "esri-wayback-release"
-    assert gdf.attrs["esri_wayback_release_date"] == RELEASE_DATE
+    assert gdf.attrs["esri_wayback_catalogue_date"] == RELEASE_DATE
     assert backend.release_tile_calls == gdf.attrs["n_aoi_tiles"]
 
 
-def test_download_can_select_one_exact_esri_release(stub) -> None:
+def test_download_can_select_one_exact_esri_release_by_identifier(stub) -> None:
     backend = stub(ReleaseBackend(RELEASE_DATE, D1, colors={D1: 77}))
     ds = old_imagery.download(
         AOI,
         ZOOM,
         provider="esri",
-        esri_wayback_release_date=RELEASE_DATE,
+        esri_wayback_release_id=backend.release.identifier,
     )
 
     tags = ds.tags()
     assert tags["selection_mode"] == "esri-wayback-release"
-    assert tags["esri_wayback_release_date"] == RELEASE_DATE.isoformat()
+    assert tags["esri_wayback_release_id"] == backend.release.identifier
+    assert tags["esri_wayback_catalogue_date"] == RELEASE_DATE.isoformat()
     assert tags["esri_wayback_release_title"] == backend.release.title
+    assert tags["esri_wayback_release_resolution"] == "identifier"
     assert tags["dates"] == D1.isoformat()
     assert "target_date" not in tags
     assert "date_match" not in tags
@@ -354,12 +367,12 @@ def test_download_can_select_one_exact_esri_release(stub) -> None:
 
 
 def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
-    stub(ReleaseBackend(RELEASE_DATE, None))
+    backend = stub(ReleaseBackend(RELEASE_DATE, None))
     ds = old_imagery.download(
         AOI,
         ZOOM,
         provider="esri",
-        esri_wayback_release_date=RELEASE_DATE,
+        esri_wayback_release_id=backend.release.identifier,
     )
     tags = ds.tags()
     assert "dates" not in tags
@@ -367,17 +380,50 @@ def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
     assert (ds.dataset_mask() > 0).all()
 
 
+def test_availability_can_select_an_exact_release_by_stable_identifier(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+    gdf = old_imagery.availability(
+        AOI,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_id=backend.release.identifier,
+    )
+
+    assert list(gdf["date"]) == [D1]
+    assert gdf.attrs["esri_wayback_release_id"] == backend.release.identifier
+    assert gdf.attrs["esri_wayback_catalogue_date"] == RELEASE_DATE
+    assert gdf.attrs["esri_wayback_release_resolution"] == "identifier"
+
+
+def test_download_can_select_latest_release_visible_on_or_before_date(stub) -> None:
+    requested = RELEASE_DATE + dt.timedelta(days=1)
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1, colors={D1: 66}))
+    ds = old_imagery.download(
+        AOI,
+        ZOOM,
+        provider="esri",
+        esri_wayback_as_of_date=requested,
+    )
+
+    tags = ds.tags()
+    assert tags["esri_wayback_release_id"] == backend.release.identifier
+    assert tags["esri_wayback_catalogue_date"] == RELEASE_DATE.isoformat()
+    assert tags["esri_wayback_release_resolution"] == "visible-on-or-before"
+    assert tags["esri_wayback_as_of_date"] == requested.isoformat()
+    assert ds.read(1).mean() == pytest.approx(66, abs=2)
+
+
 @pytest.mark.parametrize(
     "kwargs,message",
     [
         (
-            {"provider": "google", "esri_wayback_release_date": RELEASE_DATE},
-            "requires provider='esri'",
+            {"provider": "google", "esri_wayback_release_id": "WB_2014_R01"},
+            "require provider='esri'",
         ),
         (
             {
                 "provider": "esri",
-                "esri_wayback_release_date": RELEASE_DATE,
+                "esri_wayback_release_id": "WB_2014_R01",
                 "min_date": D1,
             },
             "cannot be combined with min_date or max_date",
@@ -385,10 +431,18 @@ def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
         (
             {
                 "provider": "esri",
-                "esri_wayback_release_date": RELEASE_DATE,
+                "esri_wayback_as_of_date": RELEASE_DATE,
                 "method": "per-tile",
             },
             "method cannot be set",
+        ),
+        (
+            {
+                "provider": "esri",
+                "esri_wayback_release_id": "WB_2014_R01",
+                "esri_wayback_as_of_date": RELEASE_DATE,
+            },
+            "Set only one Esri Wayback release selector",
         ),
     ],
 )
@@ -401,24 +455,32 @@ def test_release_availability_rejects_mixed_selection_modes(kwargs, message) -> 
     "kwargs,message",
     [
         (
-            {"provider": "google", "esri_wayback_release_date": RELEASE_DATE},
-            "requires provider='esri'",
+            {"provider": "google", "esri_wayback_release_id": "WB_2014_R01"},
+            "require provider='esri'",
         ),
         (
             {
                 "provider": "esri",
                 "date": D1,
-                "esri_wayback_release_date": RELEASE_DATE,
+                "esri_wayback_release_id": "WB_2014_R01",
             },
             "Choose either date",
         ),
         (
             {
                 "provider": "esri",
-                "esri_wayback_release_date": RELEASE_DATE,
+                "esri_wayback_as_of_date": RELEASE_DATE,
                 "date_match": "exact",
             },
             "date_match cannot be set",
+        ),
+        (
+            {
+                "provider": "esri",
+                "esri_wayback_release_id": "WB_2014_R01",
+                "esri_wayback_as_of_date": RELEASE_DATE,
+            },
+            "Set only one Esri Wayback release selector",
         ),
     ],
 )

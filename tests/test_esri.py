@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -124,13 +125,41 @@ def test_missing_capture_metadata_is_cached() -> None:
     assert sum("/query" in url for url in client.requested) == first_query_count
 
 
-def test_release_at_requires_an_exact_publication_date() -> None:
+def test_release_identifier_survives_a_catalogue_date_disagreement() -> None:
+    """WB_2026_R03 is stable even when Esri's two sources disagree by a day."""
     wb, _ = _wayback({})
-    release = wb.layers[1]
+    release = replace(
+        wb.layers[0],
+        identifier="WB_2026_R03",
+        title="World Imagery (Wayback 2026-03-25)",
+        date=dt.date(2026, 3, 25),
+    )
+    wb.layers = [release]
 
-    assert wb.release_at(release.date) is release
-    with pytest.raises(ValueError, match=r"No Esri Wayback release.*previous:.*next:"):
-        wb.release_at(release.date + dt.timedelta(days=1))
+    assert wb.release_by_identifier("WB_2026_R03") is release
+
+
+def test_release_on_or_before_resolves_the_latest_visible_snapshot() -> None:
+    wb, _ = _wayback({})
+    older = replace(wb.layers[1], date=dt.date(2026, 2, 26))
+    release = replace(
+        wb.layers[0],
+        identifier="WB_2026_R03",
+        title="World Imagery (Wayback 2026-03-25)",
+        date=dt.date(2026, 3, 25),
+    )
+    wb.layers = [release, older]
+
+    assert wb.release_on_or_before(dt.date(2026, 3, 26)) is release
+    assert wb.release_on_or_before(dt.date(2026, 3, 1)) is older
+    with pytest.raises(ValueError, match="earliest catalogue release"):
+        wb.release_on_or_before(dt.date(2026, 1, 1))
+
+
+def test_unknown_release_identifier_is_rejected() -> None:
+    wb, _ = _wayback({})
+    with pytest.raises(ValueError, match="No Esri Wayback release has identifier"):
+        wb.release_by_identifier("WB_2099_R99")
 
 
 def test_tile_at_release_keeps_the_requested_layer_and_capture_date() -> None:
