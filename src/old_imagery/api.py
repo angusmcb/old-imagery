@@ -43,6 +43,35 @@ AVAILABILITY_COLUMNS = ["date", "n_tiles", "coverage", "complete", "providers", 
 # a sharp optimum. Override it by passing `method` explicitly.
 ESRI_REGION_QUERY_MIN_TILES = 50
 
+# Deepest zoom at which each service actually publishes imagery.
+#
+# These are *not* the tile schemes' addressing limits. Keyhole addresses to
+# level 30 and Web Mercator to 23 (see _keyhole.MAX_LEVEL and
+# MercatorGrid.max_level, both ported from upstream's KeyholeTile.MaxLevel and
+# EsriTile.MaxLevel), but upstream's docs report that imagery "practically caps
+# out at 21" for Google Earth and 20 for Wayback. Requests above those levels
+# are well-formed and return nothing useful, while costing 4x the tiles per
+# level, so they are rejected rather than silently served.
+#
+# Upstream's CLI applies a single [1,23] bound to both providers; that is a
+# consequence of one shared --zoom flag, not a per-provider fact, so it is not
+# what is enforced here.
+MAX_IMAGERY_ZOOM = {"google": 21, "esri": 20}
+
+
+def _validate_zoom(zoom: int, provider: str) -> None:
+    """Reject zooms deeper than the provider publishes imagery for.
+
+    Unknown providers pass through: _backend raises for those, and its message
+    is the more useful one.
+    """
+    cap = MAX_IMAGERY_ZOOM.get(provider)
+    if cap is not None and zoom > cap:
+        raise ValueError(
+            f"zoom {zoom} is deeper than {provider} publishes imagery for "
+            f"(max {cap}). Tiles exist at that level but carry no imagery."
+        )
+
 
 def _as_date(value: DateLike | None) -> _dt.date | None:
     if value is None:
@@ -142,6 +171,7 @@ def availability(
         whole tiles. Google always uses the per-tile path.
     """
     aoi = normalize_aoi(aoi)
+    _validate_zoom(zoom, provider)
     min_d, max_d = _as_date(min_date), _as_date(max_date)
     backend, client = _backend(provider, cache_dir)
 
@@ -341,6 +371,7 @@ def download(
     ValueError
         If the AOI selects no tiles, or no imagery matches the request.
     """
+    _validate_zoom(zoom, provider)
     aoi = normalize_aoi(aoi)
     target = _as_date(date)
     if target is None:

@@ -110,7 +110,7 @@ Responses are cached on disk under `~/.cache/old-imagery` (override with `$OLD_I
 
 - **Antimeridian.** AOIs must lie within longitude −180…180. Split geometries that cross it and query each half. Upstream handles the wrap; this port raises a clear error instead.
 - **Esri is slow either way.** Wayback exposes no bulk per-tile date query, so the per-tile path probes ~195 releases per tile (~58 requests per tile) and the region path issues ~195 metadata queries plus one footprint fetch per capture date. Both take tens of seconds on a cold cache — see the table above. Google is far quicker than either.
-- **Zoom limits.** Google Earth goes to level 30; Esri Wayback to 23.
+- **Zoom limits.** `availability` and `download` reject zooms above **21 for Google** and **20 for Esri Wayback** — the deepest levels at which each service actually publishes imagery, per [upstream's docs](https://github.com/Mbucari/GEHistoricalImagery/blob/master/docs/availability.md). The tile schemes themselves address deeper (Keyhole to level 30, Web Mercator to 23, matching upstream's `KeyholeTile.MaxLevel` and `EsriTile.MaxLevel`), but those levels return well-formed tiles carrying no imagery while costing 4× the requests per level, so they raise rather than fail quietly. The caps are readable as `old_imagery.MAX_IMAGERY_ZOOM`. Upstream's CLI instead applies one `[1,23]` bound to both providers; that follows from its single shared `--zoom` flag rather than from either service's limits, so it is not what is enforced here.
 - **Undated imagery.** Google tiles sometimes carry a provider's undated default imagery. It is excluded from `availability` (matching upstream) but is used by `download` as a last-resort fallback, in which case it contributes nothing to the `dates` tag.
 - Only `availability` and `download` are ported. Upstream's `info`, `dump`, DXF output, terrain meshes, and the non-time-machine databases (Mars, Moon, Sky) are not.
 
@@ -121,7 +121,7 @@ pip install -e ".[dev]" && pre-commit install
 ```
 
 ```bash
-pytest                  # 154 offline tests, no network
+pytest                  # 164 offline tests, no network
 pytest -m network       # 9 live tests against Google and Esri
 ```
 

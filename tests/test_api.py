@@ -414,3 +414,57 @@ def test_decode_image_handles_greyscale() -> None:
 
 def test_decode_image_rejects_garbage() -> None:
     assert api._decode_image(b"not an image at all") is None
+
+
+# --------------------------------------------------------------------------
+# zoom caps
+#
+# The tile schemes address deeper than either service publishes imagery for
+# (Keyhole to 30, Web Mercator to 23), so the cap is a separate, shallower
+# limit taken from upstream's documented practical maxima.
+# --------------------------------------------------------------------------
+def test_max_imagery_zoom_is_below_the_addressing_limits() -> None:
+    from old_imagery._keyhole import MAX_LEVEL
+    from old_imagery._region import MercatorGrid
+
+    assert api.MAX_IMAGERY_ZOOM["google"] < MAX_LEVEL
+    assert api.MAX_IMAGERY_ZOOM["esri"] < MercatorGrid.max_level
+
+
+@pytest.mark.parametrize(
+    "provider,zoom",
+    [("google", 22), ("google", 30), ("esri", 21), ("esri", 23)],
+)
+def test_availability_rejects_zoom_beyond_published_imagery(provider, zoom) -> None:
+    with pytest.raises(ValueError, match="carry no imagery"):
+        old_imagery.availability(AOI, zoom, provider=provider)
+
+
+@pytest.mark.parametrize("provider,zoom", [("google", 22), ("esri", 21)])
+def test_download_rejects_zoom_beyond_published_imagery(provider, zoom) -> None:
+    with pytest.raises(ValueError, match="carry no imagery"):
+        old_imagery.download(AOI, zoom, D1, provider=provider)
+
+
+def test_zoom_at_the_cap_is_allowed(stub) -> None:
+    """The cap is inclusive — 21 is the deepest usable Google zoom, not the first bad one."""
+    stub(StubBackend([D1]))
+    gdf = old_imagery.availability(AOI, api.MAX_IMAGERY_ZOOM["google"], max_tiles=1_000_000)
+    assert list(gdf["date"]) == [D1]
+
+
+def test_zoom_cap_is_checked_before_any_network_client_is_built(monkeypatch) -> None:
+    """A rejected zoom must not open an HTTP client or touch the cache."""
+
+    def explode(*args, **kwargs):
+        raise AssertionError("backend was constructed despite an invalid zoom")
+
+    monkeypatch.setattr(api, "_backend", explode)
+    with pytest.raises(ValueError, match="carry no imagery"):
+        old_imagery.availability(AOI, 25)
+
+
+def test_unknown_provider_still_reports_the_provider_error() -> None:
+    """Zoom validation must not mask a bad provider name."""
+    with pytest.raises(ValueError, match="Unknown provider"):
+        old_imagery.availability(AOI, 25, provider="bing")

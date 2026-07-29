@@ -29,7 +29,7 @@ a provider's publication or release date.
 from ._dbroot import Database, DatedTile, DbRoot
 from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, NotFound, RequestFailed
 from ._keyhole import KeyholeTile
-from .api import ESRI_REGION_QUERY_MIN_TILES, availability, download
+from .api import ESRI_REGION_QUERY_MIN_TILES, MAX_IMAGERY_ZOOM, availability, download
 
 __version__ = "0.1.0"
 
@@ -37,6 +37,7 @@ __all__ = [
     "availability",
     "download",
     "ESRI_REGION_QUERY_MIN_TILES",
+    "MAX_IMAGERY_ZOOM",
     "KeyholeTile",
     "DbRoot",
     "Database",
