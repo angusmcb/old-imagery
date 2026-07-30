@@ -15,6 +15,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from ._concurrency import workers_for
 from ._http import CachedHttpClient, RequestFailed
 from ._region import MercatorGrid, MercatorTile
 
@@ -34,16 +35,6 @@ _MAX_FEATURES = 20_000
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
 _GEOMETRY_BATCH = 100
-
-# Upstream caps concurrency at 10 for --provider=Wayback, having determined
-# empirically that going wider made Wayback *slower*; its default is otherwise
-# ALL_CPUS.  See the --concurrency option in Mbucari/GEHistoricalImagery.
-#
-# This is deliberately a constant rather than a parameter: it is a measured
-# property of Esri's service, not a caller preference, and the measurement says
-# the only thing a caller could do by raising it is make their own request
-# slower.
-WAYBACK_MAX_WORKERS = 10
 
 
 @dataclass(frozen=True)
@@ -312,7 +303,6 @@ class WayBack:
         *,
         min_date: _dt.date | None = None,
         max_date: _dt.date | None = None,
-        max_workers: int = 16,
     ) -> list[tuple[_dt.date, object, str]]:
         """Capture footprints intersecting ``aoi``.
 
@@ -381,7 +371,9 @@ class WayBack:
                     if cancel_after[0] is None or layer.date < cancel_after[0]:
                         cancel_after[0] = layer.date
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers_for("esri", len(layers))
+        ) as pool:
             list(pool.map(query, layers))
 
         if not wanted:
@@ -426,7 +418,9 @@ class WayBack:
                 if date in dates
             ]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers_for("esri", len(groups))
+        ) as pool:
             for rows in pool.map(fetch, groups.values()):
                 results.extend(rows)
         return results

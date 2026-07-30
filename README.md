@@ -10,7 +10,7 @@ This is a Python port of the protocol layer of [Mbucari/GEHistoricalImagery](htt
 >
 > Imagery you fetch with `old-imagery` stays the copyright of Google, Esri, or their imagery providers, and their terms of service govern what you may do with it. [Google Earth's terms](https://maps.google.com/intl/en_all/help/terms_maps-earth/) prohibit mass downloads and bulk feeds; Esri content may carry provider-specific rights and restrictions. **Whether a particular use is permitted is your call to make, and your responsibility** — check the current terms and item details, and get permission where you need it. Research, archival and journalistic uses are not automatically exempt.
 >
-> The library defaults to at most 1,000 tiles, caches responses to avoid refetching, and uses 16 concurrent requests, but it cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
+> The library defaults to at most 1,000 tiles, caches responses to avoid refetching, and caps concurrency at what each service has been measured to tolerate (16 for Google, 10 for Esri) rather than letting callers raise it, but it cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
 >
 > **Not affiliated with Google or Esri.** Google and Google Earth are trademarks of Google LLC; Esri, ArcGIS and World Imagery Wayback are trademarks of Environmental Systems Research Institute, Inc. They are named here only to identify the services this software talks to. This project is not affiliated with, endorsed by, or sponsored by either company.
 
@@ -85,7 +85,6 @@ availability(
     max_date: date | str | None = None,
     provider: Provider = "google",
     method: Method = "auto",
-    max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
 ) -> geopandas.GeoDataFrame
@@ -194,31 +193,44 @@ genuinely does not cover.
 
 #### Getting the matching pixels
 
-`download` takes the same two release selectors, so a seam map round-trips to
-imagery:
+`download` takes the `release_id` this function reports, so a seam map
+round-trips to imagery:
 
 ```python
-release_id = seams.attrs["release_id"]
-
 with old_imagery.download(
-    aoi, zoom=18, provider="esri", esri_wayback_release_id=release_id
+    aoi, zoom=18, provider="esri", esri_wayback_release_id=seams.attrs["release_id"]
 ) as src:
     print(src.tags()["selection_mode"])  # "esri-wayback-release"
 ```
 
-Prefer the stable `WB_YYYY_RNN` identifier when you know the release; use
-`esri_wayback_as_of_date` when you only know the service date. The two are
-mutually exclusive and Esri-only, and both require `date=None` (the default) and
-reject a non-default `date_match` — those combinations are errors rather than
-ambiguous requests. Release downloads record `esri_wayback_release_id`,
-`esri_wayback_catalogue_date`, `esri_wayback_release_title` and
-`esri_wayback_release_resolution` in the raster tags instead of `target_date`
-and `date_match`; as-of downloads add the requested `esri_wayback_as_of_date`.
+This is the only release selector on `download`, and the only way to resolve a
+*service* date to a release is through `esri_mosaic_as_of` — so Esri's
+catalogue-date inconsistencies get handled in exactly one place.
 
-An exact release download may contain a tile whose capture metadata is missing.
-The pixels are retained because the requested snapshot is unambiguous, but the
-tile contributes nothing to the `dates` tag and is counted in
-`tiles_capture_date_unknown`.
+`esri_wayback_release_id` requires `provider="esri"` and `date=None` (the
+default), and rejects a non-default `date_match`; those combinations are errors
+rather than ambiguous requests. Release downloads record
+`esri_wayback_release_id`, `esri_wayback_catalogue_date` and
+`esri_wayback_release_title` in the raster tags instead of `target_date` and
+`date_match`.
+
+#### Why `date=` cannot replace it
+
+A release is a mosaic of imagery captured on many dates, so knowing the capture
+date is not enough to reproduce one. On a 9-tile AOI straddling a real seam
+between `2017-08-31` and `2017-08-20` in release `WB_2020_R07`:
+
+| | `esri_wayback_release_id=…` | `date="2017-08-31", date_match="exact"` |
+| --- | --- | --- |
+| tiles missing | **0 / 9** | **5 / 9** |
+| `dates` tag | `2017-08-20, 2017-08-31` | `2017-08-31` |
+| elapsed | 2.5 s | 19.1 s |
+
+Asking for one capture date masks out everything captured on any other, and
+re-derives each tile's whole release history to do it (~1 request per tile
+against ~58). An exact release download also retains a tile whose capture
+metadata is missing — counted in `tiles_capture_date_unknown` — which `date=`
+cannot reach at all, because Esri's per-tile path drops undated versions.
 
 ### How availability is resolved
 
@@ -239,7 +251,7 @@ Google has only a per-tile path. It accepts `method="auto"` and
 footprint geometry would otherwise receive tile-quantised geometry without
 being told.
 
-Which is faster is **not** obvious from request counts — per-tile issues far more requests, but they are small and run 16-wide, while each region query hits a slow metadata service. Measured against the live service, cold cache, seconds:
+Which is faster is **not** obvious from request counts — per-tile issues far more requests, but they are small and run concurrently, while each region query hits a slow metadata service. Measured against the live service, cold cache, seconds:
 
 | tiles | 4 | 12 | 30 | 72 |
 | --- | --- | --- | --- | --- |
@@ -261,8 +273,6 @@ download(
     date_match: DateMatch = "closest",
     provider: Provider = "google",
     esri_wayback_release_id: str | None = None,
-    esri_wayback_as_of_date: date | str | None = None,
-    max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
 ) -> rasterio.DatasetReader
@@ -295,12 +305,37 @@ with old_imagery.download(aoi, 17, target, date_match="exact") as src:
     rio_copy(src, "mosaic.tif", driver="GTiff")
 ```
 
-Both functions also take `max_workers` (default 16), `cache_dir`, and
-`max_tiles` (default 1,000), which limits the tile grid spanned by the AOI's
-bounding box. `download` holds the RGB mosaic and its mask in memory: 1,000 full
-tiles require about 250 MiB for those raw buffers, plus the in-memory GeoTIFF
-and decoding overhead. Raise the guard only after estimating the resulting
-memory and request cost.
+Both functions also take `cache_dir` and `max_tiles` (default 1,000), which
+limits the tile grid spanned by the AOI's bounding box. `download` holds the RGB
+mosaic and its mask in memory: 1,000 full tiles require about 250 MiB for those
+raw buffers, plus the in-memory GeoTIFF and decoding overhead. Raise the guard
+only after estimating the resulting memory and request cost.
+
+### Concurrency is not a knob
+
+There is no `max_workers`. Every parallel section here is network-bound, so the
+pool is sized by what the *service* tolerates and by how much work there is —
+never more threads than tasks, and never more than the per-provider cap (16 for
+Google, 10 for Esri).
+
+Upstream's `--concurrency` defaults to ALL_CPUS. CPU count is the wrong basis by
+about two orders of magnitude. The only real CPU work is JPEG decode, and
+decoding 256×256 RGB tiles on a 10-CPU machine measures:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| tiles/s | 2347 | 4291 | 7373 | 7054 | 7052 | 6800 |
+
+Decode does release the GIL, but it saturates at four threads and costs ~0.4 ms
+per tile against tens of milliseconds to fetch one — roughly 1% of the per-tile
+cost. Any width chosen for the network already exceeds what decode can use, so a
+single network-sized pool is right and a separate CPU-sized pool would be
+machinery for nothing.
+
+The caps are deliberately fixed rather than adaptive. Finding a service's limit
+means exceeding it, and Google's terms prohibit bulk feeds — the polite client
+never goes looking for the ceiling. See `src/old_imagery/_concurrency.py` for
+the measurements and their (stated) uncertainty.
 
 Transient HTTP failures are retried. Failures for an individual tile, packet,
 or Wayback release are treated as missing data so one bad response does not

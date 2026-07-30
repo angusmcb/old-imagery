@@ -166,7 +166,7 @@ def test_esri_mosaic_as_of_agrees_with_the_downloaded_pixels() -> None:
 
 
 def test_esri_wayback_release_selection() -> None:
-    """Stable-ID and as-of modes target and clearly label one release."""
+    """The stable identifier targets and clearly labels one exact release."""
     from old_imagery._esri import WayBack
     from old_imagery._http import CachedHttpClient
 
@@ -181,16 +181,36 @@ def test_esri_wayback_release_selection() -> None:
         small,
         zoom=17,
         provider="esri",
-        esri_wayback_as_of_date=release.date,
+        esri_wayback_release_id=release.identifier,
     )
     tags = ds.tags()
     assert tags["selection_mode"] == "esri-wayback-release"
     assert tags["esri_wayback_release_id"] == release.identifier
     assert tags["esri_wayback_catalogue_date"] == release.date.isoformat()
     assert tags["esri_wayback_release_title"] == release.title
-    assert tags["esri_wayback_release_resolution"] == "visible-on-or-before"
-    assert tags["esri_wayback_as_of_date"] == release.date.isoformat()
     assert (ds.dataset_mask() > 0).all()
+
+
+def test_release_download_beats_capture_date_across_a_seam() -> None:
+    """A release is a mosaic of many dates, so no single date= reproduces it."""
+    # Straddles a real seam between two capture dates in one release.
+    seam = box(-122.3484, 37.89444, -122.3460, 37.89684)
+    gdf = old_imagery.esri_mosaic_as_of(seam, 18, "2020-06-01")
+    assert len(gdf) > 1, "this AOI should straddle a capture seam"
+
+    with old_imagery.download(
+        seam, 18, provider="esri", esri_wayback_release_id=gdf.attrs["release_id"]
+    ) as src:
+        release_tags = src.tags()
+    assert release_tags["tiles_missing"] == "0"
+
+    # The same area asked for by capture date loses everything flown otherwise.
+    with old_imagery.download(
+        seam, 18, provider="esri", date=gdf["date"].iloc[0], date_match="exact"
+    ) as src:
+        capture_tags = src.tags()
+    assert int(capture_tags["tiles_missing"]) > 0
+    assert capture_tags["tiles_total"] == release_tags["tiles_total"]
 
 
 def test_both_providers_agree_on_extent() -> None:

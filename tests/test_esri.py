@@ -329,7 +329,7 @@ def test_dated_regions_fetches_geometry_once_per_date() -> None:
     per_layer = {1: [(CAPTURE, 11)], 2: [(CAPTURE, 22)], 3: [(CAPTURE, 33)]}
     wb, client = _wayback_with(layers, per_layer)
 
-    regions = wb.dated_regions(AOI, 17, max_workers=4)
+    regions = wb.dated_regions(AOI, 17)
 
     assert len(client.date_queries) == 3  # phase 1 hits every release
     assert client.geometry_queries == [(1, 11)]  # phase 2 hits the earliest only
@@ -346,7 +346,7 @@ def test_dated_regions_keeps_disjoint_footprints_sharing_a_date() -> None:
     per_layer = {1: [(CAPTURE, 11), (CAPTURE, 12)], 2: [(CAPTURE, 22)]}
     wb, client = _wayback_with(layers, per_layer)
 
-    regions = wb.dated_regions(AOI, 17, max_workers=4)
+    regions = wb.dated_regions(AOI, 17)
 
     assert sorted(client.geometry_queries) == [(1, 11), (1, 12)]
     assert len(regions) == 2
@@ -359,7 +359,7 @@ def test_dated_regions_never_compares_objectids_across_releases() -> None:
     per_layer = {1: [(early, 7)], 2: [(late, 7)]}  # same OBJECTID, different imagery
     wb, client = _wayback_with(layers, per_layer)
 
-    regions = wb.dated_regions(AOI, 17, max_workers=4)
+    regions = wb.dated_regions(AOI, 17)
 
     assert sorted(client.geometry_queries) == [(1, 7), (2, 7)]
     assert {date for date, _g, _t in regions} == {early, late}
@@ -371,10 +371,10 @@ def test_dated_regions_filters_by_date_bounds() -> None:
     per_layer = {1: [(early, 11)], 2: [(late, 22)]}
     wb, _ = _wayback_with(layers, per_layer)
 
-    only_late = wb.dated_regions(AOI, 17, min_date=dt.date(2015, 1, 1), max_workers=4)
+    only_late = wb.dated_regions(AOI, 17, min_date=dt.date(2015, 1, 1))
     assert {d for d, _g, _t in only_late} == {late}
 
-    only_early = wb.dated_regions(AOI, 17, max_date=dt.date(2015, 1, 1), max_workers=4)
+    only_early = wb.dated_regions(AOI, 17, max_date=dt.date(2015, 1, 1))
     assert {d for d, _g, _t in only_early} == {early}
 
 
@@ -384,14 +384,14 @@ def test_dated_regions_skips_releases_published_before_min_date() -> None:
     per_layer = {1: [(dt.date(2010, 1, 1), 11)], 2: [(dt.date(2021, 1, 1), 22)]}
     wb, client = _wayback_with(layers, per_layer)
 
-    wb.dated_regions(AOI, 17, min_date=dt.date(2020, 1, 1), max_workers=4)
+    wb.dated_regions(AOI, 17, min_date=dt.date(2020, 1, 1))
     assert client.date_queries == [2]  # the 2014 release was never queried
 
 
 def test_dated_regions_empty_when_nothing_matches() -> None:
     layers = [_layer(1, "2014-02-20")]
     wb, _ = _wayback_with(layers, {1: []})
-    assert wb.dated_regions(AOI, 17, max_workers=4) == []
+    assert wb.dated_regions(AOI, 17) == []
 
 
 def test_provider_copyright_maps_layer_id_to_title() -> None:

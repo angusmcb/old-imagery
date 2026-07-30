@@ -256,7 +256,7 @@ class RegionBackend(StubBackend):
         self.region_calls = 0
         self.seen_kwargs = None
 
-    def dated_regions(self, aoi, zoom, *, min_date=None, max_date=None, max_workers=16):
+    def dated_regions(self, aoi, zoom, *, min_date=None, max_date=None):
         self.region_calls += 1
         self.seen_kwargs = {"min_date": min_date, "max_date": max_date}
         return [(d, g, "Wayback release") for d, g in self.regions]
@@ -341,7 +341,7 @@ def test_download_can_select_one_exact_esri_release_by_identifier(stub) -> None:
     assert tags["esri_wayback_release_id"] == backend.release.identifier
     assert tags["esri_wayback_catalogue_date"] == RELEASE_DATE.isoformat()
     assert tags["esri_wayback_release_title"] == backend.release.title
-    assert tags["esri_wayback_release_resolution"] == "identifier"
+    assert "esri_wayback_release_resolution" not in tags  # only one selector now
     assert tags["dates"] == D1.isoformat()
     assert "target_date" not in tags
     assert "date_match" not in tags
@@ -363,22 +363,34 @@ def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
     assert (ds.dataset_mask() > 0).all()
 
 
-def test_download_can_select_latest_release_visible_on_or_before_date(stub) -> None:
-    requested = RELEASE_DATE + dt.timedelta(days=1)
-    backend = stub(ReleaseBackend(RELEASE_DATE, D1, colors={D1: 66}))
-    ds = old_imagery.download(
-        AOI,
-        ZOOM,
-        provider="esri",
-        esri_wayback_as_of_date=requested,
-    )
+def test_download_no_longer_accepts_an_as_of_date(stub) -> None:
+    """Service dates resolve in esri_mosaic_as_of, which reports the release_id."""
+    stub(ReleaseBackend(RELEASE_DATE, D1))
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        old_imagery.download(
+            AOI, ZOOM, provider="esri", esri_wayback_as_of_date=RELEASE_DATE
+        )
 
+
+def test_release_id_from_a_mosaic_round_trips_into_download(stub) -> None:
+    """The documented workflow: map the seams, then fetch that exact release."""
+    backend = stub(MosaicBackend({ZOOM: [(D1, AOI)]}))
+    seams = old_imagery.esri_mosaic_as_of(AOI, ZOOM, RELEASE_DATE)
+
+    stub(ReleaseBackend(RELEASE_DATE, D1, colors={D1: 66}))
+    ds = old_imagery.download(
+        AOI, ZOOM, provider="esri", esri_wayback_release_id=seams.attrs["release_id"]
+    )
     tags = ds.tags()
     assert tags["esri_wayback_release_id"] == backend.release.identifier
     assert tags["esri_wayback_catalogue_date"] == RELEASE_DATE.isoformat()
-    assert tags["esri_wayback_release_resolution"] == "visible-on-or-before"
-    assert tags["esri_wayback_as_of_date"] == requested.isoformat()
     assert ds.read(1).mean() == pytest.approx(66, abs=2)
+
+
+def test_download_rejects_an_empty_release_id(stub) -> None:
+    stub(ReleaseBackend(RELEASE_DATE, D1))
+    with pytest.raises(ValueError, match="cannot be empty"):
+        old_imagery.download(AOI, ZOOM, provider="esri", esri_wayback_release_id="")
 
 
 @pytest.mark.parametrize(
@@ -386,7 +398,7 @@ def test_download_can_select_latest_release_visible_on_or_before_date(stub) -> N
     [
         (
             {"provider": "google", "esri_wayback_release_id": "WB_2014_R01"},
-            "require provider='esri'",
+            "requires provider='esri'",
         ),
         (
             {
@@ -399,18 +411,10 @@ def test_download_can_select_latest_release_visible_on_or_before_date(stub) -> N
         (
             {
                 "provider": "esri",
-                "esri_wayback_as_of_date": RELEASE_DATE,
+                "esri_wayback_release_id": "WB_2014_R01",
                 "date_match": "exact",
             },
             "date_match cannot be set",
-        ),
-        (
-            {
-                "provider": "esri",
-                "esri_wayback_release_id": "WB_2014_R01",
-                "esri_wayback_as_of_date": RELEASE_DATE,
-            },
-            "Set only one Esri Wayback release selector",
         ),
     ],
 )
@@ -853,16 +857,17 @@ def test_mosaic_closes_the_client_even_when_a_zoom_fails(stub) -> None:
 
 def test_mosaic_never_exceeds_the_wayback_concurrency_cap(stub) -> None:
     """The cap is on requests in flight, so it must not multiply per zoom."""
-    from old_imagery._esri import WAYBACK_MAX_WORKERS
+    from old_imagery._concurrency import workers_for
 
-    # More zooms than the cap, or the assertion could not fail: with only ten
-    # tasks a ten-wide pool and an uncapped one are indistinguishable.
+    cap = workers_for("esri", 10_000)  # the policy's ceiling for Esri
+    # More zooms than the cap, or the assertion could not fail: with only `cap`
+    # tasks a capped pool and an uncapped one are indistinguishable.
     zooms = list(range(0, 21))  # every zoom Esri publishes imagery for
-    assert len(zooms) > WAYBACK_MAX_WORKERS
+    assert len(zooms) > cap
     backend = stub(MosaicBackend({z: [(D1, AOI)] for z in zooms}))
 
     old_imagery.esri_mosaic_as_of(AOI, zooms, RELEASE_DATE)
-    assert backend.peak_in_flight <= WAYBACK_MAX_WORKERS
+    assert backend.peak_in_flight <= cap
     # And the work really did overlap, so the bound above means something.
     assert backend.peak_in_flight > 1
     assert sorted(backend.asked_zooms) == zooms
@@ -875,3 +880,52 @@ def test_mosaic_area_fraction_is_nan_for_a_zero_area_aoi(stub) -> None:
     stub(MosaicBackend({18: [(D1, AOI)]}))
     gdf = old_imagery.esri_mosaic_as_of(line, 18, RELEASE_DATE)
     assert len(gdf) == 0 or np.isnan(gdf["area_fraction"].iloc[0])
+
+
+# --------------------------------------------------------------------------
+# concurrency policy
+# --------------------------------------------------------------------------
+def test_workers_never_exceed_the_number_of_tasks() -> None:
+    """A three-tile AOI has no use for sixteen threads."""
+    from old_imagery._concurrency import workers_for
+
+    assert workers_for("google", 3) == 3
+    assert workers_for("esri", 1) == 1
+    assert workers_for("google", 0) == 1  # a pool of zero is not constructible
+
+
+def test_workers_are_capped_per_provider() -> None:
+    from old_imagery._concurrency import workers_for
+
+    google, esri = workers_for("google", 10_000), workers_for("esri", 10_000)
+    assert google > 1 and esri > 1
+    # Esri is the more delicate service; upstream measured going wider as slower.
+    assert esri < google
+
+
+def test_unknown_provider_gets_the_more_cautious_cap() -> None:
+    from old_imagery._concurrency import workers_for
+
+    assert workers_for("bing", 10_000) == workers_for("esri", 10_000)
+
+
+def test_download_pool_is_sized_from_the_provider_not_the_cpu_count(stub) -> None:
+    """The parallel work is network-bound, so os.cpu_count() is the wrong basis."""
+    from old_imagery import _concurrency
+
+    seen = []
+    real = _concurrency.workers_for
+
+    def recording(provider, n_tasks):
+        seen.append((provider, n_tasks))
+        return real(provider, n_tasks)
+
+    stub(StubBackend([D1]))
+    tiles = KeyholeGrid().tiles(AOI, ZOOM, 10_000)
+    api.workers_for = recording
+    try:
+        old_imagery.download(AOI, ZOOM, D1)
+    finally:
+        api.workers_for = real
+
+    assert seen == [("google", len(tiles))]
