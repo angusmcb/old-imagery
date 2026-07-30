@@ -36,14 +36,7 @@ from Esri's catalogue and is named to say so.
 """
 
 from ._http import DEFAULT_CACHE_DIR, NotFound, RequestFailed
-from .api import (
-    MAX_IMAGERY_ZOOM,
-    DateMatch,
-    Provider,
-    availability,
-    download,
-    esri_mosaic_as_of,
-)
+from .api import MAX_IMAGERY_ZOOM, availability, download, esri_mosaic_as_of
 
 __version__ = "0.1.0"
 
@@ -61,9 +54,6 @@ __all__ = [
     "availability",
     "download",
     "esri_mosaic_as_of",
-    # option types
-    "Provider",
-    "DateMatch",
     # constants
     "MAX_IMAGERY_ZOOM",
     "DEFAULT_CACHE_DIR",

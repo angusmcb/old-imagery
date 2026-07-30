@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -122,3 +125,54 @@ def test_cache_can_be_disabled(client, tmp_path) -> None:
     c._client = httpx.Client(transport=FakeTransport([200, 200]))
     assert c.get(URL) == b"payload"
     assert c.get(URL) == b"payload"
+
+
+# --------------------------------------------------------------------------
+# default cache directory
+# --------------------------------------------------------------------------
+def _resolve(monkeypatch, platform, env):
+    from old_imagery import _http
+
+    for name in ("XDG_CACHE_HOME", "LOCALAPPDATA", "OLD_IMAGERY_CACHE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "platform", platform)
+    return _http._default_cache_dir()
+
+
+def test_cache_dir_follows_each_platform_convention(monkeypatch) -> None:
+    """~/.cache is an XDG convention; it is wrong on macOS and on Windows."""
+    linux = _resolve(monkeypatch, "linux", {})
+    assert linux.parts[-2:] == (".cache", "old-imagery")
+
+    mac = _resolve(monkeypatch, "darwin", {})
+    assert mac.parts[-3:] == ("Library", "Caches", "old-imagery")
+
+    win = _resolve(monkeypatch, "win32", {"LOCALAPPDATA": str(Path.home() / "AppData" / "Local")})
+    assert win.parts[-3:] == ("Local", "old-imagery", "Cache")
+
+
+def test_cache_dir_honours_xdg_and_localappdata(monkeypatch) -> None:
+    assert _resolve(monkeypatch, "linux", {"XDG_CACHE_HOME": "/xdg"}) == Path("/xdg/old-imagery")
+    win = _resolve(monkeypatch, "win32", {"LOCALAPPDATA": "/appdata"})
+    assert win == Path("/appdata/old-imagery/Cache")
+
+
+def test_cache_dir_falls_back_when_localappdata_is_unset(monkeypatch) -> None:
+    win = _resolve(monkeypatch, "win32", {})
+    assert win.parts[-4:] == ("AppData", "Local", "old-imagery", "Cache")
+
+
+def test_explicit_override_wins_on_every_platform(monkeypatch) -> None:
+    for platform in ("linux", "darwin", "win32"):
+        assert _resolve(monkeypatch, platform, {"OLD_IMAGERY_CACHE_DIR": "/custom"}) == Path(
+            "/custom"
+        )
+
+
+def test_empty_override_does_not_put_the_cache_in_the_cwd(monkeypatch) -> None:
+    """Path("") resolves to ".", which would scatter caches wherever you ran from."""
+    resolved = _resolve(monkeypatch, "linux", {"OLD_IMAGERY_CACHE_DIR": ""})
+    assert resolved != Path()
+    assert resolved.is_absolute()

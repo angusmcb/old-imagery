@@ -4,15 +4,47 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import threading
 import time
 from pathlib import Path
 
 import httpx
 
-DEFAULT_CACHE_DIR = Path(
-    os.environ.get("OLD_IMAGERY_CACHE_DIR", Path.home() / ".cache" / "old-imagery")
-)
+
+def _default_cache_dir() -> Path:
+    """Where to cache responses, following each platform's own convention.
+
+    ``~/.cache`` is an XDG convention and belongs to Linux only; using it
+    everywhere would drop a stray dot-directory in the user's home on Windows
+    and bypass the location macOS expects to be able to purge.
+
+    ``OLD_IMAGERY_CACHE_DIR`` overrides all of it. It is read once, at import,
+    because the result is a default argument value.
+    """
+    override = os.environ.get("OLD_IMAGERY_CACHE_DIR")
+    if override:  # an empty value would otherwise resolve to the process cwd
+        return Path(override)
+
+    # Read into a plain str first: comparing sys.platform directly lets mypy
+    # narrow to the platform it is checking on and call the other branches
+    # unreachable, which is exactly the code that has to keep working elsewhere.
+    platform = str(sys.platform)
+
+    if platform == "win32":
+        # LOCALAPPDATA rather than APPDATA: a cache is machine-local and must
+        # not follow a roaming profile across machines.
+        base = os.environ.get("LOCALAPPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Local"
+        return root / "old-imagery" / "Cache"
+    if platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "old-imagery"
+
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "old-imagery"
+
+
+DEFAULT_CACHE_DIR = _default_cache_dir()
 
 _USER_AGENT = "old-imagery/0.1 (+https://github.com/angusmcb/old-imagery)"
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})

@@ -48,25 +48,21 @@ The `old-imagery` package itself needs no `protoc` build step.
 
 ## API
 
-The public surface is deliberately small: the three functions below, the option
-types their signatures name, the constants those defaults refer to, and the two
-exceptions. `old_imagery.__all__` is the complete list.
+The public surface is deliberately small: the three functions below, the
+constants their defaults refer to, and the two exceptions.
+`old_imagery.__all__` is the complete list. Option values and the tile guard are
+written out in the signatures themselves, so nothing needs looking up.
 
 `availability` and `download` are the common pair — which capture dates exist,
 then give me the pixels for one. `esri_mosaic_as_of` answers a separate
 question, about what a published Esri snapshot displays rather than what the
 archive holds.
 
-The two string-valued options are closed sets, exported as type aliases so a
-type checker rejects a typo before it reaches the network:
-
-```python
-Provider  = Literal["google", "esri"]
-DateMatch = Literal["closest", "exact", "before", "after"]
-```
-
-Each is still validated at runtime, so callers without a type checker get a
-`ValueError` naming the accepted values rather than undefined behaviour.
+The two string-valued options are closed sets, written out in each signature so
+the accepted values are visible where you use them instead of behind a named
+alias you would have to look up. A type checker rejects a typo before it reaches
+the network, and both are still validated at runtime, so callers without one get
+a `ValueError` naming the accepted values rather than undefined behaviour.
 
 The protocol layer beneath this — the Keyhole quadtree walker, dbRoot client
 and cached HTTP client — lives in underscore modules. It is reachable, but it
@@ -77,20 +73,21 @@ changes when they do.
 
 ```python
 availability(
-    aoi: BaseGeometry,
+    aoi: shapely.geometry.base.BaseGeometry,
     zoom: int,
     *,
     min_date: date | str | None = None,
     max_date: date | str | None = None,
-    provider: Provider = "google",
+    provider: Literal["google", "esri"] = "google",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
 ) -> geopandas.GeoDataFrame
 ```
 
-`aoi` is a shapely `BaseGeometry` interpreted in EPSG:4326. Date bounds are
-inclusive. The function returns a `GeoDataFrame` in EPSG:4326, one row per
-capture date, newest first:
+`aoi` is any shapely geometry — a `box`, `Polygon`, `MultiPolygon` and so on,
+all of which subclass `shapely.geometry.base.BaseGeometry` — interpreted in
+EPSG:4326. Date bounds are inclusive. The function returns a `GeoDataFrame` in
+EPSG:4326, one row per capture date, newest first:
 
 | column | meaning |
 | --- | --- |
@@ -135,7 +132,7 @@ This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)
 
 ```python
 esri_mosaic_as_of(
-    aoi: BaseGeometry,
+    aoi: shapely.geometry.base.BaseGeometry,
     zoom: int | Sequence[int],
     as_of_date: date | str,
     *,
@@ -267,19 +264,19 @@ Those timings came from a connection whose per-request latency swung about 7× w
 
 ```python
 download(
-    aoi: BaseGeometry,
+    aoi: shapely.geometry.base.BaseGeometry,
     zoom: int,
     date: date | str | None = None,
     *,
-    date_match: DateMatch = "closest",
-    provider: Provider = "google",
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
 ) -> rasterio.DatasetReader
 ```
 
-`aoi` is a shapely `BaseGeometry` interpreted in EPSG:4326. The function returns
+`aoi` is any shapely geometry, interpreted in EPSG:4326. The function returns
 an open, in-memory **3-band uint8 RGB** `rasterio.DatasetReader` covering the
 AOI's bounding box, snapped to tile pixels.
 
@@ -345,9 +342,17 @@ dbRoot or Esri capabilities document raises `old_imagery.RequestFailed`.
 
 ## Caching
 
-Responses are cached on disk under `~/.cache/old-imagery` (override with
-`$OLD_IMAGERY_CACHE_DIR` before importing the package, or with the `cache_dir`
-argument; pass `cache_dir=None` to disable). Keyhole assets are addressed by
+Responses are cached on disk, in the location each platform expects:
+
+| platform | default | |
+| --- | --- | --- |
+| Linux/BSD | `$XDG_CACHE_HOME/old-imagery` | falls back to `~/.cache/old-imagery` |
+| macOS | `~/Library/Caches/old-imagery` | |
+| Windows | `%LOCALAPPDATA%\old-imagery\Cache` | `LOCALAPPDATA`, not `APPDATA` — a cache must not roam between machines |
+
+Read `old_imagery.DEFAULT_CACHE_DIR` to see the resolved path. Override it with
+`$OLD_IMAGERY_CACHE_DIR` before importing the package, or per call with the
+`cache_dir` argument; pass `cache_dir=None` to disable. Keyhole assets are addressed by
 epoch and therefore immutable, so cache entries never go stale; only dbRoot and
 the Esri capabilities document are re-fetched, daily and weekly respectively.
 There is no automatic size limit or eviction policy, so long-running workflows

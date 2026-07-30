@@ -14,31 +14,31 @@ from typing import Literal
 import geopandas as gpd
 import numpy as np
 import rasterio
+import shapely.geometry.base
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
-from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from ._concurrency import workers_for
 from ._dbroot import Database, DbRoot
 from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, RequestFailed
-from ._region import MAX_TILES, TILE_PX, dissolve, normalize_aoi, sort_by_nearest_date
+from ._region import TILE_PX, dissolve, normalize_aoi, sort_by_nearest_date
 
 WGS84 = "EPSG:4326"
 MERCATOR = "EPSG:3857"
 
 DateLike = _dt.date | str
 
-# Closed sets for the two string-valued options on the public functions.
+# The two string-valued options are spelled out as Literals in each signature
+# rather than hidden behind named aliases, so `help()`, an IDE tooltip and the
+# rendered docs all show the accepted values without a lookup.
 #
-# These constrain callers under a type checker only. Both are still validated at
-# runtime -- `_backend` for Provider, `sort_by_nearest_date` for DateMatch --
+# They constrain callers under a type checker only. Both are still validated at
+# runtime -- `_backend` for provider, `sort_by_nearest_date` for date_match --
 # because most callers run unchecked, and a typo should raise rather than behave
-# arbitrarily. For that reason the internal helpers keep plain `str` parameters:
-# narrowing them to these aliases would make their own validation branches
-# statically unreachable, and mypy runs here with warn_unreachable.
-Provider = Literal["google", "esri"]
-DateMatch = Literal["closest", "exact", "before", "after"]
+# arbitrarily. The internal helpers keep plain `str` parameters for the same
+# reason: narrowing them would make their own validation branches statically
+# unreachable, and mypy runs here with warn_unreachable.
 
 AVAILABILITY_COLUMNS = ["date", "coverage", "complete", "providers", "geometry"]
 
@@ -163,14 +163,14 @@ def _backend(provider: str, cache_dir: str | os.PathLike | None):
 # availability
 # --------------------------------------------------------------------------
 def availability(
-    aoi: BaseGeometry,
+    aoi: shapely.geometry.base.BaseGeometry,
     zoom: int,
     *,
     min_date: DateLike | None = None,
     max_date: DateLike | None = None,
-    provider: Provider = "google",
+    provider: Literal["google", "esri"] = "google",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = MAX_TILES,
+    max_tiles: int = 1_000,
 ) -> gpd.GeoDataFrame:
     """Find which imagery capture dates are available over an area.
 
@@ -316,7 +316,7 @@ def _availability_by_region(
         if title:
             titles[date].add(title)
 
-    geometry_by_date: dict[_dt.date, BaseGeometry] = {}
+    geometry_by_date: dict[_dt.date, shapely.geometry.base.BaseGeometry] = {}
     for date, geoms in by_date.items():
         clipped = unary_union(geoms).intersection(aoi)
         if not clipped.is_empty:
@@ -381,7 +381,7 @@ def _empty_availability(
 # esri_mosaic_as_of
 # --------------------------------------------------------------------------
 def esri_mosaic_as_of(
-    aoi: BaseGeometry,
+    aoi: shapely.geometry.base.BaseGeometry,
     zoom: int | Sequence[int],
     as_of_date: DateLike,
     *,
@@ -475,7 +475,7 @@ def esri_mosaic_as_of(
     try:
         layer = backend.release_on_or_before(as_of)
 
-        def work(z: int) -> list[tuple[int, _dt.date, BaseGeometry]]:
+        def work(z: int) -> list[tuple[int, _dt.date, shapely.geometry.base.BaseGeometry]]:
             footprints = backend.release_footprints(
                 layer, aoi, z, max_footprints=max_footprints
             )
@@ -549,7 +549,10 @@ def _normalise_zooms(zoom: int | Sequence[int]) -> list[int]:
     return sorted(set(candidates))
 
 
-def _area_fractions(aoi: BaseGeometry, geoms: list[BaseGeometry]) -> list[float]:
+def _area_fractions(
+    aoi: shapely.geometry.base.BaseGeometry,
+    geoms: list[shapely.geometry.base.BaseGeometry],
+) -> list[float]:
     """Each geometry's share of the AOI, as planar areas in EPSG:3857."""
     if not geoms:
         return []
@@ -566,15 +569,15 @@ def _area_fractions(aoi: BaseGeometry, geoms: list[BaseGeometry]) -> list[float]
 # download
 # --------------------------------------------------------------------------
 def download(
-    aoi: BaseGeometry,
+    aoi: shapely.geometry.base.BaseGeometry,
     zoom: int,
     date: DateLike | None = None,
     *,
-    date_match: DateMatch = "closest",
-    provider: Provider = "google",
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = MAX_TILES,
+    max_tiles: int = 1_000,
 ) -> rasterio.DatasetReader:
     """Download and mosaic historical imagery over an area.
 

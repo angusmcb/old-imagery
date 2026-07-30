@@ -933,3 +933,39 @@ def test_availability_no_longer_reports_a_tile_count_column(stub) -> None:
     gdf = old_imagery.availability(AOI, ZOOM)
     assert "n_tiles" not in gdf.columns
     assert list(gdf.columns) == ["date", "coverage", "complete", "providers", "geometry"]
+
+
+def test_public_tile_guard_matches_the_internal_default() -> None:
+    """The number is inlined in the signatures; keep it from drifting."""
+    import inspect
+
+    from old_imagery._region import MAX_TILES
+
+    for fn in (old_imagery.availability, old_imagery.download):
+        default = inspect.signature(fn).parameters["max_tiles"].default
+        assert default == MAX_TILES == 1_000, fn.__name__
+
+
+def test_option_values_are_visible_in_the_signature() -> None:
+    """No alias to look up: help() and IDE tooltips show the accepted values."""
+    import inspect
+    import typing
+
+    hints = typing.get_type_hints(old_imagery.availability)
+    assert typing.get_args(hints["provider"]) == ("google", "esri")
+
+    hints = typing.get_type_hints(old_imagery.download)
+    assert typing.get_args(hints["date_match"]) == ("closest", "exact", "before", "after")
+
+    # And they are rendered literally, not as a name the reader must resolve.
+    text = str(inspect.signature(old_imagery.availability))
+    assert "Literal['google', 'esri']" in text
+
+
+def test_aoi_annotation_names_where_the_type_comes_from() -> None:
+    """`BaseGeometry` alone does not tell a reader it is shapely's."""
+    import inspect
+
+    for fn in (old_imagery.availability, old_imagery.download, old_imagery.esri_mosaic_as_of):
+        annotation = inspect.signature(fn).parameters["aoi"].annotation
+        assert annotation == "shapely.geometry.base.BaseGeometry", fn.__name__
