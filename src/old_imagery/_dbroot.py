@@ -28,11 +28,19 @@ _DBROOT_MAX_AGE = 24 * 3600  # dbRoot advertises the current quadtree epoch
 
 
 class Database(str, Enum):
+    """A Google Earth database this port can actually read.
+
+    Keyhole also serves ``sky``, ``moon`` and ``mars``, and the dbRoot and
+    quadtree wire formats are the same for all of them. They are absent here
+    because none is a time machine: they carry no imagery-history layer, so
+    :func:`~old_imagery.availability` has no dates to report and
+    :func:`~old_imagery.download` has nothing to select between. Listing them
+    would advertise support this port does not implement -- see the "Notes and
+    limitations" section of README.md.
+    """
+
     DEFAULT = "default"
     TIME_MACHINE = "tm"
-    SKY = "sky"
-    MOON = "moon"
-    MARS = "mars"
 
 
 @dataclass(frozen=True)

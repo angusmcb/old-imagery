@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -149,7 +151,7 @@ def test_availability_records_attrs(stub) -> None:
     assert gdf.attrs["zoom"] == ZOOM
     assert gdf.attrs["provider"] == "google"
     assert gdf.attrs["n_aoi_tiles"] > 0
-    assert gdf.attrs["selection_mode"] == "capture-date"
+    assert gdf.attrs["method"] == "per-tile"
 
 
 # --------------------------------------------------------------------------
@@ -306,42 +308,23 @@ class ReleaseBackend(StubBackend):
 RELEASE_DATE = dt.date(2014, 2, 20)
 
 
-def test_availability_can_select_latest_release_visible_on_or_before_date(stub) -> None:
-    requested = RELEASE_DATE + dt.timedelta(days=1)
-    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
-    gdf = old_imagery.availability(
-        AOI,
-        ZOOM,
-        provider="esri",
-        esri_wayback_as_of_date=requested,
-    )
-
-    assert list(gdf["date"]) == [D1]
-    assert (gdf["providers"] == backend.release.title).all()
-    assert gdf.attrs["selection_mode"] == "esri-wayback-release"
-    assert gdf.attrs["method"] == "esri-wayback-release"
-    assert gdf.attrs["esri_wayback_release_id"] == backend.release.identifier
-    assert gdf.attrs["esri_wayback_catalogue_date"] == RELEASE_DATE
-    assert gdf.attrs["esri_wayback_release_title"] == backend.release.title
-    assert gdf.attrs["esri_wayback_release_resolution"] == "visible-on-or-before"
-    assert gdf.attrs["esri_wayback_as_of_date"] == requested
-    assert backend.release_tile_calls == gdf.attrs["n_aoi_tiles"]
-    assert backend.dated_tile_calls == 0
+def test_availability_no_longer_accepts_release_selectors(stub) -> None:
+    """Release snapshots moved to esri_mosaic_as_of; availability means capture dates."""
+    stub(ReleaseBackend(RELEASE_DATE, D1))
+    for kwargs in (
+        {"esri_wayback_release_id": "WB_2014_R01"},
+        {"esri_wayback_as_of_date": RELEASE_DATE},
+    ):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            old_imagery.availability(AOI, ZOOM, provider="esri", **kwargs)
 
 
-def test_release_availability_omits_unknown_capture_dates_but_keeps_metadata(stub) -> None:
-    backend = stub(ReleaseBackend(RELEASE_DATE, None))
-    gdf = old_imagery.availability(
-        AOI,
-        ZOOM,
-        provider="esri",
-        esri_wayback_release_id=backend.release.identifier,
-    )
-
-    assert len(gdf) == 0
-    assert gdf.attrs["selection_mode"] == "esri-wayback-release"
-    assert gdf.attrs["esri_wayback_catalogue_date"] == RELEASE_DATE
-    assert backend.release_tile_calls == gdf.attrs["n_aoi_tiles"]
+def test_availability_attrs_no_longer_carry_a_selection_mode(stub) -> None:
+    """With only one mode left, availability has nothing to disambiguate."""
+    stub(StubBackend([D1]))
+    gdf = old_imagery.availability(AOI, ZOOM)
+    assert "selection_mode" not in gdf.attrs
+    assert gdf.attrs["method"] == "per-tile"
 
 
 def test_download_can_select_one_exact_esri_release_by_identifier(stub) -> None:
@@ -380,21 +363,6 @@ def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
     assert (ds.dataset_mask() > 0).all()
 
 
-def test_availability_can_select_an_exact_release_by_stable_identifier(stub) -> None:
-    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
-    gdf = old_imagery.availability(
-        AOI,
-        ZOOM,
-        provider="esri",
-        esri_wayback_release_id=backend.release.identifier,
-    )
-
-    assert list(gdf["date"]) == [D1]
-    assert gdf.attrs["esri_wayback_release_id"] == backend.release.identifier
-    assert gdf.attrs["esri_wayback_catalogue_date"] == RELEASE_DATE
-    assert gdf.attrs["esri_wayback_release_resolution"] == "identifier"
-
-
 def test_download_can_select_latest_release_visible_on_or_before_date(stub) -> None:
     requested = RELEASE_DATE + dt.timedelta(days=1)
     backend = stub(ReleaseBackend(RELEASE_DATE, D1, colors={D1: 66}))
@@ -411,44 +379,6 @@ def test_download_can_select_latest_release_visible_on_or_before_date(stub) -> N
     assert tags["esri_wayback_release_resolution"] == "visible-on-or-before"
     assert tags["esri_wayback_as_of_date"] == requested.isoformat()
     assert ds.read(1).mean() == pytest.approx(66, abs=2)
-
-
-@pytest.mark.parametrize(
-    "kwargs,message",
-    [
-        (
-            {"provider": "google", "esri_wayback_release_id": "WB_2014_R01"},
-            "require provider='esri'",
-        ),
-        (
-            {
-                "provider": "esri",
-                "esri_wayback_release_id": "WB_2014_R01",
-                "min_date": D1,
-            },
-            "cannot be combined with min_date or max_date",
-        ),
-        (
-            {
-                "provider": "esri",
-                "esri_wayback_as_of_date": RELEASE_DATE,
-                "method": "per-tile",
-            },
-            "method cannot be set",
-        ),
-        (
-            {
-                "provider": "esri",
-                "esri_wayback_release_id": "WB_2014_R01",
-                "esri_wayback_as_of_date": RELEASE_DATE,
-            },
-            "Set only one Esri Wayback release selector",
-        ),
-    ],
-)
-def test_release_availability_rejects_mixed_selection_modes(kwargs, message) -> None:
-    with pytest.raises(ValueError, match=message):
-        old_imagery.availability(AOI, ZOOM, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -703,3 +633,245 @@ def test_unknown_provider_still_reports_the_provider_error() -> None:
     """Zoom validation must not mask a bad provider name."""
     with pytest.raises(ValueError, match="Unknown provider"):
         old_imagery.availability(AOI, 25, provider="bing")
+
+
+# --------------------------------------------------------------------------
+# esri_mosaic_as_of
+# --------------------------------------------------------------------------
+class MosaicBackend:
+    """An Esri-shaped backend serving one release's capture footprints."""
+
+    from old_imagery._region import MercatorGrid as _Grid
+
+    grid = _Grid()
+
+    def __init__(self, footprints_by_zoom, release_date=RELEASE_DATE, raises=None):
+        self.footprints_by_zoom = footprints_by_zoom
+        self.raises = raises
+        self.release = StubRelease(
+            id=42,
+            identifier="WB_2014_R01",
+            date=release_date,
+            title=f"World Imagery (Wayback {release_date.isoformat()})",
+        )
+        self.asked_zooms: list[int] = []
+        self.asked_release = None
+        self.seen_max_footprints: list[int] = []
+        self.peak_in_flight = 0
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    def release_on_or_before(self, visible_date):
+        if visible_date < self.release.date:
+            raise ValueError(
+                f"No Esri Wayback release was visible on or before {visible_date}; "
+                f"the earliest catalogue release is {self.release.date}"
+            )
+        return self.release
+
+    def release_by_identifier(self, identifier):
+        return self.release
+
+    def release_footprints(self, layer, aoi, zoom, *, max_footprints=500):
+        with self._lock:
+            self._in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+        try:
+            time.sleep(0.01)  # widen the window so real overlap is observable
+            self.asked_release = layer
+            self.asked_zooms.append(zoom)
+            self.seen_max_footprints.append(max_footprints)
+            if self.raises is not None:
+                raise self.raises
+            return list(self.footprints_by_zoom.get(zoom, []))
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+LEFT = box(-122.4000, 37.7920, -122.3980, 37.7950)  # exactly half of AOI
+RIGHT = box(-122.3980, 37.7920, -122.3960, 37.7950)  # the other half
+
+
+def test_mosaic_returns_one_row_per_zoom_and_date(stub) -> None:
+    stub(MosaicBackend({18: [(D1, LEFT), (D2, RIGHT)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    assert list(gdf.columns) == api.ESRI_MOSAIC_COLUMNS
+    assert gdf.crs == "EPSG:4326"
+    assert list(gdf["date"]) == [D2, D1]  # newest first within a zoom
+    assert set(gdf["zoom"]) == {18}
+    assert (gdf["release_id"] == "WB_2014_R01").all()
+
+
+def test_mosaic_geometry_is_the_footprint_not_a_tile_union(stub) -> None:
+    """The whole point: real seams, not the provider's tile grid."""
+    stub(MosaicBackend({18: [(D1, LEFT)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    geom = gdf.geometry.iloc[0]
+    assert geom.area == pytest.approx(LEFT.area, rel=1e-9)
+    assert geom.area < AOI.area
+
+
+def test_mosaic_clips_footprints_to_the_aoi(stub) -> None:
+    huge = box(-123.0, 37.0, -122.0, 38.0)
+    stub(MosaicBackend({18: [(D1, huge)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    geom = gdf.geometry.iloc[0]
+    assert geom.within(AOI.buffer(1e-9))
+    assert geom.area == pytest.approx(AOI.area, rel=1e-9)
+    assert gdf["area_fraction"].iloc[0] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_mosaic_dissolves_footprints_sharing_a_zoom_and_date(stub) -> None:
+    stub(MosaicBackend({18: [(D1, LEFT), (D1, RIGHT)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    assert len(gdf) == 1
+    assert gdf.geometry.iloc[0].area == pytest.approx(AOI.area, rel=1e-9)
+
+
+def test_mosaic_area_fraction_is_partial_for_partial_cover(stub) -> None:
+    stub(MosaicBackend({18: [(D1, LEFT)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+    assert gdf["area_fraction"].iloc[0] == pytest.approx(0.5, rel=1e-3)
+
+
+def test_mosaic_drops_footprints_outside_the_aoi(stub) -> None:
+    elsewhere = box(-70.0, 40.0, -69.9, 40.1)
+    stub(MosaicBackend({18: [(D1, elsewhere)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+    assert len(gdf) == 0
+    assert list(gdf.columns) == api.ESRI_MOSAIC_COLUMNS
+    assert gdf.attrs["release_id"] == "WB_2014_R01"
+
+
+def test_mosaic_reports_a_different_date_per_zoom(stub) -> None:
+    """Wayback composes per scale, so zoom is a real axis, not a resolution knob."""
+    backend = stub(MosaicBackend({13: [(D2, AOI)], 19: [(D1, AOI)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, [19, 13], RELEASE_DATE)
+
+    assert list(gdf["zoom"]) == [13, 19]  # sorted ascending
+    assert list(gdf["date"]) == [D2, D1]
+    assert sorted(backend.asked_zooms) == [13, 19]
+    assert gdf.attrs["zooms"] == [13, 19]
+
+
+def test_mosaic_accepts_a_single_int_zoom(stub) -> None:
+    backend = stub(MosaicBackend({18: [(D1, AOI)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+    assert backend.asked_zooms == [18]
+    assert gdf.attrs["zooms"] == [18]
+
+
+def test_mosaic_deduplicates_and_sorts_requested_zooms(stub) -> None:
+    backend = stub(MosaicBackend({18: [(D1, AOI)], 19: [(D1, AOI)]}))
+    old_imagery.esri_mosaic_as_of(AOI, [19, 18, 19], RELEASE_DATE)
+    assert sorted(backend.asked_zooms) == [18, 19]
+
+
+def test_mosaic_resolves_the_latest_release_on_or_before_the_date(stub) -> None:
+    backend = stub(MosaicBackend({18: [(D1, AOI)]}, release_date=RELEASE_DATE))
+    later = RELEASE_DATE + dt.timedelta(days=400)
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, later)
+
+    assert backend.asked_release is backend.release
+    assert gdf.attrs["release_date"] == RELEASE_DATE  # publication date
+    assert gdf.attrs["as_of_date"] == later  # what was asked for
+    assert gdf.attrs["release_title"] == backend.release.title
+
+
+def test_mosaic_rejects_a_date_before_the_archive(stub) -> None:
+    stub(MosaicBackend({18: [(D1, AOI)]}))
+    with pytest.raises(ValueError, match="earliest catalogue release"):
+        old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE - dt.timedelta(days=1))
+
+
+def test_mosaic_accepts_an_iso_string_date(stub) -> None:
+    stub(MosaicBackend({18: [(D1, AOI)]}))
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE.isoformat())
+    assert gdf.attrs["as_of_date"] == RELEASE_DATE
+
+
+@pytest.mark.parametrize("zoom", [21, 99])
+def test_mosaic_rejects_zoom_beyond_published_imagery(stub, zoom) -> None:
+    stub(MosaicBackend({}))
+    with pytest.raises(ValueError, match="deeper than esri publishes"):
+        old_imagery.esri_mosaic_as_of(AOI, zoom, RELEASE_DATE)
+
+
+def test_mosaic_rejects_a_negative_zoom(stub) -> None:
+    stub(MosaicBackend({}))
+    with pytest.raises(ValueError, match="zoom must be at least 0"):
+        old_imagery.esri_mosaic_as_of(AOI, -1, RELEASE_DATE)
+
+
+def test_mosaic_rejects_an_empty_zoom_sequence(stub) -> None:
+    stub(MosaicBackend({}))
+    with pytest.raises(ValueError, match="cannot be an empty sequence"):
+        old_imagery.esri_mosaic_as_of(AOI, [], RELEASE_DATE)
+
+
+def test_mosaic_rejects_a_non_integer_zoom(stub) -> None:
+    stub(MosaicBackend({}))
+    with pytest.raises(TypeError, match="must be ints"):
+        old_imagery.esri_mosaic_as_of(AOI, [18.5], RELEASE_DATE)
+    with pytest.raises(TypeError, match="must be an int or a sequence"):
+        old_imagery.esri_mosaic_as_of(AOI, "18", RELEASE_DATE)
+
+
+def test_mosaic_validates_zoom_before_any_network_client_is_built(monkeypatch) -> None:
+    def explode(provider, cache_dir):
+        raise AssertionError("a client must not be built for an invalid zoom")
+
+    monkeypatch.setattr(api, "_backend", explode)
+    with pytest.raises(ValueError, match="deeper than esri publishes"):
+        old_imagery.esri_mosaic_as_of(AOI, 21, RELEASE_DATE)
+
+
+def test_mosaic_passes_max_footprints_through(stub) -> None:
+    backend = stub(MosaicBackend({18: [(D1, AOI)]}))
+    old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE, max_footprints=7)
+    assert backend.seen_max_footprints == [7]
+
+
+def test_mosaic_propagates_a_refused_partial_answer(stub) -> None:
+    """release_footprints raises rather than returning holes; don't swallow it."""
+    stub(MosaicBackend({}, raises=old_imagery.RequestFailed("incomplete")))
+    with pytest.raises(old_imagery.RequestFailed):
+        old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+
+def test_mosaic_closes_the_client_even_when_a_zoom_fails(stub) -> None:
+    stub(MosaicBackend({}, raises=old_imagery.RequestFailed("incomplete")))
+    with pytest.raises(old_imagery.RequestFailed):
+        old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+    assert stub.holder.get("closed") is True
+
+
+def test_mosaic_never_exceeds_the_wayback_concurrency_cap(stub) -> None:
+    """The cap is on requests in flight, so it must not multiply per zoom."""
+    from old_imagery._esri import WAYBACK_MAX_WORKERS
+
+    # More zooms than the cap, or the assertion could not fail: with only ten
+    # tasks a ten-wide pool and an uncapped one are indistinguishable.
+    zooms = list(range(0, 21))  # every zoom Esri publishes imagery for
+    assert len(zooms) > WAYBACK_MAX_WORKERS
+    backend = stub(MosaicBackend({z: [(D1, AOI)] for z in zooms}))
+
+    old_imagery.esri_mosaic_as_of(AOI, zooms, RELEASE_DATE)
+    assert backend.peak_in_flight <= WAYBACK_MAX_WORKERS
+    # And the work really did overlap, so the bound above means something.
+    assert backend.peak_in_flight > 1
+    assert sorted(backend.asked_zooms) == zooms
+
+
+def test_mosaic_area_fraction_is_nan_for_a_zero_area_aoi(stub) -> None:
+    from shapely.geometry import LineString
+
+    line = LineString([(-122.400, 37.792), (-122.396, 37.795)])
+    stub(MosaicBackend({18: [(D1, AOI)]}))
+    gdf = old_imagery.esri_mosaic_as_of(line, 18, RELEASE_DATE)
+    assert len(gdf) == 0 or np.isnan(gdf["area_fraction"].iloc[0])

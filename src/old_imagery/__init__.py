@@ -14,7 +14,7 @@ This library retrieves imagery but does not license it — imagery remains the
 copyright of Google, Esri or their providers, and their terms of service apply.
 
 A Python port of the protocol layer of Mbucari/GEHistoricalImagery, exposing
-two functions for use from Python rather than a command line tool:
+three functions for use from Python rather than a command line tool:
 
 >>> import old_imagery
 >>> from shapely.geometry import box
@@ -22,31 +22,57 @@ two functions for use from Python rather than a command line tool:
 >>> dates = old_imagery.availability(aoi, zoom=18)                 # doctest: +SKIP
 >>> img = old_imagery.download(aoi, zoom=18, date="1993-07-10")    # doctest: +SKIP
 
+``availability`` and ``download`` answer "which capture dates exist here?" and
+"give me the pixels for one of them". The third function answers a different
+question -- what a published Esri Wayback snapshot *displays*, and how old each
+part of it is:
+
+>>> seams = old_imagery.esri_mosaic_as_of(aoi, 18, "2020-06-01")   # doctest: +SKIP
+
 The ``date`` argument and every date this package reports is an **image capture
-date**, never a provider's publication or release date. Esri Wayback snapshots
-are selected separately and explicitly by stable release identifier or an
-as-of catalogue date.
+date**, never a provider's publication or release date. The one date that means
+publication is ``esri_mosaic_as_of``'s ``as_of_date``, which selects a release
+from Esri's catalogue and is named to say so.
 """
 
-from ._dbroot import Database, DatedTile, DbRoot
-from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, NotFound, RequestFailed
-from ._keyhole import KeyholeTile
-from .api import ESRI_REGION_QUERY_MIN_TILES, MAX_IMAGERY_ZOOM, availability, download
+from ._http import DEFAULT_CACHE_DIR, NotFound, RequestFailed
+from .api import (
+    ESRI_REGION_QUERY_MIN_TILES,
+    MAX_IMAGERY_ZOOM,
+    DateMatch,
+    Method,
+    Provider,
+    availability,
+    download,
+    esri_mosaic_as_of,
+)
 
 __version__ = "0.1.0"
 
+# Deliberately narrow: the two documented functions, the constants and option
+# types their signatures name, the exceptions they raise, and the version.
+#
+# The protocol layer (DbRoot, Database, DatedTile, KeyholeTile,
+# CachedHttpClient) is reachable from the underscore modules but is not
+# exported and is not a supported interface -- it tracks Google's and Esri's
+# wire formats, so it changes when they do. Anything here that proves genuinely
+# useful can be promoted into a named advanced module later; promoting is
+# cheap, and withdrawing something callers already import is not.
 __all__ = [
+    # public API
     "availability",
     "download",
+    "esri_mosaic_as_of",
+    # option types
+    "Provider",
+    "Method",
+    "DateMatch",
+    # constants
     "ESRI_REGION_QUERY_MIN_TILES",
     "MAX_IMAGERY_ZOOM",
-    "KeyholeTile",
-    "DbRoot",
-    "Database",
-    "DatedTile",
-    "CachedHttpClient",
+    "DEFAULT_CACHE_DIR",
+    # exceptions
     "RequestFailed",
     "NotFound",
-    "DEFAULT_CACHE_DIR",
     "__version__",
 ]

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from shapely.geometry import box
 
+from old_imagery import RequestFailed
 from old_imagery._esri import WayBack, _parse_capabilities
 from old_imagery._region import MercatorTile
 
@@ -230,8 +231,12 @@ def _millis(date: dt.date) -> int:
     )
 
 
-def _esrijson(oid: int, date: dt.date) -> bytes:
-    """A minimal ESRIJSON feature set that GDAL can read."""
+def _esrijson(pairs: list[tuple[int, dt.date]]) -> bytes:
+    """A minimal ESRIJSON feature set that GDAL can read.
+
+    Takes several ``(oid, date)`` pairs because geometry is fetched in batches:
+    one request carries many OBJECTIDs and the response carries a feature each.
+    """
     return json.dumps(
         {
             "geometryType": "esriGeometryPolygon",
@@ -255,6 +260,7 @@ def _esrijson(oid: int, date: dt.date) -> bytes:
                         ]
                     },
                 }
+                for oid, date in pairs
             ],
         }
     ).encode()
@@ -266,7 +272,10 @@ class RegionClient:
     def __init__(self, per_layer):
         self.per_layer = per_layer  # {layer_id: [(date, oid), ...]}
         self.date_queries: list[int] = []
+        # Every (layer, oid) pair asked for, regardless of how they were grouped.
         self.geometry_queries: list[tuple[int, int]] = []
+        # One entry per HTTP request, so batching itself can be asserted on.
+        self.geometry_requests: list[tuple[int, tuple[int, ...]]] = []
 
     @staticmethod
     def _layer_id_from(url: str) -> int:
@@ -277,10 +286,13 @@ class RegionClient:
     def post(self, url, data, *, max_age=None):
         layer_id = self._layer_id_from(url)
         if data.get("returnGeometry") == "true":
-            oid = int(data["objectIds"])
-            self.geometry_queries.append((layer_id, oid))
-            date = next(d for d, o in self.per_layer[layer_id] if o == oid)
-            return _esrijson(oid, date)
+            oids = [int(token) for token in data["objectIds"].split(",")]
+            self.geometry_requests.append((layer_id, tuple(oids)))
+            pairs = []
+            for oid in oids:
+                self.geometry_queries.append((layer_id, oid))
+                pairs.append((oid, next(d for d, o in self.per_layer[layer_id] if o == oid)))
+            return _esrijson(pairs)
         self.date_queries.append(layer_id)
         rows = self.per_layer.get(layer_id, [])
         return json.dumps(
@@ -387,3 +399,194 @@ def test_provider_copyright_maps_layer_id_to_title() -> None:
     layer = wb.layers[0]
     assert wb.provider_copyright(layer.id) == layer.title
     assert wb.provider_copyright(-1) is None
+
+
+# --------------------------------------------------------------------------
+# batched geometry fetches
+# --------------------------------------------------------------------------
+def test_fetch_geometries_batches_ids_into_one_request() -> None:
+    """Many OBJECTIDs must cost one request, not one request each."""
+    layers = [_layer(1, "2014-02-20")]
+    per_layer = {1: [(CAPTURE, oid) for oid in range(11, 21)]}
+    wb, client = _wayback_with(layers, per_layer)
+
+    rows = wb._fetch_geometries(layers[0], 17, list(range(11, 21)))
+
+    assert len(rows) == 10
+    assert len(client.geometry_requests) == 1
+    assert client.geometry_requests[0] == (1, tuple(range(11, 21)))
+    assert all(date == CAPTURE and not geom.is_empty for date, geom in rows)
+
+
+def test_fetch_geometries_chunks_beyond_the_batch_size() -> None:
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    count = _esri._GEOMETRY_BATCH + 5
+    oids = list(range(1, count + 1))
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, oid) for oid in oids]})
+
+    rows = wb._fetch_geometries(layers[0], 17, oids)
+
+    assert len(rows) == count
+    assert len(client.geometry_requests) == 2
+    assert len(client.geometry_requests[0][1]) == _esri._GEOMETRY_BATCH
+    assert len(client.geometry_requests[1][1]) == 5
+
+
+def test_fetch_geometries_drops_only_the_failing_batch() -> None:
+    """One bad response costs its own footprints, not the whole call."""
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    oids = list(range(1, _esri._GEOMETRY_BATCH + 6))
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, oid) for oid in oids]})
+
+    real_post = client.post
+    calls: list[int] = []
+
+    def flaky(url, data, *, max_age=None):
+        if data.get("returnGeometry") == "true":
+            calls.append(1)
+            if len(calls) == 1:
+                raise RequestFailed("first batch is broken")
+        return real_post(url, data, max_age=max_age)
+
+    client.post = flaky
+    rows = wb._fetch_geometries(layers[0], 17, oids)
+    assert len(rows) == 5  # the surviving second chunk
+
+
+# --------------------------------------------------------------------------
+# _query_layer completeness signal
+# --------------------------------------------------------------------------
+def test_query_layer_reports_complete_on_a_normal_result() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, _ = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+    assert rows == [(CAPTURE, 11)]
+    assert complete is True
+
+
+def test_query_layer_reports_complete_on_a_genuinely_empty_result() -> None:
+    """No features and no error means the release publishes nothing here."""
+    layers = [_layer(1, "2014-02-20")]
+    wb, _ = _wayback_with(layers, {1: []})
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+    assert rows == []
+    assert complete is True
+
+
+def test_query_layer_reports_incomplete_when_the_request_fails() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+
+    def broken(url, data, *, max_age=None):
+        raise RequestFailed("service down")
+
+    client.post = broken
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+    assert rows == []
+    assert complete is False
+
+
+def test_query_layer_reports_incomplete_on_an_error_payload() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+
+    def errored(url, data, *, max_age=None):
+        return json.dumps({"error": {"code": 500, "message": "boom"}}).encode()
+
+    client.post = errored
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+    assert rows == []
+    assert complete is False
+
+
+def test_query_layer_reports_incomplete_when_pagination_runs_away() -> None:
+    """The _MAX_FEATURES guard truncates, and must say so."""
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: []})
+
+    page = [{"attributes": {"OBJECTID": oid, "SRC_DATE2": _millis(CAPTURE)}} for oid in range(500)]
+
+    def endless(url, data, *, max_age=None):
+        return json.dumps({"features": page, "exceededTransferLimit": True}).encode()
+
+    client.post = endless
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+    assert complete is False
+    assert len(rows) > _esri._MAX_FEATURES
+
+
+# --------------------------------------------------------------------------
+# release_footprints: the seam map of one exact release
+# --------------------------------------------------------------------------
+def test_release_footprints_returns_dated_footprints_for_one_release() -> None:
+    layers = [_layer(1, "2014-02-20"), _layer(2, "2018-04-11")]
+    per_layer = {1: [(CAPTURE, 11), (CAPTURE, 12)], 2: [(dt.date(2017, 5, 1), 22)]}
+    wb, client = _wayback_with(layers, per_layer)
+
+    rows = wb.release_footprints(layers[0], AOI, 17)
+
+    assert len(rows) == 2
+    assert {date for date, _geom in rows} == {CAPTURE}
+    assert all(not geom.is_empty for _date, geom in rows)
+    # Only the release we asked for was touched; this is not a catalogue search.
+    assert client.date_queries == [1]
+    assert [layer_id for layer_id, _oids in client.geometry_requests] == [1]
+
+
+def test_release_footprints_asks_the_metadata_layer_for_the_given_zoom() -> None:
+    """Wayback composes per scale, so zoom picks a different metadata layer."""
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    seen: list[str] = []
+    real_post = client.post
+
+    def recording(url, data, *, max_age=None):
+        seen.append(url)
+        return real_post(url, data, max_age=max_age)
+
+    client.post = recording
+    wb.release_footprints(layers[0], AOI, 19)
+    assert all("/MapServer/4/query" in url for url in seen)  # min(13, 23 - 19)
+
+
+def test_release_footprints_is_empty_when_the_release_publishes_nothing() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: []})
+    assert wb.release_footprints(layers[0], AOI, 17) == []
+    assert client.geometry_requests == []
+
+
+def test_release_footprints_refuses_a_truncated_feature_list() -> None:
+    """A partial seam map would read as missing imagery, so it must raise."""
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+
+    def broken(url, data, *, max_age=None):
+        raise RequestFailed("metadata service down")
+
+    client.post = broken
+    with pytest.raises(RequestFailed, match="did not return a complete feature list"):
+        wb.release_footprints(layers[0], AOI, 17)
+
+
+def test_release_footprints_rejects_more_footprints_than_the_limit() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    per_layer = {1: [(CAPTURE, oid) for oid in range(1, 12)]}
+    wb, client = _wayback_with(layers, per_layer)
+
+    with pytest.raises(ValueError, match="above the limit of 5"):
+        wb.release_footprints(layers[0], AOI, 17, max_footprints=5)
+    assert client.geometry_requests == []  # refused before fetching geometry
+
+
+def test_release_footprints_deduplicates_repeated_object_ids() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11), (CAPTURE, 11)]})
+    wb.release_footprints(layers[0], AOI, 17)
+    assert client.geometry_requests == [(1, (11,))]

@@ -12,6 +12,7 @@ import re
 import threading
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ._http import CachedHttpClient, RequestFailed
@@ -29,6 +30,20 @@ _KEY_TEXT = "/World_Imagery"
 _DATE_IN_TITLE = re.compile(r"\(Wayback (\d{4}-\d{2}-\d{2})\)")
 # Guard against a runaway pagination loop on a very large area of interest.
 _MAX_FEATURES = 20_000
+# How many OBJECTIDs to ask for in one geometry request.  Footprints are large,
+# so this trades request count against response size rather than URL length
+# (the ids travel in a POST body).
+_GEOMETRY_BATCH = 100
+
+# Upstream caps concurrency at 10 for --provider=Wayback, having determined
+# empirically that going wider made Wayback *slower*; its default is otherwise
+# ALL_CPUS.  See the --concurrency option in Mbucari/GEHistoricalImagery.
+#
+# This is deliberately a constant rather than a parameter: it is a measured
+# property of Esri's service, not a caller preference, and the measurement says
+# the only thing a caller could do by raising it is make their own request
+# slower.
+WAYBACK_MAX_WORKERS = 10
 
 
 @dataclass(frozen=True)
@@ -338,7 +353,9 @@ class WayBack:
             if limit is not None and layer.date > limit:
                 return  # an older release already proved the tail is empty
 
-            found = self._query_layer(layer, envelope, zoom)
+            # Partial results are accepted here on purpose: availability over a
+            # flaky archive degrades to "less found" rather than raising.
+            found, _complete = self._query_layer(layer, envelope, zoom)
             if not found:
                 return
 
@@ -389,31 +406,88 @@ class WayBack:
         for layer, date, oid in wanted:
             by_layer_date[(date, layer.id)].add(oid)
 
-        fetches = [
-            (date, layer, oid)
-            for date, layer in earliest.items()
-            for oid in sorted(by_layer_date[(date, layer.id)])
-        ]
+        # One fetch group per release rather than per (release, date): a single
+        # request carries many OBJECTIDs and reports each footprint's own
+        # SRC_DATE2, so the date no longer has to be paired up here.
+        groups: dict[int, tuple[Layer, set[int], set[_dt.date]]] = {}
+        for date, layer in earliest.items():
+            _, oids, dates = groups.setdefault(layer.id, (layer, set(), set()))
+            oids.update(by_layer_date[(date, layer.id)])
+            dates.add(date)
 
-        def fetch(item):
-            date, layer, oid = item
-            geom = self._fetch_geometry(layer, zoom, oid)
-            return None if geom is None else (date, geom, layer.title)
+        def fetch(group):
+            layer, oids, dates = group
+            return [
+                (date, geom, layer.title)
+                # Only dates this release was chosen for: another release may be
+                # the earliest for a date it also lists, and the min_date /
+                # max_date bounds were applied to `wanted`, not to the service.
+                for date, geom in self._fetch_geometries(layer, zoom, sorted(oids))
+                if date in dates
+            ]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for row in pool.map(fetch, fetches):
-                if row is not None:
-                    results.append(row)
+            for rows in pool.map(fetch, groups.values()):
+                results.extend(rows)
         return results
 
-    def _query_layer(self, layer: Layer, envelope: dict, zoom: int):
-        """Return ``[(capture_date, object_id), ...]`` for one release.
+    # -- one exact release ------------------------------------------------
+    def release_footprints(
+        self, layer: Layer, aoi, zoom: int, *, max_footprints: int = 500
+    ) -> list[tuple[_dt.date, object]]:
+        """Capture footprints displayed by one exact release at one zoom.
+
+        Returns ``(capture_date, geometry)`` pairs in EPSG:4326 -- the seam map
+        of a single published snapshot, at the resolution Esri actually records
+        rather than quantised to whole tiles.
+
+        ``zoom`` matters: :meth:`Layer.metadata_query_url` selects a metadata
+        layer per scale, so the same ground in the same release can carry a
+        different capture date at one zoom than at another.
+
+        Unlike :meth:`dated_regions`, this refuses partial answers.  A caller
+        asking what a release displays is building a map, and a quietly
+        truncated feature list would produce holes indistinguishable from ground
+        the release genuinely does not cover.
+        """
+        envelope = _envelope_3857(aoi)
+        found, complete = self._query_layer(layer, envelope, zoom)
+        if not complete:
+            raise RequestFailed(
+                f"The Esri metadata service did not return a complete feature "
+                f"list for release {layer.identifier} at zoom {zoom}. Retrying "
+                f"may succeed; a partial list is refused here because it would "
+                f"read as missing imagery rather than a failed request."
+            )
+        if len(found) > max_footprints:
+            raise ValueError(
+                f"Release {layer.identifier} publishes {len(found):,} capture "
+                f"footprints over this area at zoom {zoom}, above the limit of "
+                f"{max_footprints:,}. Use a smaller area or a lower zoom, or "
+                f"raise max_footprints."
+            )
+        if not found:
+            return []
+        return self._fetch_geometries(layer, zoom, sorted({oid for _date, oid in found}))
+
+    def _query_layer(
+        self, layer: Layer, envelope: dict, zoom: int
+    ) -> tuple[list[tuple[_dt.date, int]], bool]:
+        """Return ``([(capture_date, object_id), ...], complete)`` for one release.
 
         Deliberately requests no geometry.  Capture footprints are large -- one
         sampled polygon had 3,520 vertices -- and almost every release repeats
         the same footprint, so fetching geometry here would download the same
-        megabytes ~195 times.  Geometry is fetched once per surviving feature
-        in :meth:`_fetch_geometries` instead.
+        megabytes ~195 times.  Geometry is fetched in batches by
+        :meth:`_fetch_geometries` instead.
+
+        ``complete`` is False when the walk stopped before the service said it
+        was done -- a failed or errored request, or the ``_MAX_FEATURES``
+        pagination guard.  An empty result set with no error is *complete*: it
+        means the release genuinely publishes nothing here.  Callers that build a
+        map of what is displayed must not treat a partial list as the whole
+        truth; :meth:`dated_regions` accepts partial results on purpose, while
+        :meth:`release_footprints` refuses them.
         """
         url = layer.metadata_query_url(zoom)
         offset = 0
@@ -434,9 +508,11 @@ class WayBack:
             try:
                 payload = json.loads(self._client.post(url, form))
             except (RequestFailed, OSError, ValueError):
-                return out
-            if "error" in payload or not payload.get("features"):
-                return out
+                return out, False
+            if "error" in payload:
+                return out, False
+            if not payload.get("features"):
+                return out, True
 
             for feature in payload["features"]:
                 attributes = feature.get("attributes") or {}
@@ -446,19 +522,38 @@ class WayBack:
                     out.append((date, int(oid)))
 
             if not payload.get("exceededTransferLimit"):
-                return out
+                return out, True
             offset += len(payload["features"])
             if offset > _MAX_FEATURES:
-                return out
+                return out, False
 
-    def _fetch_geometry(self, layer: Layer, zoom: int, object_id: int):
-        """Fetch one capture footprint by OBJECTID, as an EPSG:4326 geometry."""
+    def _fetch_geometries(
+        self, layer: Layer, zoom: int, object_ids: Sequence[int]
+    ) -> list[tuple[_dt.date, object]]:
+        """Fetch capture footprints by OBJECTID, as EPSG:4326 geometries.
+
+        Batched: one request carries up to ``_GEOMETRY_BATCH`` ids, and the
+        capture date of each footprint is read back from the response's own
+        ``SRC_DATE2`` rather than being paired up by the caller.
+
+        A batch whose request or decode fails is dropped, so a single bad
+        response costs its own footprints rather than the whole call.
+        """
+        out: list[tuple[_dt.date, object]] = []
+        for start in range(0, len(object_ids), _GEOMETRY_BATCH):
+            batch = object_ids[start : start + _GEOMETRY_BATCH]
+            out.extend(self._fetch_geometry_batch(layer, zoom, batch))
+        return out
+
+    def _fetch_geometry_batch(
+        self, layer: Layer, zoom: int, object_ids: Sequence[int]
+    ) -> list[tuple[_dt.date, object]]:
         import geopandas as gpd
 
         form = {
             "f": "json",
             "outFields": "OBJECTID,SRC_DATE2",
-            "objectIds": str(object_id),
+            "objectIds": ",".join(str(oid) for oid in object_ids),
             "returnGeometry": "true",
             "geometryPrecision": "2",
             "outSR": "3857",
@@ -467,19 +562,18 @@ class WayBack:
             raw = self._client.post(layer.metadata_query_url(zoom), form)
             payload = json.loads(raw)
         except (RequestFailed, OSError, ValueError):
-            return None
+            return []
         if "error" in payload or not payload.get("features"):
-            return None
+            return []
         try:
             frame = gpd.read_file(io.BytesIO(raw))
         except Exception:  # noqa: BLE001
             # Deliberately broad: read_file dispatches to GDAL/pyogrio drivers
             # whose failure modes on unexpected bytes are not a stable, listable
-            # set.  One unreadable release degrades to None rather than
-            # aborting the whole availability call.
-            return None
-        rows = _rows_to_dated_geometries(frame)
-        return rows[0][1] if rows else None
+            # set.  One unreadable batch degrades to [] rather than aborting the
+            # whole call.
+            return []
+        return _rows_to_dated_geometries(frame)
 
     def download_tile_image(self, dated: DatedEsriTile) -> bytes:
         return self._client.get(dated.asset_url)

@@ -233,10 +233,18 @@ def sort_by_nearest_date(dates: Sequence, target, match: str):
     ``match`` is one of ``closest``, ``exact``, ``before`` or ``after``.  Items
     with an unknown (``None``) date sort last; they are the provider's undated
     default imagery and are only used as a fallback.
+
+    Validation happens here rather than in the generator below: a `raise` in a
+    generator body does not run until the first `next()`, which would defer a
+    bad ``match`` to whichever caller happened to iterate first -- or swallow it
+    entirely for a caller that builds the iterator and never consumes it.
     """
     if match not in ("closest", "exact", "before", "after"):
         raise ValueError(f"Unknown date_match {match!r}")
+    return _sorted_by_nearest_date(dates, target, match)
 
+
+def _sorted_by_nearest_date(dates: Sequence, target, match: str):
     known = [d for d in dates if d.date is not None]
     unknown = [d for d in dates if d.date is None]
 

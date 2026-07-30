@@ -7,7 +7,9 @@ import os
 import threading
 import warnings
 from collections import defaultdict
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Literal
 
 import geopandas as gpd
 import numpy as np
@@ -16,17 +18,34 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 from shapely.prepared import prep
 
 from ._dbroot import Database, DbRoot
+from ._esri import WAYBACK_MAX_WORKERS
 from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, RequestFailed
 from ._region import MAX_TILES, TILE_PX, dissolve, normalize_aoi, sort_by_nearest_date
 
 WGS84 = "EPSG:4326"
+MERCATOR = "EPSG:3857"
 
 DateLike = _dt.date | str
 
+# Closed sets for the three string-valued options on the public functions.
+#
+# These constrain callers under a type checker only. Every one of them is still
+# validated at runtime -- `_backend` for Provider, `_use_region_query` for
+# Method, `sort_by_nearest_date` for DateMatch -- because most callers run
+# unchecked, and a typo should raise rather than behave arbitrarily. For that
+# reason the internal helpers keep plain `str` parameters: narrowing them to
+# these aliases would make their own validation branches statically
+# unreachable, and mypy runs here with warn_unreachable.
+Provider = Literal["google", "esri"]
+Method = Literal["auto", "per-tile", "region"]
+DateMatch = Literal["closest", "exact", "before", "after"]
+
 AVAILABILITY_COLUMNS = ["date", "n_tiles", "coverage", "complete", "providers", "geometry"]
+ESRI_MOSAIC_COLUMNS = ["zoom", "date", "area_fraction", "release_id", "geometry"]
 
 # Esri exposes two ways to resolve availability, and which wins is not obvious
 # from request counts: per-tile probing issues far more requests but they are
@@ -141,15 +160,13 @@ def availability(
     *,
     min_date: DateLike | None = None,
     max_date: DateLike | None = None,
-    provider: str = "google",
-    method: str = "auto",
-    esri_wayback_release_id: str | None = None,
-    esri_wayback_as_of_date: DateLike | None = None,
+    provider: Provider = "google",
+    method: Method = "auto",
     max_workers: int = 16,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = MAX_TILES,
 ) -> gpd.GeoDataFrame:
-    """Find which imagery dates are available over an area.
+    """Find which imagery capture dates are available over an area.
 
     Parameters
     ----------
@@ -170,16 +187,6 @@ def availability(
         provider-reported capture footprints and is faster on large areas but
         2-3x slower on small ones; ``"per-tile"`` reports coverage quantised to
         whole tiles. Ignored for Google, which only has a per-tile path.
-    esri_wayback_release_id : str | None
-        Select one exact Esri Wayback snapshot by its stable catalogue
-        identifier, for example ``"WB_2026_R03"``. This is the preferred exact
-        release selector.
-    esri_wayback_as_of_date : datetime.date | str | None
-        Select the latest WMTS snapshot dated on or before this date. This is
-        an explicit release-catalogue lookup, not capture-date matching.
-        Release selectors are mutually exclusive, require ``provider="esri"``,
-        and cannot be combined with capture-date bounds or a non-default
-        ``method``.
     max_workers : int
         Maximum number of concurrent HTTP requests. Default 16.
     cache_dir : str | os.PathLike[str] | None
@@ -216,71 +223,25 @@ def availability(
         undated default imagery) are excluded, matching upstream behaviour.
 
         ``gdf.attrs`` records ``zoom``, ``provider``, ``n_aoi_tiles`` and
-        ``method``. Normal capture-date searches report ``"per-tile"`` or
-        ``"region-query"``. Esri release selection reports
-        ``"esri-wayback-release"`` and also records the resolved release ID,
-        catalogue date, title, and resolution method.
+        ``method`` -- ``"per-tile"``, ``"region-query"``, or ``"none"`` when the
+        AOI selects no tiles.
+
+    See Also
+    --------
+    esri_mosaic_as_of : What one published Esri Wayback snapshot *displays*, and
+        where each piece of it came from. That is a different question from this
+        one: this function searches the archive for capture dates, that one reads
+        the seam map of a single release.
     """
     aoi = normalize_aoi(aoi)
     _validate_zoom(zoom, provider)
     min_d, max_d = _as_date(min_date), _as_date(max_date)
-    release_resolution, release_value = _release_selector(
-        esri_wayback_release_id,
-        esri_wayback_as_of_date,
-    )
-    if release_resolution is not None:
-        if provider != "esri":
-            raise ValueError(
-                "Esri Wayback release selectors require provider='esri'; "
-                "they select publication snapshots, not capture dates"
-            )
-        if min_d is not None or max_d is not None:
-            raise ValueError(
-                "Esri Wayback release selectors cannot be combined with "
-                "min_date or max_date; "
-                "the release snapshot reports its own capture dates"
-            )
-        if method != "auto":
-            raise ValueError(
-                "method cannot be set with an Esri Wayback release selector; "
-                "release selection uses its own exact-layer path"
-            )
     backend, client = _backend(provider, cache_dir)
 
     try:
-        release_layer = _resolve_release(backend, release_resolution, release_value)
         tiles = backend.grid.tiles(aoi, zoom, max_tiles)
         if not tiles:
-            if release_layer is None:
-                return _empty_availability(zoom, provider)
-            assert release_resolution is not None
-            gdf = _empty_availability(
-                zoom,
-                provider,
-                method="esri-wayback-release",
-                selection_mode="esri-wayback-release",
-            )
-            _set_release_attrs(
-                gdf,
-                release_layer,
-                release_resolution,
-                esri_wayback_as_of_date,
-            )
-            return gdf
-
-        if release_layer is not None:
-            assert release_resolution is not None
-            return _availability_at_esri_release(
-                backend,
-                release_layer,
-                aoi,
-                tiles,
-                zoom,
-                provider,
-                max_workers,
-                release_resolution,
-                esri_wayback_as_of_date,
-            )
+            return _empty_availability(zoom, provider)
 
         if _use_region_query(backend, len(tiles), method):
             return _availability_by_region(
@@ -346,65 +307,6 @@ def _use_region_query(backend, n_tiles: int, method: str = "auto") -> bool:
     return supported and n_tiles >= ESRI_REGION_QUERY_MIN_TILES
 
 
-def _availability_at_esri_release(
-    backend,
-    release_layer,
-    aoi,
-    tiles,
-    zoom,
-    provider,
-    max_workers,
-    release_resolution,
-    as_of_date,
-) -> gpd.GeoDataFrame:
-    """Capture dates visible in one exact Esri Wayback release snapshot."""
-    by_date: dict[_dt.date, set] = defaultdict(set)
-    lock = threading.Lock()
-
-    def work(tile) -> None:
-        candidate = backend.tile_at_release(tile, release_layer)
-        if candidate.date is None:
-            return
-        with lock:
-            by_date[candidate.date].add(tile)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        list(pool.map(work, tiles))
-
-    if not by_date:
-        gdf = _empty_availability(
-            zoom,
-            provider,
-            len(tiles),
-            method="esri-wayback-release",
-            selection_mode="esri-wayback-release",
-        )
-        _set_release_attrs(gdf, release_layer, release_resolution, as_of_date)
-        return gdf
-
-    rows = [
-        {
-            "date": date,
-            "n_tiles": len(by_date[date]),
-            "coverage": len(by_date[date]) / len(tiles),
-            "complete": len(by_date[date]) == len(tiles),
-            "providers": release_layer.title,
-            "geometry": dissolve(by_date[date]).intersection(aoi),
-        }
-        for date in sorted(by_date, reverse=True)
-    ]
-    gdf = _finish_availability(
-        rows,
-        zoom,
-        provider,
-        len(tiles),
-        method="esri-wayback-release",
-        selection_mode="esri-wayback-release",
-    )
-    _set_release_attrs(gdf, release_layer, release_resolution, as_of_date)
-    return gdf
-
-
 def _availability_by_region(
     backend, aoi, tiles, zoom, provider, min_d, max_d, max_workers
 ) -> gpd.GeoDataFrame:
@@ -412,12 +314,16 @@ def _availability_by_region(
 
     Produces the same columns as the per-tile path.  ``geometry`` is the
     provider-reported capture footprint clipped to the AOI rather than a union
-    of whole tiles, while ``n_tiles`` / ``coverage`` / ``complete`` stay
-    tile-based so the two paths and the two providers remain directly
-    comparable.
-    """
-    from shapely.ops import unary_union
+    of whole tiles.
 
+    ``n_tiles`` / ``coverage`` / ``complete`` stay tile-based, but note that
+    "tile-based" does not mean the same thing here as in the per-tile path: a
+    tile counts when a footprint *intersects* its extent, whereas the per-tile
+    path counts a tile only when the provider reports imagery for the whole
+    tile.  A footprint clipping a sliver off every AOI tile therefore reports
+    full coverage over near-zero area.  Compare ``geometry`` areas, not
+    ``coverage``, when comparing the two paths.
+    """
     regions = backend.dated_regions(
         aoi, zoom, min_date=min_d, max_date=max_d, max_workers=max_workers
     )
@@ -463,22 +369,9 @@ def _availability_by_region(
     return _finish_availability(rows, zoom, provider, len(tiles), "region-query")
 
 
-def _finish_availability(
-    rows,
-    zoom,
-    provider,
-    n_tiles,
-    method,
-    selection_mode: str = "capture-date",
-) -> gpd.GeoDataFrame:
+def _finish_availability(rows, zoom, provider, n_tiles, method) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(rows, columns=AVAILABILITY_COLUMNS, geometry="geometry", crs=WGS84)
-    gdf.attrs.update(
-        zoom=zoom,
-        provider=provider,
-        n_aoi_tiles=n_tiles,
-        method=method,
-        selection_mode=selection_mode,
-    )
+    gdf.attrs.update(zoom=zoom, provider=provider, n_aoi_tiles=n_tiles, method=method)
     return gdf
 
 
@@ -487,35 +380,197 @@ def _empty_availability(
     provider: str,
     n_tiles: int = 0,
     method: str = "none",
-    selection_mode: str = "capture-date",
 ) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(
         {name: [] for name in AVAILABILITY_COLUMNS}, geometry="geometry", crs=WGS84
     )
+    gdf.attrs.update(zoom=zoom, provider=provider, n_aoi_tiles=n_tiles, method=method)
+    return gdf
+
+
+# --------------------------------------------------------------------------
+# esri_mosaic_as_of
+# --------------------------------------------------------------------------
+def esri_mosaic_as_of(
+    aoi: BaseGeometry,
+    zoom: int | Sequence[int],
+    as_of_date: DateLike,
+    *,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_footprints: int = 500,
+) -> gpd.GeoDataFrame:
+    """Map what one Esri Wayback snapshot displays, and where each piece came from.
+
+    A Wayback *release* is a published snapshot of the World Imagery basemap,
+    mosaicked from imagery flown across many years.  This answers "if I looked at
+    the basemap on this date, what would I be seeing, and how old is each part of
+    it?" -- which is a different question from :func:`availability`, and it is
+    answered from Esri's own capture footprints rather than by probing tiles.
+
+    Parameters
+    ----------
+    aoi : shapely.geometry.base.BaseGeometry
+        Area of interest as a shapely geometry in EPSG:4326 (lon/lat degrees).
+    zoom : int | Sequence[int]
+        One zoom level, or several.  This is not merely a resolution knob: Esri
+        composes the mosaic per scale and publishes metadata per scale, so the
+        same ground in the same release can carry a different capture date at
+        different zooms.  Pass several to see that.  Zooms of 10 and below all
+        resolve to the same metadata layer and so return identical geometry.
+    as_of_date : datetime.date | str
+        The date to look at the archive on.  The latest release published on or
+        before this date is used; it is a **publication** date, not a capture
+        date, and no capture-date matching happens.
+    cache_dir : str | os.PathLike[str] | None
+        On-disk response cache. Pass ``None`` to disable caching.
+    max_footprints : int
+        Reject areas where the release publishes more capture footprints than
+        this at some zoom. Default 500. Footprint count, not tile count, is what
+        this call costs.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per ``(zoom, capture date)``, ordered by zoom then newest date
+        first, in EPSG:4326:
+
+        ``zoom``
+            The zoom the row was resolved at.
+        ``date``
+            The **capture date** of the imagery displayed in this area.
+        ``area_fraction``
+            This row's share of the AOI, as a planar area ratio computed in
+            EPSG:3857.  Mercator's area distortion largely cancels between the
+            row and the AOI over a modest latitude span, but this is not a true
+            area ratio for a tall AOI -- reproject ``geometry`` yourself if you
+            need one.  ``nan`` for a zero-area (line or point) AOI.
+        ``release_id``
+            Stable catalogue identifier of the resolved release, for example
+            ``"WB_2026_R03"``.  Constant for the whole frame, and a column
+            rather than only an attr so concatenating two snapshots cannot lose
+            track of which release each row came from.
+        ``geometry``
+            The area displaying that capture date, clipped to the AOI.  Real
+            capture-footprint boundaries, not tile edges.
+
+        ``gdf.attrs`` records ``release_id``, ``release_date`` (the publication
+        date), ``release_title``, ``as_of_date`` and ``zooms``.
+
+        Footprints sharing a zoom and capture date are dissolved into one row.
+        Ground the release publishes no footprint metadata for is absent
+        entirely, so ``area_fraction`` need not sum to 1 across a zoom.
+
+    Raises
+    ------
+    ValueError
+        If ``as_of_date`` precedes the archive, a zoom is out of range, or the
+        release publishes more than ``max_footprints`` footprints here.
+    RequestFailed
+        If Esri's metadata service returned an incomplete feature list.  A
+        partial seam map is refused rather than returned, because its holes
+        would be indistinguishable from ground the release does not cover.
+
+    See Also
+    --------
+    availability : Which capture dates exist over an area, across all releases.
+    download : Fetch the pixels; pass ``esri_wayback_release_id=`` with the
+        ``release_id`` from this frame to get exactly the snapshot mapped here.
+    """
+    aoi = normalize_aoi(aoi)
+    zooms = _normalise_zooms(zoom)
+    as_of = _as_date(as_of_date)
+    if as_of is None:
+        raise ValueError("as_of_date is required")
+
+    backend, client = _backend("esri", cache_dir)
+    try:
+        layer = backend.release_on_or_before(as_of)
+
+        def work(z: int) -> list[tuple[int, _dt.date, BaseGeometry]]:
+            footprints = backend.release_footprints(
+                layer, aoi, z, max_footprints=max_footprints
+            )
+            by_date: dict[_dt.date, list] = defaultdict(list)
+            for date, geom in footprints:
+                by_date[date].append(geom)
+
+            out = []
+            for date, geoms in by_date.items():
+                clipped = unary_union(geoms).intersection(aoi)
+                if not clipped.is_empty:
+                    out.append((z, date, clipped))
+            return out
+
+        # One worker per zoom, capped: release_footprints issues its requests
+        # serially, so this bounds requests in flight against Wayback to the
+        # measured cap rather than multiplying it by the number of zooms.
+        with ThreadPoolExecutor(max_workers=min(WAYBACK_MAX_WORKERS, len(zooms))) as pool:
+            found = [row for rows in pool.map(work, zooms) for row in rows]
+    finally:
+        client.close()
+
+    found.sort(key=lambda row: (row[0], -row[1].toordinal()))
+    fractions = _area_fractions(aoi, [geom for _z, _d, geom in found])
+    rows = [
+        {
+            "zoom": z,
+            "date": date,
+            "area_fraction": fraction,
+            "release_id": layer.identifier,
+            "geometry": geom,
+        }
+        for (z, date, geom), fraction in zip(found, fractions, strict=True)
+    ]
+
+    gdf = gpd.GeoDataFrame(
+        rows if rows else {name: [] for name in ESRI_MOSAIC_COLUMNS},
+        columns=ESRI_MOSAIC_COLUMNS,
+        geometry="geometry",
+        crs=WGS84,
+    )
     gdf.attrs.update(
-        zoom=zoom,
-        provider=provider,
-        n_aoi_tiles=n_tiles,
-        method=method,
-        selection_mode=selection_mode,
+        release_id=layer.identifier,
+        release_date=layer.date,
+        release_title=layer.title,
+        as_of_date=as_of,
+        zooms=zooms,
     )
     return gdf
 
 
-def _set_release_attrs(
-    gdf: gpd.GeoDataFrame,
-    layer,
-    resolution: str,
-    as_of_date: DateLike | None = None,
-) -> None:
-    gdf.attrs.update(
-        esri_wayback_release_id=layer.identifier,
-        esri_wayback_catalogue_date=layer.date,
-        esri_wayback_release_title=layer.title,
-        esri_wayback_release_resolution=resolution,
-    )
-    if as_of_date is not None:
-        gdf.attrs["esri_wayback_as_of_date"] = _as_date(as_of_date)
+def _normalise_zooms(zoom: int | Sequence[int]) -> list[int]:
+    """Validate one zoom or several, returning them sorted and deduplicated."""
+    if isinstance(zoom, int) and not isinstance(zoom, bool):
+        candidates = [zoom]
+    elif isinstance(zoom, Sequence) and not isinstance(zoom, (str, bytes)):
+        candidates = list(zoom)
+        if not candidates:
+            raise ValueError("zoom cannot be an empty sequence")
+    else:
+        raise TypeError(f"zoom must be an int or a sequence of ints, not {type(zoom).__name__}")
+
+    for value in candidates:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"zoom values must be ints, not {type(value).__name__}")
+        # The grid would normally enforce the lower bound in MercatorGrid.tiles;
+        # this path never enumerates tiles, so it is checked here.
+        if value < 0:
+            raise ValueError(f"zoom must be at least 0, not {value}")
+        _validate_zoom(value, "esri")
+    return sorted(set(candidates))
+
+
+def _area_fractions(aoi: BaseGeometry, geoms: list[BaseGeometry]) -> list[float]:
+    """Each geometry's share of the AOI, as planar areas in EPSG:3857."""
+    if not geoms:
+        return []
+    areas = gpd.GeoSeries([aoi, *geoms], crs=WGS84).to_crs(MERCATOR).area.to_numpy()
+    aoi_area = float(areas[0])
+    if aoi_area <= 0.0:
+        # A line or point AOI: every clip is zero-area too, so the ratio is
+        # genuinely undefined rather than zero.
+        return [float("nan")] * len(geoms)
+    return [float(area) / aoi_area for area in areas[1:]]
 
 
 # --------------------------------------------------------------------------
@@ -526,8 +581,8 @@ def download(
     zoom: int,
     date: DateLike | None = None,
     *,
-    date_match: str = "closest",
-    provider: str = "google",
+    date_match: DateMatch = "closest",
+    provider: Provider = "google",
     esri_wayback_release_id: str | None = None,
     esri_wayback_as_of_date: DateLike | None = None,
     max_workers: int = 16,

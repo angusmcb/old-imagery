@@ -11,6 +11,7 @@ import pytest
 from shapely.geometry import box
 
 import old_imagery
+from old_imagery import api
 
 pytestmark = pytest.mark.network
 
@@ -110,6 +111,60 @@ def test_esri_region_query_dates_are_capture_not_release() -> None:
     assert len(capture_dates - release_dates) > len(capture_dates) / 2
 
 
+def test_esri_mosaic_as_of_maps_real_footprints() -> None:
+    """The seam map must come from footprints and agree with the pixels."""
+    # Big enough to straddle a capture seam, so the multi-row case is exercised.
+    area = box(-122.52, 37.70, -122.15, 37.90)
+    gdf = old_imagery.esri_mosaic_as_of(area, 16, "2020-06-01")
+
+    assert len(gdf) > 1, "this AOI should span several capture dates"
+    assert list(gdf.columns) == api.ESRI_MOSAIC_COLUMNS
+    assert gdf.crs == "EPSG:4326"
+    assert gdf.attrs["release_date"] <= dt.date(2020, 6, 1)
+    assert (gdf["release_id"] == gdf.attrs["release_id"]).all()
+
+    # Footprints, not tile unions: a tile-quantised answer at zoom 16 could not
+    # sum this close to 1 while still resolving several distinct dates.
+    assert gdf["area_fraction"].sum() == pytest.approx(1.0, abs=0.05)
+    assert gdf.geometry.within(area.buffer(1e-9)).all()
+
+    # The metadata layer is a flat partition: rows must not claim the same
+    # ground. Boundary slivers from geometryPrecision rounding are expected.
+    geoms = list(gdf.geometry)
+    for i in range(len(geoms)):
+        for j in range(i + 1, len(geoms)):
+            assert geoms[i].intersection(geoms[j]).area < area.area * 1e-6
+
+
+def test_esri_mosaic_as_of_resolves_a_different_date_per_zoom() -> None:
+    """Wayback composes per scale, so zoom is a real axis of the answer."""
+    small = box(-122.404, 37.792, -122.396, 37.798)
+    gdf = old_imagery.esri_mosaic_as_of(small, [13, 19], "2020-06-01")
+
+    assert sorted(gdf["zoom"].unique()) == [13, 19]
+    by_zoom = {z: set(g["date"]) for z, g in gdf.groupby("zoom")}
+    assert by_zoom[13] != by_zoom[19], (
+        "this AOI is known to show different capture dates at zoom 13 and 19; "
+        "if Esri has recomposed the release, pick another area rather than "
+        "weakening the assertion"
+    )
+
+
+def test_esri_mosaic_as_of_agrees_with_the_downloaded_pixels() -> None:
+    small = box(-122.404, 37.792, -122.396, 37.798)
+    gdf = old_imagery.esri_mosaic_as_of(small, 18, "2020-06-01")
+    mapped = set(gdf["date"])
+
+    with old_imagery.download(
+        small, zoom=18, provider="esri", esri_wayback_release_id=gdf.attrs["release_id"]
+    ) as src:
+        tags = src.tags()
+    pixel_dates = {dt.date.fromisoformat(d) for d in tags["dates"].split(",") if d}
+
+    assert tags["esri_wayback_release_id"] == gdf.attrs["release_id"]
+    assert pixel_dates <= mapped
+
+
 def test_esri_wayback_release_selection() -> None:
     """Stable-ID and as-of modes target and clearly label one release."""
     from old_imagery._esri import WayBack
@@ -121,19 +176,6 @@ def test_esri_wayback_release_selection() -> None:
         release = wayback.layers[0]
         assert wayback.release_by_identifier(release.identifier) is release
         assert wayback.release_on_or_before(release.date) is release
-
-    gdf = old_imagery.availability(
-        small,
-        zoom=17,
-        provider="esri",
-        esri_wayback_release_id=release.identifier,
-    )
-    assert gdf.attrs["selection_mode"] == "esri-wayback-release"
-    assert gdf.attrs["esri_wayback_release_id"] == release.identifier
-    assert gdf.attrs["esri_wayback_catalogue_date"] == release.date
-    assert gdf.attrs["esri_wayback_release_resolution"] == "identifier"
-    if len(gdf):
-        assert (gdf["providers"] == release.title).all()
 
     ds = old_imagery.download(
         small,
