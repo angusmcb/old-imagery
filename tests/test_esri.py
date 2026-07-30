@@ -590,3 +590,115 @@ def test_release_footprints_deduplicates_repeated_object_ids() -> None:
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11), (CAPTURE, 11)]})
     wb.release_footprints(layers[0], AOI, 17)
     assert client.geometry_requests == [(1, (11,))]
+
+
+# --------------------------------------------------------------------------
+# candidate_releases: narrowing the release list with cheap tilemap probes
+# --------------------------------------------------------------------------
+class ChainClient(RegionClient):
+    """Adds tilemap responses so the select skip-ahead can be exercised.
+
+    ``chain`` maps a layer id to the layer id its ``select`` points at; layers
+    listed in ``carries`` report imagery (``data == [1]``).
+    """
+
+    def __init__(self, per_layer, chain=None, carries=()):
+        super().__init__(per_layer)
+        self.chain = chain or {}
+        self.carries = set(carries)
+        self.tilemap_queries: list[int] = []
+
+    def get(self, url, *, max_age=None):
+        if "/tilemap/" in url:
+            layer_id = int(url.split("/tilemap/")[1].split("/")[0])
+            self.tilemap_queries.append(layer_id)
+            payload = {"data": [1 if layer_id in self.carries else 0]}
+            if layer_id in self.chain:
+                payload["select"] = [self.chain[layer_id]]
+            return json.dumps(payload).encode()
+        return SAMPLE
+
+
+def _wayback_chain(layers, per_layer, chain=None, carries=()):
+    import threading
+
+    client = ChainClient(per_layer, chain, carries)
+    wb = WayBack.__new__(WayBack)
+    wb._client = client
+    wb.layers = layers
+    wb._by_id = {layer.id: layer for layer in layers}
+    wb._date_cache = {}
+    wb._lock = threading.Lock()
+    return wb, client
+
+
+def test_candidate_releases_follows_the_select_skip_ahead() -> None:
+    """The point of the exercise: don't probe releases the service says are unchanged."""
+    layers = [_layer(i, f"20{10 + i:02d}-01-01") for i in range(1, 7)]
+    # Layer 1 says "nothing changed until layer 4", so 2 and 3 are never probed.
+    wb, client = _wayback_chain(layers, {}, chain={1: 4}, carries={1, 4, 5, 6})
+
+    found = wb.candidate_releases([TILE])
+
+    assert client.tilemap_queries == [1, 4, 5, 6]  # 2 and 3 skipped
+    assert {layer.id for layer in found} == {4, 5, 6}  # 1 resolves to its select target
+
+
+def test_candidate_releases_ignores_releases_without_imagery() -> None:
+    layers = [_layer(i, f"20{10 + i:02d}-01-01") for i in range(1, 4)]
+    wb, _ = _wayback_chain(layers, {}, carries={2})
+    assert {layer.id for layer in wb.candidate_releases([TILE])} == {2}
+
+
+def test_candidate_releases_unions_over_tiles_and_keeps_document_order() -> None:
+    layers = [_layer(i, f"20{10 + i:02d}-01-01") for i in range(1, 5)]
+    wb, _ = _wayback_chain(layers, {}, carries={1, 2, 3, 4})
+    other = MercatorTile(TILE.row + 1, TILE.column, TILE.level)
+
+    found = wb.candidate_releases([TILE, other])
+    assert [layer.id for layer in found] == [1, 2, 3, 4]  # document order, newest first
+
+
+def test_candidate_releases_is_empty_when_no_release_carries_the_tile() -> None:
+    layers = [_layer(i, f"20{10 + i:02d}-01-01") for i in range(1, 4)]
+    wb, _ = _wayback_chain(layers, {}, carries=set())
+    assert wb.candidate_releases([TILE]) == []
+
+
+def test_dated_regions_narrows_the_release_list_when_given_tiles() -> None:
+    """Tiles in hand, only the releases that changed this area are queried."""
+    layers = [_layer(i, f"201{i}-01-01") for i in range(1, 5)]
+    per_layer = {i: [(CAPTURE, 10 + i)] for i in range(1, 5)}
+    wb, client = _wayback_chain(layers, per_layer, carries={2})
+
+    wb.dated_regions(AOI, 17, tiles=[TILE])
+
+    # Only release 2 reached the slow metadata service, not all four.
+    assert client.date_queries == [2]
+
+
+def test_dated_regions_queries_every_release_without_tiles() -> None:
+    layers = [_layer(i, f"201{i}-01-01") for i in range(1, 5)]
+    per_layer = {i: [(CAPTURE, 10 + i)] for i in range(1, 5)}
+    wb, client = _wayback_chain(layers, per_layer, carries={2})
+
+    wb.dated_regions(AOI, 17)
+    assert sorted(client.date_queries) == [1, 2, 3, 4]
+
+
+def test_dated_regions_skips_narrowing_on_a_large_tile_count() -> None:
+    """Above the threshold, probing every tile costs more than it saves."""
+    from old_imagery._esri import NARROW_RELEASES_MAX_TILES
+
+    layers = [_layer(i, f"201{i}-01-01") for i in range(1, 5)]
+    per_layer = {i: [(CAPTURE, 10 + i)] for i in range(1, 5)}
+    wb, client = _wayback_chain(layers, per_layer, carries={2})
+
+    many = [
+        MercatorTile(TILE.row + i, TILE.column, TILE.level)
+        for i in range(NARROW_RELEASES_MAX_TILES + 1)
+    ]
+    wb.dated_regions(AOI, 17, tiles=many)
+
+    assert client.tilemap_queries == []  # never probed
+    assert sorted(client.date_queries) == [1, 2, 3, 4]

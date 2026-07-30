@@ -121,7 +121,8 @@ def test_availability_excludes_undated_imagery(stub) -> None:
     assert list(old_imagery.availability(AOI, ZOOM)["date"]) == [D1]
 
 
-def test_availability_reports_partial_coverage(stub) -> None:
+def test_availability_reports_partial_coverage_as_area(stub) -> None:
+    """Coverage is the fraction of the AOI's *area*, not of its tile count."""
     backend = StubBackend([D1])
     tiles = KeyholeGrid().tiles(AOI, ZOOM, 10_000)
     assert len(tiles) > 1
@@ -129,9 +130,13 @@ def test_availability_reports_partial_coverage(stub) -> None:
     stub(backend)
 
     gdf = old_imagery.availability(AOI, ZOOM)
-    assert gdf["n_tiles"].iloc[0] == len(tiles) - 1
-    assert gdf["coverage"].iloc[0] == pytest.approx((len(tiles) - 1) / len(tiles))
+    covered = gdf.geometry.iloc[0]
+    assert gdf["coverage"].iloc[0] == pytest.approx(covered.area / AOI.area, rel=1e-3)
+    assert 0 < gdf["coverage"].iloc[0] < 1
     assert not bool(gdf["complete"].iloc[0])
+    # A dropped tile that only clips the AOI corner must not cost a whole
+    # 1/len(tiles) of coverage the way a tile count would.
+    assert gdf["coverage"].iloc[0] != pytest.approx((len(tiles) - 1) / len(tiles))
 
 
 def test_availability_empty_when_no_imagery(stub) -> None:
@@ -255,10 +260,12 @@ class RegionBackend(StubBackend):
         self.regions = regions
         self.region_calls = 0
         self.seen_kwargs = None
+        self.seen_tiles = None
 
-    def dated_regions(self, aoi, zoom, *, min_date=None, max_date=None):
+    def dated_regions(self, aoi, zoom, *, min_date=None, max_date=None, tiles=None):
         self.region_calls += 1
         self.seen_kwargs = {"min_date": min_date, "max_date": max_date}
+        self.seen_tiles = tiles
         return [(d, g, "Wayback release") for d, g in self.regions]
 
 
@@ -423,57 +430,23 @@ def test_release_download_rejects_mixed_selection_modes(kwargs, message) -> None
         old_imagery.download(AOI, ZOOM, **kwargs)
 
 
-def test_region_query_used_above_the_tile_threshold(stub) -> None:
-    backend = stub(RegionBackend([(D1, AOI)]))
-    gdf = old_imagery.availability(AOI, REGION_ZOOM, provider="esri", max_tiles=10_000)
-
-    assert gdf.attrs["n_aoi_tiles"] >= api.ESRI_REGION_QUERY_MIN_TILES
-    assert gdf.attrs["method"] == "region-query"
-    assert backend.region_calls == 1
-    assert list(gdf["date"]) == [D1]
-
-
-def test_per_tile_used_below_the_tile_threshold(stub) -> None:
+def test_esri_always_uses_footprints(stub) -> None:
+    """No `method` option: Esri resolves through footprints, small AOI or large."""
     tiny = box(-122.3999, 37.7929, -122.3997, 37.7931)
-    backend = stub(RegionBackend([(D1, tiny)]))
-    gdf = old_imagery.availability(tiny, ZOOM, provider="esri")
-
-    assert gdf.attrs["n_aoi_tiles"] < api.ESRI_REGION_QUERY_MIN_TILES
-    assert gdf.attrs["method"] == "per-tile"
-    assert backend.region_calls == 0
-
-
-def test_method_region_forces_the_region_query_below_the_threshold(stub) -> None:
-    tiny = box(-122.3999, 37.7929, -122.3997, 37.7931)
-    backend = stub(RegionBackend([(D1, tiny)]))
-    gdf = old_imagery.availability(tiny, ZOOM, provider="esri", method="region")
-
-    assert gdf.attrs["n_aoi_tiles"] < api.ESRI_REGION_QUERY_MIN_TILES
-    assert gdf.attrs["method"] == "region-query"
-    assert backend.region_calls == 1
+    for aoi, zoom in ((tiny, ZOOM), (AOI, REGION_ZOOM)):
+        backend = stub(RegionBackend([(D1, aoi)]))
+        gdf = old_imagery.availability(aoi, zoom, provider="esri", max_tiles=10_000)
+        assert gdf.attrs["method"] == "region-query"
+        assert backend.region_calls == 1
+        assert list(gdf["date"]) == [D1]
 
 
-def test_method_per_tile_forces_probing_above_the_threshold(stub) -> None:
-    backend = stub(RegionBackend([(D1, AOI)]))
-    gdf = old_imagery.availability(
-        AOI, REGION_ZOOM, provider="esri", method="per-tile", max_tiles=10_000
-    )
-
-    assert gdf.attrs["n_aoi_tiles"] >= api.ESRI_REGION_QUERY_MIN_TILES
-    assert gdf.attrs["method"] == "per-tile"
-    assert backend.region_calls == 0
-
-
-def test_method_region_rejected_for_google(stub) -> None:
-    stub(StubBackend([D1]))
-    with pytest.raises(ValueError, match="only available for provider='esri'"):
-        old_imagery.availability(AOI, ZOOM, method="region")
-
-
-def test_unknown_method_rejected(stub) -> None:
-    stub(StubBackend([D1]))
-    with pytest.raises(ValueError, match="Unknown method"):
-        old_imagery.availability(AOI, ZOOM, method="quick")
+def test_availability_no_longer_accepts_a_method(stub) -> None:
+    """The knob is gone: footprints are strictly better, so there was no trade-off."""
+    stub(RegionBackend([(D1, AOI)]))
+    for method in ("region", "per-tile", "auto"):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            old_imagery.availability(AOI, ZOOM, provider="esri", method=method)
 
 
 def test_google_never_uses_the_region_query(stub) -> None:
@@ -929,3 +902,34 @@ def test_download_pool_is_sized_from_the_provider_not_the_cpu_count(stub) -> Non
         api.workers_for = real
 
     assert seen == [("google", len(tiles))]
+
+
+def test_coverage_is_area_not_touched_tiles(stub) -> None:
+    """A footprint clipping a sliver off every tile must not read as full cover.
+
+    This is the defect area-based coverage exists to fix: with a tile count, a
+    geometry touching all AOI tiles reported coverage 1.0 over almost no ground.
+    """
+    minx, miny, maxx, maxy = AOI.bounds
+    sliver = box(minx, miny, maxx, miny + (maxy - miny) * 0.02)  # 2% of the AOI
+    stub(RegionBackend([(D1, sliver)]))
+
+    gdf = old_imagery.availability(AOI, REGION_ZOOM, provider="esri", max_tiles=10_000)
+
+    assert gdf["coverage"].iloc[0] == pytest.approx(0.02, abs=0.005)
+    assert not bool(gdf["complete"].iloc[0])
+
+
+def test_full_cover_is_complete(stub) -> None:
+    stub(RegionBackend([(D1, AOI)]))
+    gdf = old_imagery.availability(AOI, REGION_ZOOM, provider="esri", max_tiles=10_000)
+    assert gdf["coverage"].iloc[0] == pytest.approx(1.0)
+    assert bool(gdf["complete"].iloc[0])
+
+
+def test_availability_no_longer_reports_a_tile_count_column(stub) -> None:
+    """The tile grid is transport, not something the caller chose or can see."""
+    stub(StubBackend([D1]))
+    gdf = old_imagery.availability(AOI, ZOOM)
+    assert "n_tiles" not in gdf.columns
+    assert list(gdf.columns) == ["date", "coverage", "complete", "providers", "geometry"]

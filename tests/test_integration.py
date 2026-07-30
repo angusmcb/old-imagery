@@ -80,17 +80,29 @@ def test_esri_availability_and_download() -> None:
     assert (ds.dataset_mask() > 0).all()
 
 
-def test_esri_region_query_agrees_with_per_tile() -> None:
-    """The two Esri availability paths must report the same capture dates."""
-    small = box(-122.3965, 37.7940, -122.3945, 37.7955)
-    per_tile = old_imagery.availability(small, zoom=17, provider="esri", method="per-tile")
-    region = old_imagery.availability(small, zoom=17, provider="esri", method="region")
+def test_esri_footprints_cover_what_tile_probing_would_have_found() -> None:
+    """Footprints replaced per-tile probing, so they must not lose capture dates."""
+    from old_imagery._esri import WayBack
+    from old_imagery._http import CachedHttpClient
+    from old_imagery._region import MercatorGrid
 
-    assert per_tile.attrs["method"] == "per-tile"
+    small = box(-122.3965, 37.7940, -122.3945, 37.7955)
+    region = old_imagery.availability(small, zoom=17, provider="esri")
     assert region.attrs["method"] == "region-query"
-    # The region path can additionally see footprints that only clip the AOI
-    # edge, so require it to be a superset rather than an exact match.
-    assert set(per_tile["date"]) <= set(region["date"])
+
+    # What the removed per-tile path would have reported, computed directly.
+    with CachedHttpClient() as client:
+        wb = WayBack(client)
+        probed = {
+            d.date
+            for tile in MercatorGrid().tiles(small, 17, 10_000)
+            for d in wb.dated_tiles(tile)
+            if d.date is not None
+        }
+
+    # Footprints can additionally see imagery that only clips the AOI edge, so
+    # require a superset rather than equality.
+    assert probed <= set(region["date"])
     assert region.geometry.is_valid.all()
     assert region.geometry.apply(lambda g: g.within(small.buffer(1e-9))).all()
 
@@ -223,3 +235,43 @@ def test_both_providers_agree_on_extent() -> None:
 
     for a, b in zip(google.bounds, esri_4326, strict=True):
         assert a == pytest.approx(b, abs=1e-4)
+
+
+def test_region_narrowing_gives_the_same_answer_as_querying_every_release() -> None:
+    """Narrowing must be a pure speedup: identical dates, identical geometry."""
+    from old_imagery import _esri
+
+    small = box(-122.404, 37.792, -122.398, 37.7968)
+    original = _esri.NARROW_RELEASES_MAX_TILES
+    try:
+        _esri.NARROW_RELEASES_MAX_TILES = 0  # disable
+        full = old_imagery.availability(small, 17, provider="esri")
+        _esri.NARROW_RELEASES_MAX_TILES = original
+        narrowed = old_imagery.availability(small, 17, provider="esri")
+    finally:
+        _esri.NARROW_RELEASES_MAX_TILES = original
+
+    assert len(narrowed) == len(full)
+    assert list(narrowed["date"]) == list(full["date"])
+    for a, b in zip(narrowed.geometry, full.geometry, strict=True):
+        assert a.symmetric_difference(b).area < small.area * 1e-9
+
+
+def test_candidate_releases_finds_the_same_dates_as_the_whole_catalogue() -> None:
+    """The property the narrowing rests on, checked against the live service."""
+    from old_imagery._esri import WayBack, _envelope_3857
+    from old_imagery._http import CachedHttpClient
+    from old_imagery._region import MercatorGrid
+
+    small = box(-122.404, 37.792, -122.398, 37.7968)
+    tiles = MercatorGrid().tiles(small, 17, 10_000)
+    with CachedHttpClient() as client:
+        wb = WayBack(client)
+        env = _envelope_3857(small)
+        candidates = wb.candidate_releases(tiles)
+        assert 0 < len(candidates) < len(wb.layers)
+
+        def dates(layers):
+            return {d for layer in layers for d, _oid in wb._query_layer(layer, env, 17)[0]}
+
+        assert dates(candidates) == dates(wb.layers)

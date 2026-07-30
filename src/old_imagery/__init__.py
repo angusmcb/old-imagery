@@ -37,10 +37,8 @@ from Esri's catalogue and is named to say so.
 
 from ._http import DEFAULT_CACHE_DIR, NotFound, RequestFailed
 from .api import (
-    ESRI_REGION_QUERY_MIN_TILES,
     MAX_IMAGERY_ZOOM,
     DateMatch,
-    Method,
     Provider,
     availability,
     download,
@@ -65,10 +63,8 @@ __all__ = [
     "esri_mosaic_as_of",
     # option types
     "Provider",
-    "Method",
     "DateMatch",
     # constants
-    "ESRI_REGION_QUERY_MIN_TILES",
     "MAX_IMAGERY_ZOOM",
     "DEFAULT_CACHE_DIR",
     # exceptions

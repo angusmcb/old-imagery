@@ -16,10 +16,8 @@ import numpy as np
 import rasterio
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
-from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
-from shapely.prepared import prep
 
 from ._concurrency import workers_for
 from ._dbroot import Database, DbRoot
@@ -31,44 +29,63 @@ MERCATOR = "EPSG:3857"
 
 DateLike = _dt.date | str
 
-# Closed sets for the three string-valued options on the public functions.
+# Closed sets for the two string-valued options on the public functions.
 #
-# These constrain callers under a type checker only. Every one of them is still
-# validated at runtime -- `_backend` for Provider, `_use_region_query` for
-# Method, `sort_by_nearest_date` for DateMatch -- because most callers run
-# unchecked, and a typo should raise rather than behave arbitrarily. For that
-# reason the internal helpers keep plain `str` parameters: narrowing them to
-# these aliases would make their own validation branches statically
-# unreachable, and mypy runs here with warn_unreachable.
+# These constrain callers under a type checker only. Both are still validated at
+# runtime -- `_backend` for Provider, `sort_by_nearest_date` for DateMatch --
+# because most callers run unchecked, and a typo should raise rather than behave
+# arbitrarily. For that reason the internal helpers keep plain `str` parameters:
+# narrowing them to these aliases would make their own validation branches
+# statically unreachable, and mypy runs here with warn_unreachable.
 Provider = Literal["google", "esri"]
-Method = Literal["auto", "per-tile", "region"]
 DateMatch = Literal["closest", "exact", "before", "after"]
 
-AVAILABILITY_COLUMNS = ["date", "n_tiles", "coverage", "complete", "providers", "geometry"]
+AVAILABILITY_COLUMNS = ["date", "coverage", "complete", "providers", "geometry"]
+
+# `coverage` is a float ratio, so `complete` cannot test it against 1.0
+# exactly. A clip that lands this close to the AOI's own area is a
+# reprojection artefact, not a real gap.
+_COMPLETE_TOLERANCE = 1e-9
 ESRI_MOSAIC_COLUMNS = ["zoom", "date", "area_fraction", "release_id", "geometry"]
 
-# Esri exposes two ways to resolve availability, and which wins is not obvious
-# from request counts: per-tile probing issues far more but small requests,
-# while each region query hits a slow metadata service. Measured against the
-# live service (cold cache, 16 requests in flight, seconds):
+# Esri availability always resolves through capture footprints
+# (WayBack.dated_regions), never by probing tiles. There used to be a `method`
+# option choosing between them; it is gone, because the footprint path is more
+# accurate and the trade-off it was there to expose could not be substantiated.
 #
-#     tiles      4     12     30     72
-#     per-tile  30.9   32.8   62.0   67.9
-#     region    63.3   96.7  143.4   40.7
+# Request counts are the reliable part -- they do not depend on the link.
+# Measured on a 12-tile z17 area:
 #
-# So per-tile wins by 2-3x on small areas and region wins on large ones, with
-# the crossover somewhere in the tens of tiles.
+#     per-tile   456 tilemap + 240 metadata   320 KiB
+#     footprint  456 tilemap +  30 metadata  2843 KiB
 #
-# Treat this as an order-of-magnitude result, not a calibration. Run-to-run
-# variance on an identical AOI reached 2.3x, which is the same size as the
-# effect being measured. A later attempt to re-measure at the 10-wide setting
-# _concurrency now uses produced 1.8x *slower* for per-tile and 1.9x *faster*
-# for region on the same AOI -- two opposite conclusions of equal magnitude,
-# i.e. noise, on a link that was known to be degraded at the time. The threshold
-# is therefore a rough midpoint that has never been sharply located, and is
-# worth revisiting only with many repeats on a stable connection. Override it
-# for a specific call by passing `method` explicitly.
-ESRI_REGION_QUERY_MIN_TILES = 50
+# Per-tile issues one metadata point query per (release, tile); the footprint
+# path issues one envelope query per candidate release, so its metadata load is
+# flat in the tile count rather than linear. Both find the same 11 capture
+# dates, and the footprint answer carries true seam geometry.
+#
+# Wall-clock, cold cache, end to end -- and read this with suspicion:
+#
+#     tiles         6      12      36
+#     per-tile   254.9    42.2    75.3
+#     footprint   14.9    25.8   127.4
+#
+# The footprint path loses at 36 tiles. Not because of query counts (195
+# metadata queries is ~7s at 10-wide) but because of payload: it downloads real
+# polygons -- one sampled had 3,520 vertices -- and that grows with AOI area
+# while per-tile's tiny responses do not. See _esri._GEOMETRY_BATCH and
+# `geometryPrecision` if that becomes worth attacking.
+#
+# Do not calibrate anything against those timings. Per-request latency on the
+# link they were taken over swung ~7x *within one session*: the metadata
+# endpoint measured 2.21 s/request at one point and 0.42 s/request at another,
+# against a tilemap endpoint that stayed near 0.31-0.34 s. Any threshold derived
+# from their ratio is a measurement of the connection, not of Esri.
+#
+# Google has no footprint equivalent: dbRoot reports dates per tile and nothing
+# finer, so its geometry is a union of tile extents. That difference between
+# providers is real and is documented, rather than papered over by quantising
+# Esri down to match.
 
 # Deepest zoom at which each service actually publishes imagery.
 #
@@ -152,7 +169,6 @@ def availability(
     min_date: DateLike | None = None,
     max_date: DateLike | None = None,
     provider: Provider = "google",
-    method: Method = "auto",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = MAX_TILES,
 ) -> gpd.GeoDataFrame:
@@ -170,13 +186,6 @@ def availability(
     provider : str
         ``"google"`` for Google Earth historical imagery, ``"esri"`` for the
         Esri World Imagery Wayback archive.
-    method : str
-        How Esri availability is resolved. ``"auto"`` (default) picks
-        ``"region"`` for areas of at least ``ESRI_REGION_QUERY_MIN_TILES``
-        tiles and ``"per-tile"`` below that. ``"region"`` returns
-        provider-reported capture footprints and is faster on large areas but
-        2-3x slower on small ones; ``"per-tile"`` reports coverage quantised to
-        whole tiles. Ignored for Google, which only has a per-tile path.
     cache_dir : str | os.PathLike[str] | None
         On-disk response cache. Pass ``None`` to disable caching.
     max_tiles : int
@@ -190,14 +199,13 @@ def availability(
 
         ``date``
             The capture date.
-        ``n_tiles``
-            Number of AOI tiles carrying imagery from that date.
         ``coverage``
-            ``n_tiles`` as a fraction of the AOI's tiles.
+            How much of the AOI's **area** this date covers, as a planar ratio
+            computed in EPSG:3857. Independent of ``zoom`` and of the provider,
+            so a date covering half the AOI reports ``0.5`` whichever way it was
+            resolved. ``nan`` for a zero-area (line or point) AOI.
         ``complete``
-            True when that date covers every AOI tile (equivalent to
-            ``coverage == 1.0``). This is a tile-resolution measure, not a
-            guarantee that every point in the AOI has imagery.
+            True when that date covers the whole AOI (``coverage == 1.0``).
         ``providers``
             Google imagery provider names or Esri Wayback release titles,
             where known.
@@ -210,9 +218,17 @@ def availability(
         Google Earth tiles whose imagery carries no capture date (a provider's
         undated default imagery) are excluded, matching upstream behaviour.
 
+        ``geometry`` is resolved as finely as each provider allows, with no
+        option to choose. Esri returns true capture footprints, so its date
+        boundaries follow real imagery seams. Google's dbRoot reports dates per
+        tile and nothing finer, so its geometry is a union of tile extents --
+        the AOI's own outline survives the clip, but internal date boundaries
+        are tile-shaped.
+
         ``gdf.attrs`` records ``zoom``, ``provider``, ``n_aoi_tiles`` and
-        ``method`` -- ``"per-tile"``, ``"region-query"``, or ``"none"`` when the
-        AOI selects no tiles.
+        ``method`` -- ``"per-tile"`` for Google, ``"region-query"`` for Esri, or
+        ``"none"`` when the AOI selects no tiles. It is reported so a result can
+        say how it was obtained; it is not selectable.
 
     See Also
     --------
@@ -231,10 +247,11 @@ def availability(
         if not tiles:
             return _empty_availability(zoom, provider)
 
-        if _use_region_query(backend, len(tiles), method):
-            return _availability_by_region(
-                backend, aoi, tiles, zoom, provider, min_d, max_d
-            )
+        # Footprints where the provider publishes them, tiles where it does
+        # not. Not a caller's choice: the footprint path is both more accurate
+        # and cheaper, so there is nothing to trade off.
+        if hasattr(backend, "dated_regions"):
+            return _availability_by_region(backend, aoi, tiles, zoom, provider, min_d, max_d)
 
         by_date: dict[_dt.date, set] = defaultdict(set)
         providers: dict[_dt.date, set[int]] = defaultdict(set)
@@ -259,40 +276,18 @@ def availability(
         if not by_date:
             return _empty_availability(zoom, provider, len(tiles), "per-tile")
 
-        rows = []
-        for date in sorted(by_date, reverse=True):
-            date_tiles = by_date[date]
-            names = sorted(
-                {n for n in (backend.provider_copyright(p) for p in providers[date]) if n}
+        dates = sorted(by_date, reverse=True)
+        geoms = [dissolve(by_date[date]).intersection(aoi) for date in dates]
+        names = [
+            ", ".join(
+                sorted({n for n in (backend.provider_copyright(p) for p in providers[date]) if n})
             )
-            rows.append(
-                {
-                    "date": date,
-                    "n_tiles": len(date_tiles),
-                    "coverage": len(date_tiles) / len(tiles),
-                    "complete": len(date_tiles) == len(tiles),
-                    "providers": ", ".join(names),
-                    "geometry": dissolve(date_tiles).intersection(aoi),
-                }
-            )
-
-        gdf = _finish_availability(rows, zoom, provider, len(tiles), "per-tile")
-        return gdf
+            for date in dates
+        ]
+        rows = _availability_rows(aoi, dates, geoms, names)
+        return _finish_availability(rows, zoom, provider, len(tiles), "per-tile")
     finally:
         client.close()
-
-
-def _use_region_query(backend, n_tiles: int, method: str = "auto") -> bool:
-    if method not in ("auto", "region", "per-tile"):
-        raise ValueError(f"Unknown method {method!r}; expected 'auto', 'region' or 'per-tile'")
-    if method == "per-tile":
-        return False
-    supported = hasattr(backend, "dated_regions")
-    if method == "region":
-        if not supported:
-            raise ValueError("method='region' is only available for provider='esri'")
-        return True
-    return supported and n_tiles >= ESRI_REGION_QUERY_MIN_TILES
 
 
 def _availability_by_region(
@@ -302,17 +297,15 @@ def _availability_by_region(
 
     Produces the same columns as the per-tile path.  ``geometry`` is the
     provider-reported capture footprint clipped to the AOI rather than a union
-    of whole tiles.
+    of whole tiles, and ``coverage`` is measured as area either way, so the two
+    paths are directly comparable.
 
-    ``n_tiles`` / ``coverage`` / ``complete`` stay tile-based, but note that
-    "tile-based" does not mean the same thing here as in the per-tile path: a
-    tile counts when a footprint *intersects* its extent, whereas the per-tile
-    path counts a tile only when the provider reports imagery for the whole
-    tile.  A footprint clipping a sliver off every AOI tile therefore reports
-    full coverage over near-zero area.  Compare ``geometry`` areas, not
-    ``coverage``, when comparing the two paths.
+    Tiles are used only to bound the request cost and to narrow the release
+    list; they do not shape the answer.
     """
-    regions = backend.dated_regions(aoi, zoom, min_date=min_d, max_date=max_d)
+    # Passing the tiles lets the backend skip releases that never touched this
+    # area, trading ~175 slow metadata queries for cheap tilemap probes.
+    regions = backend.dated_regions(aoi, zoom, min_date=min_d, max_date=max_d, tiles=tiles)
     if not regions:
         return _empty_availability(zoom, provider, len(tiles), "region-query")
 
@@ -323,36 +316,46 @@ def _availability_by_region(
         if title:
             titles[date].add(title)
 
-    prepared_tiles = [(tile, box(*tile.bounds_wgs84)) for tile in tiles]
-
     geometry_by_date: dict[_dt.date, BaseGeometry] = {}
-    tiles_by_date: dict[_dt.date, set] = {}
     for date, geoms in by_date.items():
         clipped = unary_union(geoms).intersection(aoi)
-        if clipped.is_empty:
-            continue
-        prepared = prep(clipped)
-        covered = {tile for tile, extent in prepared_tiles if prepared.intersects(extent)}
-        if not covered:
-            continue
-        geometry_by_date[date] = clipped
-        tiles_by_date[date] = covered
+        if not clipped.is_empty:
+            geometry_by_date[date] = clipped
 
     if not geometry_by_date:
         return _empty_availability(zoom, provider, len(tiles), "region-query")
 
-    rows = [
+    dates = sorted(geometry_by_date, reverse=True)
+    rows = _availability_rows(
+        aoi,
+        dates,
+        [geometry_by_date[date] for date in dates],
+        [", ".join(sorted(titles.get(date, ()))) for date in dates],
+    )
+    return _finish_availability(rows, zoom, provider, len(tiles), "region-query")
+
+
+def _availability_rows(aoi, dates, geoms, names) -> list[dict]:
+    """Assemble availability rows, with coverage measured as area.
+
+    Deliberately not a tile count. The tile grid is a transport detail the
+    caller never chose and cannot see, and counting tiles means different things
+    on the two paths: a footprint that clips a sliver off every AOI tile would
+    report full coverage over almost no ground. An area fraction says the one
+    thing a caller actually wants to know -- how much of my area does this date
+    cover -- and says it identically for both providers.
+    """
+    fractions = _area_fractions(aoi, list(geoms))
+    return [
         {
             "date": date,
-            "n_tiles": len(tiles_by_date[date]),
-            "coverage": len(tiles_by_date[date]) / len(tiles),
-            "complete": len(tiles_by_date[date]) == len(tiles),
-            "providers": ", ".join(sorted(titles.get(date, ()))),
-            "geometry": geometry_by_date[date],
+            "coverage": fraction,
+            "complete": fraction >= 1.0 - _COMPLETE_TOLERANCE,
+            "providers": name,
+            "geometry": geom,
         }
-        for date in sorted(geometry_by_date, reverse=True)
+        for date, geom, name, fraction in zip(dates, geoms, names, fractions, strict=True)
     ]
-    return _finish_availability(rows, zoom, provider, len(tiles), "region-query")
 
 
 def _finish_availability(rows, zoom, provider, n_tiles, method) -> gpd.GeoDataFrame:

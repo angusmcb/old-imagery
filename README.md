@@ -57,12 +57,11 @@ then give me the pixels for one. `esri_mosaic_as_of` answers a separate
 question, about what a published Esri snapshot displays rather than what the
 archive holds.
 
-The three string-valued options are closed sets, exported as type aliases so a
+The two string-valued options are closed sets, exported as type aliases so a
 type checker rejects a typo before it reaches the network:
 
 ```python
 Provider  = Literal["google", "esri"]
-Method    = Literal["auto", "per-tile", "region"]
 DateMatch = Literal["closest", "exact", "before", "after"]
 ```
 
@@ -84,7 +83,6 @@ availability(
     min_date: date | str | None = None,
     max_date: date | str | None = None,
     provider: Provider = "google",
-    method: Method = "auto",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 1_000,
 ) -> geopandas.GeoDataFrame
@@ -97,14 +95,23 @@ capture date, newest first:
 | column | meaning |
 | --- | --- |
 | `date` | **image capture date** — see the note below |
-| `n_tiles` | AOI tiles carrying imagery from that date |
-| `coverage` | `n_tiles` as a fraction of the AOI's tiles |
-| `complete` | date covers every AOI tile (`coverage == 1.0`); measured at tile resolution, not a guarantee that every point is covered |
+| `coverage` | fraction of the AOI's **area** covered by imagery from that date |
+| `complete` | that date covers the whole AOI (`coverage == 1.0`) |
 | `providers` | imagery provider / release names, where known |
 | `geometry` | covered area, clipped to the AOI |
 
+`coverage` is an area fraction, computed as a planar ratio in EPSG:3857. That
+makes it mean the same thing for both providers and independent of `zoom` — a
+date covering half your AOI reports `0.5` whether you asked at zoom 13 or 19.
+It is `nan` for a zero-area (line or point) AOI.
+
+`geometry` is resolved as finely as each provider allows, with nothing to
+choose: Esri returns true capture footprints, Google a union of tile extents.
+See [How availability is resolved](#how-availability-is-resolved).
+
 `gdf.attrs` records `zoom`, `provider`, `n_aoi_tiles` and `method` —
-`"per-tile"`, `"region-query"`, or `"none"` when the AOI selects no tiles.
+`"region-query"` for Esri, `"per-tile"` for Google, or `"none"` when the AOI
+selects no tiles. It reports what ran; it is not selectable.
 
 `availability` reports **capture dates only**. To ask what one published Esri
 snapshot displays, use [`esri_mosaic_as_of`](#esri_mosaic_as_of).
@@ -236,31 +243,25 @@ cannot reach at all, because Esri's per-tile path drops undated versions.
 
 `zoom` sets how finely date boundaries are traced. Zoom 15–17 is usually the right trade-off; the date *list* barely changes above that, only the precision of the polygons.
 
-Esri has two ways to resolve availability, selected by `method`:
+**There is no `method` option.** Each provider is resolved as finely as it allows:
 
-- `"per-tile"` — probe each tile against every Wayback release. Coverage is quantised to whole tiles.
-- `"region"` — one query per release against the metadata feature service. Returns provider-reported capture footprints, so `geometry` is not quantised to tiles. It is *not* zoom-independent, though: Esri publishes metadata per scale (`min(13, 23 - zoom)`), so a different zoom queries a different metadata layer and can return different footprints.
-- `"auto"` (default) — `"region"` at or above `ESRI_REGION_QUERY_MIN_TILES` (50) tiles, `"per-tile"` below.
+- **Esri** returns real capture footprints, so date boundaries follow actual imagery seams. Note these are *not* zoom-independent: Esri publishes metadata per scale (`min(13, 23 - zoom)`), so a different zoom queries a different metadata layer and can return different footprints.
+- **Google** has nothing finer to offer — dbRoot reports dates per tile — so its `geometry` is a union of tile extents. Your AOI's outline survives the clip; internal date boundaries are tile-shaped.
 
-`gdf.attrs["method"]` reports `"per-tile"` or `"region-query"` according to
-which path ran.
+`gdf.attrs["method"]` reports which ran (`"region-query"` or `"per-tile"`), so a result can say how it was obtained. It is not selectable.
 
-Google has only a per-tile path. It accepts `method="auto"` and
-`method="per-tile"` — both resolve per-tile — but `method="region"` raises
-`ValueError` rather than silently falling back, since a caller asking for
-footprint geometry would otherwise receive tile-quantised geometry without
-being told.
+This used to be a three-valued `method` argument with a tile-count threshold, on the theory that footprints were more accurate but slower. The accuracy holds; the trade-off could not be substantiated well enough to be worth every caller's attention. Request counts on a 12-tile area — the part that does not depend on your connection:
 
-Which is faster is **not** obvious from request counts — per-tile issues far more requests, but they are small and run concurrently, while each region query hits a slow metadata service. Measured against the live service, cold cache, seconds:
+| | tilemap | metadata | bytes |
+| --- | --- | --- | --- |
+| per-tile probing | 456 | 240 — one point query per (release, tile) | 320 KiB |
+| footprints | 456 | **30** — one envelope query per candidate release | 2,843 KiB |
 
-| tiles | 4 | 12 | 30 | 72 |
-| --- | --- | --- | --- | --- |
-| `per-tile` | 30.9 | 32.8 | 62.0 | 67.9 |
-| `region` | 63.3 | 96.7 | 143.4 | **40.7** |
+Same 11 capture dates, better geometry, an eighth of the metadata load. Wall-clock is murkier, and worth stating plainly: measured cold-cache end to end, footprints took 14.9 s vs 254.9 s at 6 tiles and 25.8 s vs 42.2 s at 12 tiles, but **127.4 s vs 75.3 s at 36 tiles**. The footprint path downloads real polygons — one sampled had 3,520 vertices — and that payload grows with AOI area while per-tile's tiny responses do not.
 
-Per-tile wins by 2–3× on small areas; region wins on large ones. Run-to-run variance on an identical AOI reached 2.3×, so the threshold is a rough midpoint, not a sharp optimum — set `method` explicitly if it matters. Reach for `method="region"` on small areas anyway when you want exact footprint geometry rather than tile-quantised coverage.
+Those timings came from a connection whose per-request latency swung about 7× within a single session, so do not calibrate against them. On a large AOI where speed matters more than seam precision, expect footprints to cost you time.
 
-`n_tiles`, `coverage` and `complete` are tile-based in both paths, but "tile-based" does not mean quite the same thing in each. The per-tile path counts a tile when the provider reports imagery for the **whole tile**; the region path counts it when a footprint merely **intersects** its extent. A footprint clipping a sliver off every AOI tile therefore reports `coverage == 1.0` and `complete == True` over almost no area. Compare `geometry` areas rather than `coverage` when comparing the two paths, and note that crossing the `method="auto"` threshold changes which of the two meanings you get.
+`coverage` is measured as area on both paths, so the two are directly comparable and neither depends on the tile grid. That grid is a transport detail: it bounds the request cost and narrows the release list, but it never shapes the answer. It used to — `coverage` was a tile count, which meant a footprint clipping a sliver off every AOI tile reported `coverage == 1.0` over almost no ground.
 
 ### `download`
 

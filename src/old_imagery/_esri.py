@@ -5,9 +5,11 @@ Ported from ``LibEsri`` in Mbucari/GEHistoricalImagery.
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as _dt
 import io
 import json
+import math
 import re
 import threading
 import xml.etree.ElementTree as ET
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 
 from ._concurrency import workers_for
 from ._http import CachedHttpClient, RequestFailed
-from ._region import MercatorGrid, MercatorTile
+from ._region import MERCATOR_EQUATOR, TILE_PX, MercatorGrid, MercatorTile
 
 WMTS_CAPABILITIES = (
     "https://wayback.maptiles.arcgis.com/arcgis/rest/services/world_imagery/"
@@ -35,6 +37,24 @@ _MAX_FEATURES = 20_000
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
 _GEOMETRY_BATCH = 100
+
+# Above this many tiles, stop narrowing the release list with tilemap probes and
+# just ask every release.
+#
+# PROVISIONAL. Narrowing trades ~38 tilemap requests per tile for ~165 metadata
+# requests, so whether it pays turns entirely on the cost ratio between the two
+# endpoints: it wins below roughly 4.3x that ratio in tiles. That ratio could not
+# be pinned down here -- the metadata endpoint measured 2.21 s/request at one
+# point in a session and 0.42 s/request at another, against a tilemap endpoint
+# steady near 0.31-0.34 s, on a link known to be degraded. A 7.1x ratio puts the
+# threshold near 31; a 1.2x ratio puts it near 5.
+#
+# 33 is the high end of that range, chosen because narrowing is what makes the
+# footprint path affordable on the small areas where it is most wanted, and
+# because being wrong here costs throughput rather than correctness -- the answer
+# is verified identical either way (see candidate_releases). Re-measure the two
+# endpoints on a stable connection before trusting this number.
+NARROW_RELEASES_MAX_TILES = 33
 
 
 @dataclass(frozen=True)
@@ -296,6 +316,70 @@ class WayBack:
         return DatedEsriTile(tile=tile, date=date, provider=layer.id, epoch=layer.id, layer=layer)
 
     # -- region-wide availability -----------------------------------------
+    def candidate_releases(self, tiles, *, max_workers: int | None = None) -> list[Layer]:
+        """Releases that changed the imagery over ``tiles``, newest first.
+
+        Answers "which releases do we even need to ask about?" using only the
+        tilemap endpoint, whose ``select`` field names the next release that
+        changed a tile -- the same skip-ahead :meth:`dated_tiles` relies on.
+        Crucially it never touches the metadata service, trading queries there
+        for queries against a cheaper endpoint. How much cheaper could not be
+        established: see NARROW_RELEASES_MAX_TILES.
+
+        The catalogue holds ~195 releases but only a handful ever touched any
+        given area, so this typically returns 10-20. Verified against querying
+        all 195: on a 12-tile z17 area, 20 candidates found the same 11 capture
+        dates; on a 9-tile z18 area straddling a capture seam, 10 candidates
+        found the same 12.
+
+        Probe at the zoom you intend to answer at. Wayback composes the mosaic
+        per scale, so change history is per-scale too: a coarse tile covering
+        the same ground is *not* a safe shortcut. Measured on that 9-tile area,
+        one z13 tile returned 41 releases yet missed 8 the z18 tiles found, and
+        so found only 10 of the 12 dates.
+
+        Every tile is probed rather than a sample. Sampling looks tempting --
+        on three test areas (z11/z17/z18, 42/12/9 tiles) every single tile
+        returned the identical candidate set, so one would have sufficed -- but
+        it buys far less than the request counts suggest. One tile's chain is a
+        *serial* dependency: each hop is the previous response's ``select``.
+        Tiles, by contrast, probe concurrently. So n tiles cost about
+        ceil(n / workers) x chain-length, not n x chain-length: 12 tiles is
+        roughly two waves against one, not twelve times the wall clock. Paying
+        under 2x to keep the answer exact is the right trade for a path whose
+        entire purpose is exactness -- a missed release here would silently drop
+        a capture date, which is indistinguishable from the archive not having
+        one.
+        """
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers or workers_for("esri", len(tiles))
+        ) as pool:
+            found = pool.map(self._candidate_releases_for_tile, tiles)
+            ids = {layer.id for layers in found for layer in layers}
+        # Back into document order, which is newest first.
+        return [layer for layer in self.layers if layer.id in ids]
+
+    def _candidate_releases_for_tile(self, tile: MercatorTile) -> list[Layer]:
+        out: list[Layer] = []
+        skip_until: int | None = None
+        for layer in self.layers:
+            if skip_until is not None:
+                if skip_until == layer.id:
+                    skip_until = None
+                else:
+                    continue
+            payload = self._json(layer.tilemap_url(tile))
+            effective = layer
+            select = (payload or {}).get("select")
+            if select:
+                skip_until = int(select[0])
+                effective = self._by_id.get(skip_until, layer)
+            data = (payload or {}).get("data")
+            if not data or data[0] != 1:
+                continue
+            out.append(effective)
+        return out
+
     def dated_regions(
         self,
         aoi,
@@ -303,6 +387,7 @@ class WayBack:
         *,
         min_date: _dt.date | None = None,
         max_date: _dt.date | None = None,
+        tiles: Sequence[MercatorTile] | None = None,
     ) -> list[tuple[_dt.date, object, str]]:
         """Capture footprints intersecting ``aoi``.
 
@@ -311,18 +396,26 @@ class WayBack:
         release that first published it -- two different things.
 
         One query per Wayback release against the metadata feature service,
-        rather than probing every release for every tile.  The cost therefore
-        scales with the number of distinct capture footprints instead of the
-        tile count, and the returned geometry is the true capture footprint
-        rather than a tile-quantised approximation.
+        rather than probing every release for every tile.  The returned geometry
+        is the true capture footprint rather than a tile-quantised
+        approximation.
+
+        Pass the AOI's ``tiles`` to let :meth:`candidate_releases` cut the
+        release list down first, which on a small area replaces most of ~195
+        slow metadata queries with a smaller number of cheap tilemap ones. It is
+        skipped above ``NARROW_RELEASES_MAX_TILES``, where probing every tile
+        would cost more than it saves.
 
         ``aoi`` and the returned geometries are in EPSG:4326.
         """
-        import concurrent.futures
-
         # A release published before min_date cannot contain imagery captured
         # after it, so those releases can be dropped outright.
         layers = [layer for layer in self.layers if min_date is None or layer.date >= min_date]
+        if tiles and len(tiles) <= NARROW_RELEASES_MAX_TILES:
+            # Releases that never changed this area show the same footprints as
+            # the next release that did, so querying them adds nothing.
+            wanted_ids = {layer.id for layer in self.candidate_releases(tiles)}
+            layers = [layer for layer in layers if layer.id in wanted_ids]
         # Oldest first, so the max_date short-circuit below can cut the tail.
         layers.sort(key=lambda layer: layer.date)
         if not layers:
@@ -544,12 +637,44 @@ class WayBack:
     ) -> list[tuple[_dt.date, object]]:
         import geopandas as gpd
 
+        # Ask the service to generalise, rather than downloading centimetre
+        # detail and throwing it away. A capture footprint is a big polygon --
+        # one sampled had 3,660 vertices -- and that payload, not the request
+        # count, is what makes this path expensive over a wide area.
+        #
+        # Both bounds are tied to the caller's zoom, so nothing they could
+        # perceive at that zoom is lost: vertices are dropped only where they
+        # deviate by under half a pixel, and coordinates are rounded to a tenth
+        # of one.
+        #
+        # How much that saves depends entirely on the zoom, because a footprint's
+        # own detail sits at the 10-50 m scale. Measured on one polygon, varying
+        # only maxAllowableOffset:
+        #
+        #     none    71.9 KiB   3,660 vertices
+        #     0.6 m   86.0 KiB   3,652 vertices    <- half a pixel at z17
+        #     50 m     2.9 KiB     125 vertices
+        #     500 m    0.7 KiB      15 vertices
+        #
+        # So at fine zooms this does nothing for vertex count -- half a pixel is
+        # far below the spacing the data actually has -- and the win there comes
+        # from geometryPrecision alone (~1.2x end to end). At coarse zooms, where
+        # an AOI covers far more ground and the payload actually hurts, half a
+        # pixel is tens of metres and the saving is large: ~38 m at z11.
+        #
+        # Generalising harder would cut fine-zoom payloads too, but those
+        # vertices are the real acquisition boundary, and a caller who asked for
+        # z19 asked to see it. There is no server-side clip on ArcGIS `query`,
+        # so the rest of a regional polygon is downloaded and discarded either
+        # way.
+        pixel_m = _pixel_metres(zoom)
         form = {
             "f": "json",
             "outFields": "OBJECTID,SRC_DATE2",
             "objectIds": ",".join(str(oid) for oid in object_ids),
             "returnGeometry": "true",
-            "geometryPrecision": "2",
+            "maxAllowableOffset": f"{pixel_m / 2:.6g}",
+            "geometryPrecision": str(max(0, math.ceil(-math.log10(pixel_m / 10)))),
             "outSR": "3857",
         }
         try:
@@ -575,6 +700,11 @@ class WayBack:
     def provider_copyright(self, provider_id: int) -> str | None:
         layer = self._by_id.get(provider_id)
         return layer.title if layer is not None else None
+
+
+def _pixel_metres(zoom: int) -> float:
+    """Ground size of one output pixel at ``zoom``, in EPSG:3857 metres."""
+    return MERCATOR_EQUATOR / (TILE_PX * (1 << zoom))
 
 
 def _query_string(params: dict[str, str]) -> str:
