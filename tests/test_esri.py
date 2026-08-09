@@ -99,7 +99,7 @@ def _wayback(responses):
     wb._client = client
     wb.layers = _parse_capabilities(SAMPLE)
     wb._by_id = {layer.id: layer for layer in wb.layers}
-    wb._date_cache = {}
+    wb._metadata_cache = {}
     import threading
 
     wb._lock = threading.Lock()
@@ -166,13 +166,36 @@ def test_unknown_release_identifier_is_rejected() -> None:
 def test_tile_at_release_keeps_the_requested_layer_and_capture_date() -> None:
     captured = dt.datetime(2011, 3, 4, tzinfo=dt.timezone.utc)
     millis = int(captured.timestamp() * 1000)
-    wb, _ = _wayback({"/query": {"features": [{"attributes": {"SRC_DATE2": millis}}]}})
+    wb, _ = _wayback(
+        {
+            "/query": {
+                "features": [
+                    {
+                        "attributes": {
+                            "SRC_DATE2": millis,
+                            "SRC_RES": 0.5,
+                            "SRC_ACC": 3,
+                            "NICE_NAME": "Imagery Co",
+                            "NICE_DESC": "Aerial survey",
+                            "MinMapLevel": 15,
+                            "MaxMapLevel": 19,
+                        }
+                    }
+                ]
+            }
+        }
+    )
     release = wb.layers[1]
 
     result = wb.tile_at_release(TILE, release)
     assert result.layer is release
     assert result.provider == release.id
     assert result.date == dt.date(2011, 3, 4)
+    assert result.source is not None
+    assert result.source.provider == "Imagery Co"
+    assert result.source.resolution_m == 0.5
+    assert result.source.accuracy_m == 3.0
+    assert result.source.max_map_level == 19
     assert f"/tile/{release.id}/" in result.asset_url
 
 
@@ -244,10 +267,43 @@ def _esrijson(pairs: list[tuple[int, dt.date]]) -> bytes:
             "fields": [
                 {"name": "OBJECTID", "type": "esriFieldTypeOID", "alias": "OBJECTID"},
                 {"name": "SRC_DATE2", "type": "esriFieldTypeDate", "alias": "SRC_DATE2"},
+                {"name": "SRC_RES", "type": "esriFieldTypeDouble", "alias": "SRC_RES"},
+                {"name": "SRC_ACC", "type": "esriFieldTypeDouble", "alias": "SRC_ACC"},
+                {
+                    "name": "NICE_NAME",
+                    "type": "esriFieldTypeString",
+                    "alias": "NICE_NAME",
+                    "length": 50,
+                },
+                {
+                    "name": "NICE_DESC",
+                    "type": "esriFieldTypeString",
+                    "alias": "NICE_DESC",
+                    "length": 50,
+                },
+                {
+                    "name": "MinMapLevel",
+                    "type": "esriFieldTypeSmallInteger",
+                    "alias": "MinMapLevel",
+                },
+                {
+                    "name": "MaxMapLevel",
+                    "type": "esriFieldTypeSmallInteger",
+                    "alias": "MaxMapLevel",
+                },
             ],
             "features": [
                 {
-                    "attributes": {"OBJECTID": oid, "SRC_DATE2": _millis(date)},
+                    "attributes": {
+                        "OBJECTID": oid,
+                        "SRC_DATE2": _millis(date),
+                        "SRC_RES": 0.3,
+                        "SRC_ACC": 5.0,
+                        "NICE_NAME": "Test Provider",
+                        "NICE_DESC": "Test Source",
+                        "MinMapLevel": 16,
+                        "MaxMapLevel": 20,
+                    },
                     "geometry": {
                         "rings": [
                             [
@@ -315,7 +371,7 @@ def _wayback_with(layers, per_layer):
     wb._client = client
     wb.layers = layers
     wb._by_id = {layer.id: layer for layer in layers}
-    wb._date_cache = {}
+    wb._metadata_cache = {}
     wb._lock = threading.Lock()
     return wb, client
 
@@ -334,10 +390,10 @@ def test_dated_regions_fetches_geometry_once_per_date() -> None:
     assert len(client.date_queries) == 3  # phase 1 hits every release
     assert client.geometry_queries == [(1, 11)]  # phase 2 hits the earliest only
     assert len(regions) == 1
-    date, geom, title = regions[0]
-    assert date == CAPTURE
-    assert "2014-02-20" in title  # earliest release carrying this imagery
-    assert not geom.is_empty
+    footprint = regions[0]
+    assert footprint.date == CAPTURE
+    assert "2014-02-20" in footprint.release_title
+    assert not footprint.geometry.is_empty
 
 
 def test_dated_regions_keeps_disjoint_footprints_sharing_a_date() -> None:
@@ -362,7 +418,7 @@ def test_dated_regions_never_compares_objectids_across_releases() -> None:
     regions = wb.dated_regions(AOI, 17)
 
     assert sorted(client.geometry_queries) == [(1, 7), (2, 7)]
-    assert {date for date, _g, _t in regions} == {early, late}
+    assert {footprint.date for footprint in regions} == {early, late}
 
 
 def test_dated_regions_filters_by_date_bounds() -> None:
@@ -372,10 +428,10 @@ def test_dated_regions_filters_by_date_bounds() -> None:
     wb, _ = _wayback_with(layers, per_layer)
 
     only_late = wb.dated_regions(AOI, 17, min_date=dt.date(2015, 1, 1))
-    assert {d for d, _g, _t in only_late} == {late}
+    assert {footprint.date for footprint in only_late} == {late}
 
     only_early = wb.dated_regions(AOI, 17, max_date=dt.date(2015, 1, 1))
-    assert {d for d, _g, _t in only_early} == {early}
+    assert {footprint.date for footprint in only_early} == {early}
 
 
 def test_dated_regions_skips_releases_published_before_min_date() -> None:
@@ -415,7 +471,7 @@ def test_fetch_geometries_batches_ids_into_one_request() -> None:
     assert len(rows) == 10
     assert len(client.geometry_requests) == 1
     assert client.geometry_requests[0] == (1, tuple(range(11, 21)))
-    assert all(date == CAPTURE and not geom.is_empty for date, geom in rows)
+    assert all(row.date == CAPTURE and not row.geometry.is_empty for row in rows)
 
 
 def test_fetch_geometries_chunks_beyond_the_batch_size() -> None:
@@ -532,8 +588,14 @@ def test_release_footprints_returns_dated_footprints_for_one_release() -> None:
     rows = wb.release_footprints(layers[0], AOI, 17)
 
     assert len(rows) == 2
-    assert {date for date, _geom in rows} == {CAPTURE}
-    assert all(not geom.is_empty for _date, geom in rows)
+    assert {row.date for row in rows} == {CAPTURE}
+    assert all(not row.geometry.is_empty for row in rows)
+    assert {row.source.provider for row in rows} == {"Test Provider"}
+    assert {row.source.description for row in rows} == {"Test Source"}
+    assert {row.source.resolution_m for row in rows} == {0.3}
+    assert {row.source.accuracy_m for row in rows} == {5.0}
+    assert {row.source.min_map_level for row in rows} == {16}
+    assert {row.source.max_map_level for row in rows} == {20}
     # Only the release we asked for was touched; this is not a catalogue search.
     assert client.date_queries == [1]
     assert [layer_id for layer_id, _oids in client.geometry_requests] == [1]
@@ -627,7 +689,7 @@ def _wayback_chain(layers, per_layer, chain=None, carries=()):
     wb._client = client
     wb.layers = layers
     wb._by_id = {layer.id: layer for layer in layers}
-    wb._date_cache = {}
+    wb._metadata_cache = {}
     wb._lock = threading.Lock()
     return wb, client
 

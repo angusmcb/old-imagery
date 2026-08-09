@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from shapely.geometry import box
 
 import old_imagery
 from old_imagery import api
+from old_imagery._esri import EsriFootprint, EsriSource
 from old_imagery._keyhole import KeyholeTile
 from old_imagery._region import KeyholeGrid
 
@@ -25,6 +27,7 @@ class StubDated:
     tile: KeyholeTile
     date: dt.date | None
     provider: int
+    source: EsriSource | None = None
 
 
 class StubBackend:
@@ -32,16 +35,17 @@ class StubBackend:
 
     grid = KeyholeGrid()
 
-    def __init__(self, dates, colors=None, missing=()):
+    def __init__(self, dates, colors=None, missing=(), source=None):
         self.dates = list(dates)
         self.colors = colors or {}
         self.missing = set(missing)
+        self.source = source
         self.downloads = 0
 
     def dated_tiles(self, tile):
         if tile in self.missing:
             return []
-        return [StubDated(tile, d, 7) for d in self.dates]
+        return [StubDated(tile, d, 7, self.source) for d in self.dates]
 
     def download_tile_image(self, dated):
         self.downloads += 1
@@ -245,6 +249,32 @@ def test_download_dataset_outlives_the_call(stub) -> None:
     assert ds.read(1).shape[0] > 0
 
 
+def test_esri_download_records_source_metadata_without_changing_zoom(stub) -> None:
+    source = EsriSource(
+        provider="Imagery Co",
+        description="Aerial survey",
+        resolution_m=0.3,
+        accuracy_m=2.0,
+        min_map_level=16,
+        max_map_level=19,
+    )
+    stub(StubBackend([D1], source=source))
+
+    ds = old_imagery.download(AOI, ZOOM, D1, provider="esri")
+
+    assert ds.tags()["zoom"] == str(ZOOM)
+    assert json.loads(ds.tags()["esri_source_metadata"]) == [
+        {
+            "provider": "Imagery Co",
+            "description": "Aerial survey",
+            "resolution_m": 0.3,
+            "accuracy_m": 2.0,
+            "min_map_level": 16,
+            "max_map_level": 19,
+        }
+    ]
+
+
 # --------------------------------------------------------------------------
 # misc
 # --------------------------------------------------------------------------
@@ -266,7 +296,15 @@ class RegionBackend(StubBackend):
         self.region_calls += 1
         self.seen_kwargs = {"min_date": min_date, "max_date": max_date}
         self.seen_tiles = tiles
-        return [(d, g, "Wayback release") for d, g in self.regions]
+        return [EsriFootprint(d, g, EsriSource(), "Wayback release") for d, g in self.regions]
+
+
+class MetadataRegionBackend(RegionBackend):
+    def dated_regions(self, aoi, zoom, *, min_date=None, max_date=None, tiles=None):
+        self.region_calls += 1
+        self.seen_kwargs = {"min_date": min_date, "max_date": max_date}
+        self.seen_tiles = tiles
+        return list(self.regions)
 
 
 @dataclass(frozen=True)
@@ -374,9 +412,7 @@ def test_download_no_longer_accepts_an_as_of_date(stub) -> None:
     """Service dates resolve in esri_mosaic_as_of, which reports the release_id."""
     stub(ReleaseBackend(RELEASE_DATE, D1))
     with pytest.raises(TypeError, match="unexpected keyword argument"):
-        old_imagery.download(
-            AOI, ZOOM, provider="esri", esri_wayback_as_of_date=RELEASE_DATE
-        )
+        old_imagery.download(AOI, ZOOM, provider="esri", esri_wayback_as_of_date=RELEASE_DATE)
 
 
 def test_release_id_from_a_mosaic_round_trips_into_download(stub) -> None:
@@ -439,6 +475,28 @@ def test_esri_always_uses_footprints(stub) -> None:
         assert gdf.attrs["method"] == "region-query"
         assert backend.region_calls == 1
         assert list(gdf["date"]) == [D1]
+
+
+def test_availability_passes_through_distinct_esri_source_metadata(stub) -> None:
+    left = box(-122.4000, 37.7920, -122.3980, 37.7950)
+    right = box(-122.3980, 37.7920, -122.3960, 37.7950)
+    source_a = EsriSource(provider="Provider A", resolution_m=1.0, accuracy_m=5.0)
+    source_b = EsriSource(provider="Provider B", resolution_m=0.3, accuracy_m=2.0)
+    stub(
+        MetadataRegionBackend(
+            [
+                EsriFootprint(D1, left, source_a, "Wayback release"),
+                EsriFootprint(D1, right, source_b, "Wayback release"),
+            ]
+        )
+    )
+
+    gdf = old_imagery.availability(AOI, ZOOM, provider="esri", max_tiles=10_000)
+
+    row = gdf.iloc[0]
+    assert row["source_providers"] == ("Provider A", "Provider B")
+    assert row["source_resolutions_m"] == (0.3, 1.0)
+    assert row["source_accuracies_m"] == (2.0, 5.0)
 
 
 def test_availability_no_longer_accepts_a_method(stub) -> None:
@@ -660,7 +718,10 @@ class MosaicBackend:
             self.seen_max_footprints.append(max_footprints)
             if self.raises is not None:
                 raise self.raises
-            return list(self.footprints_by_zoom.get(zoom, []))
+            return [
+                row if isinstance(row, EsriFootprint) else EsriFootprint(*row, EsriSource())
+                for row in self.footprints_by_zoom.get(zoom, [])
+            ]
         finally:
             with self._lock:
                 self._in_flight -= 1
@@ -708,6 +769,28 @@ def test_mosaic_dissolves_footprints_sharing_a_zoom_and_date(stub) -> None:
 
     assert len(gdf) == 1
     assert gdf.geometry.iloc[0].area == pytest.approx(AOI.area, rel=1e-9)
+
+
+def test_mosaic_preserves_distinct_sources_sharing_a_capture_date(stub) -> None:
+    source_a = EsriSource(provider="Provider A", resolution_m=1.0, accuracy_m=5.0)
+    source_b = EsriSource(provider="Provider B", resolution_m=0.3, accuracy_m=2.0)
+    stub(
+        MosaicBackend(
+            {
+                18: [
+                    EsriFootprint(D1, LEFT, source_a),
+                    EsriFootprint(D1, RIGHT, source_b),
+                ]
+            }
+        )
+    )
+
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    assert len(gdf) == 2
+    assert set(gdf["source_provider"]) == {"Provider A", "Provider B"}
+    assert set(gdf["source_resolution_m"]) == {1.0, 0.3}
+    assert set(gdf["source_accuracy_m"]) == {5.0, 2.0}
 
 
 def test_mosaic_area_fraction_is_partial_for_partial_cover(stub) -> None:
@@ -939,7 +1022,7 @@ def test_availability_no_longer_reports_a_tile_count_column(stub) -> None:
     stub(StubBackend([D1]))
     gdf = old_imagery.availability(AOI, ZOOM)
     assert "n_tiles" not in gdf.columns
-    assert list(gdf.columns) == ["date", "coverage", "complete", "providers", "geometry"]
+    assert list(gdf.columns) == api.AVAILABILITY_COLUMNS
 
 
 def test_public_tile_guard_matches_the_internal_default() -> None:

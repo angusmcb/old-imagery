@@ -37,6 +37,7 @@ _MAX_FEATURES = 20_000
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
 _GEOMETRY_BATCH = 100
+_SOURCE_FIELDS = "OBJECTID,SRC_DATE2,SRC_RES,SRC_ACC,NICE_NAME,NICE_DESC,MinMapLevel,MaxMapLevel"
 
 # Above this many tiles, stop narrowing the release list with tilemap probes and
 # just ask every release.
@@ -100,10 +101,33 @@ class DatedEsriTile:
     provider: int
     epoch: int
     layer: Layer
+    source: EsriSource | None = None
 
     @property
     def asset_url(self) -> str:
         return self.layer.asset_url(self.tile)
+
+
+@dataclass(frozen=True)
+class EsriSource:
+    """Source provenance attached to one Esri imagery footprint."""
+
+    provider: str | None = None
+    description: str | None = None
+    resolution_m: float | None = None
+    accuracy_m: float | None = None
+    min_map_level: int | None = None
+    max_map_level: int | None = None
+
+
+@dataclass(frozen=True)
+class EsriFootprint:
+    """One capture footprint and its source provenance, in EPSG:4326."""
+
+    date: _dt.date
+    geometry: object
+    source: EsriSource
+    release_title: str | None = None
 
 
 def _find_ows(element, name):
@@ -180,7 +204,9 @@ class WayBack:
         self._client = client
         self.layers = _parse_capabilities(client.get(WMTS_CAPABILITIES, max_age=_CAPS_MAX_AGE))
         self._by_id = {layer.id: layer for layer in self.layers}
-        self._date_cache: dict[tuple[int, int, int, int], _dt.date | None] = {}
+        self._metadata_cache: dict[
+            tuple[int, int, int, int], tuple[_dt.date, EsriSource] | None
+        ] = {}
         self._lock = threading.Lock()
 
     # -- helpers -----------------------------------------------------------
@@ -190,17 +216,19 @@ class WayBack:
         except (RequestFailed, ValueError, UnicodeDecodeError):
             return None
 
-    def _capture_date(self, layer: Layer, tile: MercatorTile) -> _dt.date | None:
-        """The true capture date of ``tile`` in ``layer``, or ``None`` if unavailable."""
+    def _tile_metadata(
+        self, layer: Layer, tile: MercatorTile
+    ) -> tuple[_dt.date, EsriSource] | None:
+        """Capture date and source provenance at the centre of ``tile``."""
         key = (layer.id, tile.level, tile.row, tile.column)
         with self._lock:
-            if key in self._date_cache:
-                return self._date_cache[key]
+            if key in self._metadata_cache:
+                return self._metadata_cache[key]
 
         lon, lat = tile.center
         query = {
             "f": "json",
-            "outFields": "SRC_DATE2",
+            "outFields": _SOURCE_FIELDS,
             "spatialRel": "esriSpatialRelWithin",
             "geometryType": "esriGeometryPoint",
             "inSR": "4326",
@@ -212,18 +240,24 @@ class WayBack:
         # A release date is not an image capture date. If the metadata service
         # gives us nothing usable, omit this version rather than silently
         # changing the meaning of every date exposed by the public API.
-        date = None
+        result = None
         if payload is not None:
             try:
-                millis = payload["features"][0]["attributes"]["SRC_DATE2"]
-                if millis is not None:
-                    date = _dt.datetime.fromtimestamp(millis / 1000, _dt.timezone.utc).date()
+                attributes = payload["features"][0]["attributes"]
+                date = _coerce_date(attributes.get("SRC_DATE2"))
+                if date is not None:
+                    result = (date, _source_from_attributes(attributes))
             except (TypeError, KeyError, IndexError):
                 pass
 
         with self._lock:
-            self._date_cache[key] = date
-        return date
+            self._metadata_cache[key] = result
+        return result
+
+    def _capture_date(self, layer: Layer, tile: MercatorTile) -> _dt.date | None:
+        """The true capture date of ``tile`` in ``layer``, or ``None`` if unavailable."""
+        metadata = self._tile_metadata(layer, tile)
+        return metadata[0] if metadata is not None else None
 
     def release_by_identifier(self, identifier: str) -> Layer:
         """Return the exact release with stable WMTS ``identifier``."""
@@ -258,12 +292,14 @@ class WayBack:
         releases. The capture date may be unknown, but the requested layer is
         retained so downloading always targets that exact published snapshot.
         """
+        metadata = self._tile_metadata(layer, tile)
         return DatedEsriTile(
             tile=tile,
-            date=self._capture_date(layer, tile),
+            date=metadata[0] if metadata is not None else None,
             provider=layer.id,
             epoch=layer.id,
             layer=layer,
+            source=metadata[1] if metadata is not None else None,
         )
 
     # -- provider interface ------------------------------------------------
@@ -278,6 +314,7 @@ class WayBack:
         results: list[DatedEsriTile] = []
         last_layer: Layer | None = None
         last_date: _dt.date | None = None
+        last_source: EsriSource | None = None
         skip_until: int | None = None
 
         for layer in self.layers:
@@ -298,22 +335,32 @@ class WayBack:
             if not data or data[0] != 1:
                 continue
 
-            date = self._capture_date(effective, tile)
-            if date is None:
+            metadata = self._tile_metadata(effective, tile)
+            if metadata is None:
                 continue
+            date, source = metadata
             if last_date is not None and last_layer is not None and last_date != date:
                 # Emit only when the tile's imagery actually changed, so each
                 # entry is the earliest release carrying that imagery.
-                results.append(self._make(tile, last_date, last_layer))
-            last_date, last_layer = date, effective
+                results.append(self._make(tile, last_date, last_layer, last_source))
+            last_date, last_layer, last_source = date, effective, source
 
         if last_date is not None and last_layer is not None:
-            results.append(self._make(tile, last_date, last_layer))
+            results.append(self._make(tile, last_date, last_layer, last_source))
         return results
 
     @staticmethod
-    def _make(tile: MercatorTile, date: _dt.date, layer: Layer) -> DatedEsriTile:
-        return DatedEsriTile(tile=tile, date=date, provider=layer.id, epoch=layer.id, layer=layer)
+    def _make(
+        tile: MercatorTile, date: _dt.date, layer: Layer, source: EsriSource | None
+    ) -> DatedEsriTile:
+        return DatedEsriTile(
+            tile=tile,
+            date=date,
+            provider=layer.id,
+            epoch=layer.id,
+            layer=layer,
+            source=source,
+        )
 
     # -- region-wide availability -----------------------------------------
     def candidate_releases(self, tiles, *, max_workers: int | None = None) -> list[Layer]:
@@ -388,12 +435,11 @@ class WayBack:
         min_date: _dt.date | None = None,
         max_date: _dt.date | None = None,
         tiles: Sequence[MercatorTile] | None = None,
-    ) -> list[tuple[_dt.date, object, str]]:
+    ) -> list[EsriFootprint]:
         """Capture footprints intersecting ``aoi``.
 
-        Returns ``(capture_date, geometry, release_title)`` triples, where the
-        date is when the imagery was *captured* and the title names the Wayback
-        release that first published it -- two different things.
+        Returns source-attributed capture footprints. The capture date and
+        Wayback release title remain distinct pieces of provenance.
 
         One query per Wayback release against the metadata feature service,
         rather than probing every release for every tile.  The returned geometry
@@ -423,7 +469,7 @@ class WayBack:
 
         envelope = _envelope_3857(aoi)
         cancel_after: list[_dt.date | None] = [None]
-        results: list[tuple[_dt.date, object, str]] = []
+        results: list[EsriFootprint] = []
         lock = threading.Lock()
 
         # Phase 1: which capture dates does each release expose here? Cheap,
@@ -503,12 +549,17 @@ class WayBack:
         def fetch(group):
             layer, oids, dates = group
             return [
-                (date, geom, layer.title)
+                EsriFootprint(
+                    date=footprint.date,
+                    geometry=footprint.geometry,
+                    source=footprint.source,
+                    release_title=layer.title,
+                )
                 # Only dates this release was chosen for: another release may be
                 # the earliest for a date it also lists, and the min_date /
                 # max_date bounds were applied to `wanted`, not to the service.
-                for date, geom in self._fetch_geometries(layer, zoom, sorted(oids))
-                if date in dates
+                for footprint in self._fetch_geometries(layer, zoom, sorted(oids))
+                if footprint.date in dates
             ]
 
         with concurrent.futures.ThreadPoolExecutor(
@@ -521,11 +572,11 @@ class WayBack:
     # -- one exact release ------------------------------------------------
     def release_footprints(
         self, layer: Layer, aoi, zoom: int, *, max_footprints: int = 500
-    ) -> list[tuple[_dt.date, object]]:
+    ) -> list[EsriFootprint]:
         """Capture footprints displayed by one exact release at one zoom.
 
-        Returns ``(capture_date, geometry)`` pairs in EPSG:4326 -- the seam map
-        of a single published snapshot, at the resolution Esri actually records
+        Returns source-attributed footprints in EPSG:4326 -- the seam map of a
+        single published snapshot, at the resolution Esri actually records
         rather than quantised to whole tiles.
 
         ``zoom`` matters: :meth:`Layer.metadata_query_url` selects a metadata
@@ -583,7 +634,7 @@ class WayBack:
         while True:
             form = {
                 "f": "json",
-                "outFields": "OBJECTID,SRC_DATE2",
+                "outFields": _SOURCE_FIELDS,
                 "spatialRel": "esriSpatialRelIntersects",
                 "geometryType": "esriGeometryEnvelope",
                 "inSR": "3857",
@@ -616,7 +667,7 @@ class WayBack:
 
     def _fetch_geometries(
         self, layer: Layer, zoom: int, object_ids: Sequence[int]
-    ) -> list[tuple[_dt.date, object]]:
+    ) -> list[EsriFootprint]:
         """Fetch capture footprints by OBJECTID, as EPSG:4326 geometries.
 
         Batched: one request carries up to ``_GEOMETRY_BATCH`` ids, and the
@@ -626,7 +677,7 @@ class WayBack:
         A batch whose request or decode fails is dropped, so a single bad
         response costs its own footprints rather than the whole call.
         """
-        out: list[tuple[_dt.date, object]] = []
+        out: list[EsriFootprint] = []
         for start in range(0, len(object_ids), _GEOMETRY_BATCH):
             batch = object_ids[start : start + _GEOMETRY_BATCH]
             out.extend(self._fetch_geometry_batch(layer, zoom, batch))
@@ -634,7 +685,7 @@ class WayBack:
 
     def _fetch_geometry_batch(
         self, layer: Layer, zoom: int, object_ids: Sequence[int]
-    ) -> list[tuple[_dt.date, object]]:
+    ) -> list[EsriFootprint]:
         import geopandas as gpd
 
         # Ask the service to generalise, rather than downloading centimetre
@@ -670,7 +721,7 @@ class WayBack:
         pixel_m = _pixel_metres(zoom)
         form = {
             "f": "json",
-            "outFields": "OBJECTID,SRC_DATE2",
+            "outFields": _SOURCE_FIELDS,
             "objectIds": ",".join(str(oid) for oid in object_ids),
             "returnGeometry": "true",
             "maxAllowableOffset": f"{pixel_m / 2:.6g}",
@@ -736,17 +787,17 @@ def _envelope_3857(aoi) -> dict:
     }
 
 
-def _rows_to_dated_geometries(frame) -> list[tuple[_dt.date, object]]:
-    """Convert a queried feature frame to ``(capture_date, geometry_4326)``."""
+def _rows_to_dated_geometries(frame) -> list[EsriFootprint]:
+    """Convert queried features to source-attributed EPSG:4326 footprints."""
     from shapely import make_valid
 
     if frame.crs is not None:
         frame = frame.to_crs("EPSG:4326")
 
-    out: list[tuple[_dt.date, object]] = []
-    # strict=True is safe: both operands are columns of the same frame and so
-    # are equal length by construction; a mismatch would mean real corruption.
-    for date_value, geom in zip(frame.get("SRC_DATE2"), frame.geometry, strict=True):
+    out: list[EsriFootprint] = []
+    for _, row in frame.iterrows():
+        date_value = row.get("SRC_DATE2")
+        geom = row.geometry
         if geom is None or date_value is None:
             continue
         date = _coerce_date(date_value)
@@ -754,11 +805,55 @@ def _rows_to_dated_geometries(frame) -> list[tuple[_dt.date, object]]:
             continue
         if not geom.is_valid:
             # Capture footprints are routinely self-intersecting.
-            geom = make_valid(geom)  # noqa: PLW2901 — intentional narrowing rebind
+            geom = make_valid(geom)
             if geom.is_empty:
                 continue
-        out.append((date, geom))
+        out.append(
+            EsriFootprint(
+                date=date,
+                geometry=geom,
+                source=_source_from_attributes(row),
+            )
+        )
     return out
+
+
+def _source_from_attributes(attributes) -> EsriSource:
+    """Normalise optional Esri source fields without inventing missing values."""
+    return EsriSource(
+        provider=_optional_text(attributes.get("NICE_NAME")),
+        description=_optional_text(attributes.get("NICE_DESC")),
+        resolution_m=_optional_float(attributes.get("SRC_RES")),
+        accuracy_m=_optional_float(attributes.get("SRC_ACC")),
+        min_map_level=_optional_int(attributes.get("MinMapLevel")),
+        max_map_level=_optional_int(attributes.get("MaxMapLevel")),
+    )
+
+
+def _optional_text(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _optional_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_date(value) -> _dt.date | None:

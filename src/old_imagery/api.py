@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import threading
 import warnings
@@ -40,13 +41,37 @@ DateLike = _dt.date | str
 # reason: narrowing them would make their own validation branches statically
 # unreachable, and mypy runs here with warn_unreachable.
 
-AVAILABILITY_COLUMNS = ["date", "coverage", "complete", "providers", "geometry"]
+AVAILABILITY_COLUMNS = [
+    "date",
+    "coverage",
+    "complete",
+    "providers",
+    "source_providers",
+    "source_descriptions",
+    "source_resolutions_m",
+    "source_accuracies_m",
+    "min_map_levels",
+    "max_map_levels",
+    "geometry",
+]
 
 # `coverage` is a float ratio, so `complete` cannot test it against 1.0
 # exactly. A clip that lands this close to the AOI's own area is a
 # reprojection artefact, not a real gap.
 _COMPLETE_TOLERANCE = 1e-9
-ESRI_MOSAIC_COLUMNS = ["zoom", "date", "area_fraction", "release_id", "geometry"]
+ESRI_MOSAIC_COLUMNS = [
+    "zoom",
+    "date",
+    "area_fraction",
+    "release_id",
+    "source_provider",
+    "source_description",
+    "source_resolution_m",
+    "source_accuracy_m",
+    "min_map_level",
+    "max_map_level",
+    "geometry",
+]
 
 # Esri availability always resolves through capture footprints
 # (WayBack.dated_regions), never by probing tiles. There used to be a `method`
@@ -211,6 +236,15 @@ def availability(
         ``providers``
             Google imagery provider names or Esri Wayback release titles,
             where known.
+        ``source_providers``, ``source_descriptions``
+            Distinct Esri imagery source names and descriptions for this date.
+            Empty tuples for Google or when Esri omits the metadata.
+        ``source_resolutions_m``, ``source_accuracies_m``
+            Distinct Esri native resolutions and positional accuracies in
+            metres. These describe the source imagery, not output pixel size.
+        ``min_map_levels``, ``max_map_levels``
+            Distinct Esri scale ranges, passed through as provenance only. They
+            do not select, cap or otherwise change ``zoom``.
         ``geometry``
             The covered area, clipped to the AOI.
 
@@ -292,9 +326,7 @@ def availability(
         client.close()
 
 
-def _availability_by_region(
-    backend, aoi, tiles, zoom, provider, min_d, max_d
-) -> gpd.GeoDataFrame:
+def _availability_by_region(backend, aoi, tiles, zoom, provider, min_d, max_d) -> gpd.GeoDataFrame:
     """Availability from region-wide capture-footprint queries.
 
     Produces the same columns as the per-tile path.  ``geometry`` is the
@@ -313,10 +345,12 @@ def _availability_by_region(
 
     by_date: dict[_dt.date, list] = defaultdict(list)
     titles: dict[_dt.date, set[str]] = defaultdict(set)
-    for date, geom, title in regions:
-        by_date[date].append(geom)
-        if title:
-            titles[date].add(title)
+    sources: dict[_dt.date, set] = defaultdict(set)
+    for footprint in regions:
+        by_date[footprint.date].append(footprint.geometry)
+        sources[footprint.date].add(footprint.source)
+        if footprint.release_title:
+            titles[footprint.date].add(footprint.release_title)
 
     geometry_by_date: dict[_dt.date, shapely.geometry.base.BaseGeometry] = {}
     for date, geoms in by_date.items():
@@ -333,11 +367,12 @@ def _availability_by_region(
         dates,
         [geometry_by_date[date] for date in dates],
         [", ".join(sorted(titles.get(date, ()))) for date in dates],
+        [sources[date] for date in dates],
     )
     return _finish_availability(rows, zoom, provider, len(tiles), "region-query")
 
 
-def _availability_rows(aoi, dates, geoms, names) -> list[dict]:
+def _availability_rows(aoi, dates, geoms, names, sources=None) -> list[dict]:
     """Assemble availability rows, with coverage measured as area.
 
     Deliberately not a tile count. The tile grid is a transport detail the
@@ -348,16 +383,35 @@ def _availability_rows(aoi, dates, geoms, names) -> list[dict]:
     cover -- and says it identically for both providers.
     """
     fractions = _area_fractions(aoi, list(geoms))
-    return [
-        {
-            "date": date,
-            "coverage": fraction,
-            "complete": fraction >= 1.0 - _COMPLETE_TOLERANCE,
-            "providers": name,
-            "geometry": geom,
-        }
-        for date, geom, name, fraction in zip(dates, geoms, names, fractions, strict=True)
-    ]
+    if sources is None:
+        sources = [set() for _ in dates]
+    rows = []
+    for date, geom, name, source_set, fraction in zip(
+        dates, geoms, names, sources, fractions, strict=True
+    ):
+        rows.append(
+            {
+                "date": date,
+                "coverage": fraction,
+                "complete": fraction >= 1.0 - _COMPLETE_TOLERANCE,
+                "providers": name,
+                "source_providers": _source_values(source_set, "provider"),
+                "source_descriptions": _source_values(source_set, "description"),
+                "source_resolutions_m": _source_values(source_set, "resolution_m"),
+                "source_accuracies_m": _source_values(source_set, "accuracy_m"),
+                "min_map_levels": _source_values(source_set, "min_map_level"),
+                "max_map_levels": _source_values(source_set, "max_map_level"),
+                "geometry": geom,
+            }
+        )
+    return rows
+
+
+def _source_values(sources, attribute: str) -> tuple:
+    """Sorted distinct non-null values for one source-provenance attribute."""
+    return tuple(
+        sorted({value for source in sources if (value := getattr(source, attribute)) is not None})
+    )
 
 
 def _finish_availability(rows, zoom, provider, n_tiles, method) -> gpd.GeoDataFrame:
@@ -424,8 +478,8 @@ def esri_mosaic_as_of(
     Returns
     -------
     geopandas.GeoDataFrame
-        One row per ``(zoom, capture date)``, ordered by zoom then newest date
-        first, in EPSG:4326:
+        One row per distinct ``(zoom, capture date, source metadata)`` value,
+        ordered by zoom then newest date first, in EPSG:4326:
 
         ``zoom``
             The zoom the row was resolved at.
@@ -442,6 +496,14 @@ def esri_mosaic_as_of(
             ``"WB_2026_R03"``.  Constant for the whole frame, and a column
             rather than only an attr so concatenating two snapshots cannot lose
             track of which release each row came from.
+        ``source_provider``, ``source_description``
+            Esri's source name and description, where supplied.
+        ``source_resolution_m``, ``source_accuracy_m``
+            Native source resolution and positional accuracy in metres, where
+            supplied. These describe the imagery, not the output pixel size.
+        ``min_map_level``, ``max_map_level``
+            Esri's scale range for this source, reported as provenance only.
+            These values never change or cap the requested zoom.
         ``geometry``
             The area displaying that capture date, clipped to the AOI.  Real
             capture-footprint boundaries, not tile edges.
@@ -449,9 +511,10 @@ def esri_mosaic_as_of(
         ``gdf.attrs`` records ``release_id``, ``release_date`` (the publication
         date), ``release_title``, ``as_of_date`` and ``zooms``.
 
-        Footprints sharing a zoom and capture date are dissolved into one row.
-        Ground the release publishes no footprint metadata for is absent
-        entirely, so ``area_fraction`` need not sum to 1 across a zoom.
+        Footprints sharing a zoom, capture date and identical source metadata
+        are dissolved into one row. Ground the release publishes no footprint
+        metadata for is absent entirely, so ``area_fraction`` need not sum to 1
+        across a zoom.
 
     Raises
     ------
@@ -479,19 +542,17 @@ def esri_mosaic_as_of(
     try:
         layer = backend.release_on_or_before(as_of)
 
-        def work(z: int) -> list[tuple[int, _dt.date, shapely.geometry.base.BaseGeometry]]:
-            footprints = backend.release_footprints(
-                layer, aoi, z, max_footprints=max_footprints
-            )
-            by_date: dict[_dt.date, list] = defaultdict(list)
-            for date, geom in footprints:
-                by_date[date].append(geom)
+        def work(z: int) -> list[tuple]:
+            footprints = backend.release_footprints(layer, aoi, z, max_footprints=max_footprints)
+            by_source: dict[tuple[_dt.date, object], list] = defaultdict(list)
+            for footprint in footprints:
+                by_source[(footprint.date, footprint.source)].append(footprint.geometry)
 
             out = []
-            for date, geoms in by_date.items():
+            for (date, source), geoms in by_source.items():
                 clipped = unary_union(geoms).intersection(aoi)
                 if not clipped.is_empty:
-                    out.append((z, date, clipped))
+                    out.append((z, date, source, clipped))
             return out
 
         # One worker per zoom, capped: release_footprints issues its requests
@@ -502,17 +563,23 @@ def esri_mosaic_as_of(
     finally:
         client.close()
 
-    found.sort(key=lambda row: (row[0], -row[1].toordinal()))
-    fractions = _area_fractions(aoi, [geom for _z, _d, geom in found])
+    found.sort(key=lambda row: (row[0], -row[1].toordinal(), repr(row[2])))
+    fractions = _area_fractions(aoi, [geom for _z, _d, _s, geom in found])
     rows = [
         {
             "zoom": z,
             "date": date,
             "area_fraction": fraction,
             "release_id": layer.identifier,
+            "source_provider": source.provider,
+            "source_description": source.description,
+            "source_resolution_m": source.resolution_m,
+            "source_accuracy_m": source.accuracy_m,
+            "min_map_level": source.min_map_level,
+            "max_map_level": source.max_map_level,
             "geometry": geom,
         }
-        for (z, date, geom), fraction in zip(found, fractions, strict=True)
+        for (z, date, source, geom), fraction in zip(found, fractions, strict=True)
     ]
 
     gdf = gpd.GeoDataFrame(
@@ -643,7 +710,10 @@ def download(
         ``tiles_capture_date_unknown``. ``dates`` contains comma-separated
         capture dates when at least one is known. Capture-date mode also
         records ``target_date`` and ``date_match``. Release mode instead
-        records the resolved Esri release ID, catalogue date and title.
+        records the resolved Esri release ID, catalogue date and title. Esri
+        downloads also record the distinct source records used as compact JSON
+        in ``esri_source_metadata`` when that metadata is available; map-level
+        values in that tag never alter the requested zoom.
 
     See Also
     --------
@@ -667,8 +737,7 @@ def download(
             )
         if target is not None:
             raise ValueError(
-                "Choose either date (capture-date mode) or "
-                "esri_wayback_release_id, not both"
+                "Choose either date (capture-date mode) or esri_wayback_release_id, not both"
             )
         if date_match != "closest":
             raise ValueError(
@@ -692,6 +761,7 @@ def download(
         rgb = np.zeros((3, height, width), dtype=np.uint8)
         mask = np.zeros((height, width), dtype=np.uint8)
         used_dates: set[_dt.date] = set()
+        used_esri_sources: set = set()
         missing = 0
         unknown_capture_dates = 0
         lock = threading.Lock()
@@ -707,7 +777,8 @@ def download(
                 with lock:
                     missing += 1
                 return
-            arr, tile_date = result
+            arr, candidate = result
+            tile_date = candidate.date
             ox, oy = grid.tile_origin(tile)
             x0, x1 = max(ox, left), min(ox + TILE_PX, right)
             y0, y1 = max(oy, top), min(oy + TILE_PX, bottom)
@@ -722,6 +793,9 @@ def download(
                     used_dates.add(tile_date)
                 else:
                     unknown_capture_dates += 1
+                source = getattr(candidate, "source", None)
+                if source is not None:
+                    used_esri_sources.add(source)
 
         with ThreadPoolExecutor(max_workers=workers_for(provider, len(tiles))) as pool:
             list(pool.map(work, tiles))
@@ -772,6 +846,11 @@ def download(
                     target_date=target.isoformat(),
                     date_match=date_match,
                 )
+            if provider == "esri" and used_esri_sources:
+                tags["esri_source_metadata"] = json.dumps(
+                    [_source_as_dict(source) for source in sorted(used_esri_sources, key=repr)],
+                    separators=(",", ":"),
+                )
             dst.update_tags(**tags)
 
         dataset = memfile.open()
@@ -783,7 +862,7 @@ def download(
 
 
 def _fetch_tile(backend, tile, target: _dt.date, date_match: str):
-    """Return ``(array, date)`` for the best-matching image, or ``None``."""
+    """Return ``(array, selected candidate)`` for the best match, or ``None``."""
     candidates = backend.dated_tiles(tile)
     if not candidates:
         return None
@@ -795,19 +874,31 @@ def _fetch_tile(backend, tile, target: _dt.date, date_match: str):
             continue  # try the next-nearest date
         arr = _decode_image(raw)
         if arr is not None:
-            return arr, candidate.date
+            return arr, candidate
     return None
 
 
 def _fetch_release_tile(backend, tile, release_layer):
-    """Return ``(array, capture_date)`` from one exact Esri release, or ``None``."""
+    """Return ``(array, candidate)`` from one exact Esri release, or ``None``."""
     candidate = backend.tile_at_release(tile, release_layer)
     try:
         raw = backend.download_tile_image(candidate)
     except (RequestFailed, OSError, ValueError):
         return None
     arr = _decode_image(raw)
-    return None if arr is None else (arr, candidate.date)
+    return None if arr is None else (arr, candidate)
+
+
+def _source_as_dict(source) -> dict:
+    """JSON-safe representation used in raster provenance tags."""
+    return {
+        "provider": source.provider,
+        "description": source.description,
+        "resolution_m": source.resolution_m,
+        "accuracy_m": source.accuracy_m,
+        "min_map_level": source.min_map_level,
+        "max_map_level": source.max_map_level,
+    }
 
 
 def _decode_image(raw: bytes) -> np.ndarray | None:

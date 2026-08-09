@@ -96,6 +96,11 @@ returns a `GeoDataFrame` in EPSG:4326, one row per capture date, newest first:
 | `coverage` | fraction of the AOI's **area** covered by imagery from that date |
 | `complete` | that date covers the whole AOI (`coverage == 1.0`) |
 | `providers` | imagery provider / release names, where known |
+| `source_providers` | distinct Esri imagery source names; an empty tuple for Google or missing metadata |
+| `source_descriptions` | distinct Esri source descriptions |
+| `source_resolutions_m` | distinct Esri native source resolutions in metres |
+| `source_accuracies_m` | distinct Esri positional accuracies in metres |
+| `min_map_levels`, `max_map_levels` | Esri source scale ranges, reported only as provenance |
 | `geometry` | covered area, clipped to the AOI |
 
 `coverage` is an area fraction, computed as a planar ratio in EPSG:3857. That
@@ -163,10 +168,17 @@ print(seams[["zoom", "date", "area_fraction", "release_id"]])
 | `date` | **capture date** of the imagery displayed here |
 | `area_fraction` | this row's share of the AOI, as a planar area ratio in EPSG:3857 |
 | `release_id` | stable identifier of the resolved release, e.g. `WB_2026_R03` |
+| `source_provider`, `source_description` | Esri's imagery source name and description |
+| `source_resolution_m`, `source_accuracy_m` | source resolution and positional accuracy in metres |
+| `min_map_level`, `max_map_level` | Esri's source scale range, reported only as provenance |
 | `geometry` | the area showing that date, clipped to the AOI — real footprint boundaries, not tile edges |
 
 `gdf.attrs` records `release_id`, `release_date` (the **publication** date),
 `release_title`, `as_of_date` and `zooms`.
+
+Source metadata remains attached when two footprints have the same capture
+date: only footprints with identical source metadata are dissolved together.
+`min_map_level` and `max_map_level` never select or cap a requested zoom.
 
 `as_of_date` is the one date in this package that means publication rather than
 capture, and it is named to say so. The rule is deterministic: take the
@@ -292,6 +304,12 @@ ds.tags()
 #  'provider': 'google', 'tiles_total': '15', 'tiles_missing': '0',
 #  'tiles_capture_date_unknown': '0'}
 ```
+
+Esri downloads additionally include `esri_source_metadata` when source
+metadata is available. It is compact JSON containing the distinct provider,
+description, native resolution, positional accuracy and map-level values used
+by the mosaic. The map-level values are informational and never modify the
+requested `zoom`.
 
 Tiles with no imagery are left black and excluded by the dataset mask, so use `ds.dataset_mask()` or `ds.read(masked=True)` to ignore gaps.
 
