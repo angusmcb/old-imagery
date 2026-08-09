@@ -163,7 +163,7 @@ def _backend(provider: str, cache_dir: str | os.PathLike | None):
 # availability
 # --------------------------------------------------------------------------
 def availability(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int,
     *,
     min_date: DateLike | None = None,
@@ -176,8 +176,10 @@ def availability(
 
     Parameters
     ----------
-    aoi : shapely.geometry.base.BaseGeometry
-        Area of interest as a shapely geometry in EPSG:4326 (lon/lat degrees).
+    aoi : shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection
+        Area of interest in EPSG:4326 (lon/lat degrees). Must enclose some
+        area: coverage is reported as a fraction of it, so a Point or
+        LineString is rejected -- buffer it first.
     zoom : int
         Tile zoom level.  Availability is reported at tile granularity, so a
         higher zoom gives finer date boundaries and costs more requests.
@@ -203,7 +205,7 @@ def availability(
             How much of the AOI's **area** this date covers, as a planar ratio
             computed in EPSG:3857. Independent of ``zoom`` and of the provider,
             so a date covering half the AOI reports ``0.5`` whichever way it was
-            resolved. ``nan`` for a zero-area (line or point) AOI.
+            resolved.
         ``complete``
             True when that date covers the whole AOI (``coverage == 1.0``).
         ``providers``
@@ -381,7 +383,7 @@ def _empty_availability(
 # esri_mosaic_as_of
 # --------------------------------------------------------------------------
 def esri_mosaic_as_of(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int | Sequence[int],
     as_of_date: DateLike,
     *,
@@ -398,8 +400,10 @@ def esri_mosaic_as_of(
 
     Parameters
     ----------
-    aoi : shapely.geometry.base.BaseGeometry
-        Area of interest as a shapely geometry in EPSG:4326 (lon/lat degrees).
+    aoi : shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection
+        Area of interest in EPSG:4326 (lon/lat degrees). Must enclose some
+        area: coverage is reported as a fraction of it, so a Point or
+        LineString is rejected -- buffer it first.
     zoom : int | Sequence[int]
         One zoom level, or several.  This is not merely a resolution knob: Esri
         composes the mosaic per scale and publishes metadata per scale, so the
@@ -432,7 +436,7 @@ def esri_mosaic_as_of(
             EPSG:3857.  Mercator's area distortion largely cancels between the
             row and the AOI over a modest latitude span, but this is not a true
             area ratio for a tall AOI -- reproject ``geometry`` yourself if you
-            need one.  ``nan`` for a zero-area (line or point) AOI.
+            need one.
         ``release_id``
             Stable catalogue identifier of the resolved release, for example
             ``"WB_2026_R03"``.  Constant for the whole frame, and a column
@@ -550,7 +554,7 @@ def _normalise_zooms(zoom: int | Sequence[int]) -> list[int]:
 
 
 def _area_fractions(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     geoms: list[shapely.geometry.base.BaseGeometry],
 ) -> list[float]:
     """Each geometry's share of the AOI, as planar areas in EPSG:3857."""
@@ -559,6 +563,8 @@ def _area_fractions(
     areas = gpd.GeoSeries([aoi, *geoms], crs=WGS84).to_crs(MERCATOR).area.to_numpy()
     aoi_area = float(areas[0])
     if aoi_area <= 0.0:
+        # Unreachable through the public API -- normalize_aoi rejects a
+        # zero-area AOI -- but kept so this helper stays total for any caller.
         # A line or point AOI: every clip is zero-area too, so the ratio is
         # genuinely undefined rather than zero.
         return [float("nan")] * len(geoms)
@@ -569,7 +575,7 @@ def _area_fractions(
 # download
 # --------------------------------------------------------------------------
 def download(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int,
     date: DateLike | None = None,
     *,
@@ -583,8 +589,10 @@ def download(
 
     Parameters
     ----------
-    aoi : shapely.geometry.base.BaseGeometry
-        Area of interest as a shapely geometry in EPSG:4326 (lon/lat degrees).
+    aoi : shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection
+        Area of interest in EPSG:4326 (lon/lat degrees). Must enclose some
+        area: coverage is reported as a fraction of it, so a Point or
+        LineString is rejected -- buffer it first.
         The output covers the AOI's bounding box, snapped to tile pixels.
     zoom : int
         Tile zoom level.  Ground resolution is roughly ``156543 / 2**zoom``

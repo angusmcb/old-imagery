@@ -73,7 +73,7 @@ changes when they do.
 
 ```python
 availability(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int,
     *,
     min_date: date | str | None = None,
@@ -84,10 +84,11 @@ availability(
 ) -> geopandas.GeoDataFrame
 ```
 
-`aoi` is any shapely geometry — a `box`, `Polygon`, `MultiPolygon` and so on,
-all of which subclass `shapely.geometry.base.BaseGeometry` — interpreted in
-EPSG:4326. Date bounds are inclusive. The function returns a `GeoDataFrame` in
-EPSG:4326, one row per capture date, newest first:
+`aoi` is a shapely `Polygon`, `MultiPolygon` or `GeometryCollection` (`box()`
+returns a `Polygon`), interpreted in EPSG:4326. It must enclose some area —
+`coverage` is a fraction of that area, so a `Point` or `LineString` is rejected
+with a message telling you to buffer it. Date bounds are inclusive. The function
+returns a `GeoDataFrame` in EPSG:4326, one row per capture date, newest first:
 
 | column | meaning |
 | --- | --- |
@@ -100,7 +101,6 @@ EPSG:4326, one row per capture date, newest first:
 `coverage` is an area fraction, computed as a planar ratio in EPSG:3857. That
 makes it mean the same thing for both providers and independent of `zoom` — a
 date covering half your AOI reports `0.5` whether you asked at zoom 13 or 19.
-It is `nan` for a zero-area (line or point) AOI.
 
 `geometry` is resolved as finely as each provider allows, with nothing to
 choose: Esri returns true capture footprints, Google a union of tile extents.
@@ -132,7 +132,7 @@ This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)
 
 ```python
 esri_mosaic_as_of(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int | Sequence[int],
     as_of_date: date | str,
     *,
@@ -264,7 +264,7 @@ Those timings came from a connection whose per-request latency swung about 7× w
 
 ```python
 download(
-    aoi: shapely.geometry.base.BaseGeometry,
+    aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int,
     date: date | str | None = None,
     *,
@@ -276,7 +276,8 @@ download(
 ) -> rasterio.DatasetReader
 ```
 
-`aoi` is any shapely geometry, interpreted in EPSG:4326. The function returns
+`aoi` is a shapely `Polygon`, `MultiPolygon` or `GeometryCollection` enclosing
+some area, interpreted in EPSG:4326. The function returns
 an open, in-memory **3-band uint8 RGB** `rasterio.DatasetReader` covering the
 AOI's bounding box, snapped to tile pixels.
 

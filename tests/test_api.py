@@ -846,13 +846,20 @@ def test_mosaic_never_exceeds_the_wayback_concurrency_cap(stub) -> None:
     assert sorted(backend.asked_zooms) == zooms
 
 
-def test_mosaic_area_fraction_is_nan_for_a_zero_area_aoi(stub) -> None:
-    from shapely.geometry import LineString
+def test_every_entry_point_rejects_a_zero_area_aoi(stub) -> None:
+    """area_fraction and coverage are fractions of the AOI, so it needs one."""
+    from shapely.geometry import LineString, Point
 
-    line = LineString([(-122.400, 37.792), (-122.396, 37.795)])
-    stub(MosaicBackend({18: [(D1, AOI)]}))
-    gdf = old_imagery.esri_mosaic_as_of(line, 18, RELEASE_DATE)
-    assert len(gdf) == 0 or np.isnan(gdf["area_fraction"].iloc[0])
+    for geometry in (LineString([(-122.400, 37.792), (-122.396, 37.795)]), Point(-122.4, 37.79)):
+        stub(MosaicBackend({18: [(D1, AOI)]}))
+        with pytest.raises(ValueError, match="no area"):
+            old_imagery.esri_mosaic_as_of(geometry, 18, RELEASE_DATE)
+
+        stub(StubBackend([D1]))
+        with pytest.raises(ValueError, match="no area"):
+            old_imagery.availability(geometry, ZOOM)
+        with pytest.raises(ValueError, match="no area"):
+            old_imagery.download(geometry, ZOOM, D1)
 
 
 # --------------------------------------------------------------------------
@@ -968,4 +975,8 @@ def test_aoi_annotation_names_where_the_type_comes_from() -> None:
 
     for fn in (old_imagery.availability, old_imagery.download, old_imagery.esri_mosaic_as_of):
         annotation = inspect.signature(fn).parameters["aoi"].annotation
-        assert annotation == "shapely.geometry.base.BaseGeometry", fn.__name__
+        # Spelled out rather than BaseGeometry: it says both where the type
+        # comes from and that the AOI has to enclose an area.
+        assert annotation == (
+            "shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection"
+        ), fn.__name__

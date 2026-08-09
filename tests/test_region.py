@@ -42,11 +42,44 @@ def test_normalize_rejects_none() -> None:
         normalize_aoi(None)
 
 
-def test_degenerate_box_is_treated_as_a_point() -> None:
-    """A zero-area box is point-like, not empty, and selects one tile."""
+def test_normalize_rejects_a_zero_area_aoi() -> None:
+    """Coverage is a fraction of the AOI's area, so a degenerate one is refused.
+
+    Checked by area rather than by type, so a collapsed box is caught alongside
+    an obvious Point, and a GeometryCollection is judged on its contents.
+    """
+    from shapely.geometry import GeometryCollection, LineString, Point
+
     degenerate = box(-122.3937, 37.7955, -122.3937, 37.7955)
-    assert normalize_aoi(degenerate) is degenerate
+    for geometry in (
+        degenerate,
+        Point(-122.3937, 37.7955),
+        LineString([(-122.394, 37.795), (-122.393, 37.796)]),
+        GeometryCollection([Point(-122.3937, 37.7955)]),
+    ):
+        with pytest.raises(ValueError, match="no area"):
+            normalize_aoi(geometry)
+
+    # The message has to say what to do about it, not just that it failed.
+    with pytest.raises(ValueError, match=r"buffer"):
+        normalize_aoi(Point(-122.3937, 37.7955))
+
+    # A tile grid still handles a degenerate geometry; it is the coverage
+    # contract that cannot, which is why the guard lives in normalize_aoi.
     assert len(KeyholeGrid().tiles(degenerate, 18, 100)) == 1
+
+
+def test_normalize_accepts_every_area_bearing_type() -> None:
+    from shapely.geometry import GeometryCollection, MultiPolygon, Point
+
+    square = box(-122.400, 37.792, -122.396, 37.795)
+    other = box(-122.395, 37.792, -122.393, 37.795)
+    for geometry in (
+        square,
+        MultiPolygon([square, other]),
+        GeometryCollection([square, Point(-122.3937, 37.7955)]),
+    ):
+        assert normalize_aoi(geometry) is geometry
 
 
 def test_normalize_rejects_antimeridian_crossing() -> None:

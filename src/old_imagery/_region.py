@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from affine import Affine
 from shapely.geometry import box
@@ -28,14 +28,32 @@ TILE_PX = 256
 MERCATOR_EQUATOR = 40075016.68557849
 MERCATOR_MAX_LAT = 85.051128779806589
 
+_G = TypeVar("_G", bound=BaseGeometry)
 
-def normalize_aoi(geometry: BaseGeometry) -> BaseGeometry:
+
+def normalize_aoi(geometry: _G) -> _G:
     """Validate an area of interest supplied by the caller.
 
     The AOI is interpreted as lon/lat degrees in EPSG:4326.
+
+    Generic in the geometry type so the caller's narrower annotation survives
+    the call rather than widening back to :class:`BaseGeometry`.
     """
     if geometry is None or geometry.is_empty:
         raise ValueError("The area of interest is empty")
+
+    # Checked as area rather than by type, so a GeometryCollection is judged on
+    # what it actually contains. The public signatures say Polygon |
+    # MultiPolygon | GeometryCollection, but annotations bind nothing at
+    # runtime and most callers run unchecked -- and a zero-area AOI does not
+    # merely degrade, it makes `coverage` undefined and `complete` false even
+    # where imagery covers the point.
+    if geometry.area <= 0.0:
+        raise ValueError(
+            f"The area of interest has no area ({geometry.geom_type}). Coverage "
+            f"is measured as a fraction of that area, so it would be undefined. "
+            f"Give it extent first, for example aoi.buffer(0.0001)."
+        )
 
     minx, miny, maxx, maxy = geometry.bounds
     if not (minx >= -180.0 and maxx <= 180.0):
