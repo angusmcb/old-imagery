@@ -45,12 +45,37 @@ Homepage = "https://github.com/angusmcb/old-imagery"
 Source = "https://github.com/angusmcb/old-imagery"
 Issues = "https://github.com/angusmcb/old-imagery/issues"
 
+# The only published extra. Running examples/getting-started.ipynb needs
+# matplotlib to draw the imagery and the seam maps, and the jupyter stack to
+# execute the notebook — by hand, and in the network test that keeps it honest
+# (tests/test_examples.py). The offline notebook tests read it as JSON and need
+# none of this. It is an extra rather than a dependency group because the
+# README tells readers to `pip install "old-imagery[examples]"`, so it has to
+# be resolvable from PyPI.
 [project.optional-dependencies]
+examples = [
+    "matplotlib>=3.6",
+    "nbformat>=5.7",
+    "nbclient>=0.7",
+    "ipykernel>=6",
+]
+
+# Development tooling, as PEP 735 groups rather than extras. Groups are never
+# published, so nobody can `pip install old-imagery[dev]` off PyPI and pull in
+# ruff, mypy and pre-commit — that was always a packaging accident rather than
+# something a consumer wanted.
+#
+#     uv sync                                      # dev, the default group
+#     uv sync --no-default-groups --group test     # what CI installs
+#     pip install -e . --group dev                 # pip 25.1+
+#
+# `--group test` on its own *adds* to the default groups rather than replacing
+# them, which quietly installs the whole dev tree.
+[dependency-groups]
 test = ["pytest>=7", "pyproj>=3.4"]
 # grpcio-tools supplies protoc for tools/regen_descriptors.py.
 dev = [
-    "pytest>=7",
-    "pyproj>=3.4",
+    { include-group = "test" },
     "grpcio-tools>=1.60",
     # Floor kept in step with the pinned rev in .pre-commit-config.yaml.
     "ruff>=0.16",
@@ -63,6 +88,10 @@ dev = [
     "pre-commit>=3.5",
     "build",
     "twine>=6.1",
+    # Self-reference rather than a second copy of the list: two lists is one
+    # that drifts. `examples` is an extra, so this is a plain requirement
+    # string; include-group only reaches other groups.
+    "old-imagery[examples]",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -78,6 +107,7 @@ include = [
     "/tests",
     "/proto",
     "/tools",
+    "/examples",
     "/README.md",
     "/LICENSE",
     "/NOTICE",

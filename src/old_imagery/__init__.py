@@ -14,7 +14,7 @@ This library retrieves imagery but does not license it — imagery remains the
 copyright of Google, Esri or their providers, and their terms of service apply.
 
 A Python port of the protocol layer of Mbucari/GEHistoricalImagery, exposing
-three functions for use from Python rather than a command line tool:
+four functions for use from Python rather than a command line tool:
 
 >>> import old_imagery
 >>> from shapely.geometry import box
@@ -30,17 +30,22 @@ part of it is:
 >>> seams = old_imagery.esri_mosaic_as_of(aoi, 18, "2020-06-01")   # doctest: +SKIP
 
 The ``date`` argument and every date this package reports is an **image capture
-date**, never a provider's publication or release date. The one date that means
-publication is ``esri_mosaic_as_of``'s ``as_of_date``, which selects a release
-from Esri's catalogue and is named to say so.
+date**, never a provider's publication or release date. ``esri_mosaic_as_of``'s
+``as_of`` selects a publication date or an exact release from Esri's catalogue.
 """
 
 from ._http import DEFAULT_CACHE_DIR, NotFound, RequestFailed
-from .api import MAX_IMAGERY_ZOOM, availability, download, esri_mosaic_as_of
+from .api import (
+    MAX_IMAGERY_ZOOM,
+    availability,
+    download,
+    esri_mosaic_as_of,
+    esri_wayback_releases,
+)
 
 __version__ = "0.1.0"
 
-# Deliberately narrow: the two documented functions, the constants and option
+# Deliberately narrow: the documented functions, the constants and option
 # types their signatures name, the exceptions they raise, and the version.
 #
 # The protocol layer (DbRoot, Database, DatedTile, KeyholeTile,
@@ -54,6 +59,7 @@ __all__ = [
     "availability",
     "download",
     "esri_mosaic_as_of",
+    "esri_wayback_releases",
     # constants
     "MAX_IMAGERY_ZOOM",
     "DEFAULT_CACHE_DIR",

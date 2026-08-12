@@ -31,9 +31,16 @@ with old_imagery.download(aoi, zoom=17, date=target, date_match="exact") as src:
     transform = src.transform   # georeferenced, EPSG:4326
 ```
 
-Pass `provider="esri"` to both calls to use Esri Wayback instead. Every AOI is
-interpreted as longitude/latitude in **EPSG:4326**; shapely geometries do not
-carry a CRS, so reproject before calling the library.
+Pass `provider="esri"` to both calls to use Esri Wayback instead. Every `aoi`
+argument is a shapely `Polygon`, `MultiPolygon` or `GeometryCollection` (`box()`
+returns a `Polygon`) enclosing some area, interpreted as longitude/latitude in
+**EPSG:4326** — shapely geometries do not carry a CRS, so reproject before
+calling the library.
+
+[`examples/getting-started.ipynb`](https://github.com/angusmcb/old-imagery/blob/main/examples/getting-started.ipynb)
+tours the whole API with plots: availability, downloads and their tags, both
+providers, seam maps, saving, and the guardrails. Run it with
+`pip install "old-imagery[examples]"`.
 
 ## Install
 
@@ -48,21 +55,13 @@ The `old-imagery` package itself needs no `protoc` build step.
 
 ## API
 
-The public surface is deliberately small: the three functions below, the
-constants their defaults refer to, and the two exceptions.
-`old_imagery.__all__` is the complete list. Option values and the tile guard are
-written out in the signatures themselves, so nothing needs looking up.
+The public surface is the four functions below, the constants their defaults
+refer to, and the two exceptions; `old_imagery.__all__` is the complete list.
 
 `availability` and `download` are the common pair — which capture dates exist,
 then give me the pixels for one. `esri_mosaic_as_of` answers a separate
 question, about what a published Esri snapshot displays rather than what the
 archive holds.
-
-The two string-valued options are closed sets, written out in each signature so
-the accepted values are visible where you use them instead of behind a named
-alias you would have to look up. A type checker rejects a typo before it reaches
-the network, and both are still validated at runtime, so callers without one get
-a `ValueError` naming the accepted values rather than undefined behaviour.
 
 The protocol layer beneath this — the Keyhole quadtree walker, dbRoot client
 and cached HTTP client — lives in underscore modules. It is reachable, but it
@@ -84,11 +83,10 @@ availability(
 ) -> geopandas.GeoDataFrame
 ```
 
-`aoi` is a shapely `Polygon`, `MultiPolygon` or `GeometryCollection` (`box()`
-returns a `Polygon`), interpreted in EPSG:4326. It must enclose some area —
-`coverage` is a fraction of that area, so a `Point` or `LineString` is rejected
-with a message telling you to buffer it. Date bounds are inclusive. The function
-returns a `GeoDataFrame` in EPSG:4326, one row per capture date, newest first:
+`coverage` is a fraction of the AOI's area, so a `Point` or `LineString` is
+rejected with a message telling you to buffer it. Date bounds are inclusive.
+The function returns a `GeoDataFrame` in EPSG:4326, one row per capture date,
+newest first:
 
 | column | meaning |
 | --- | --- |
@@ -100,7 +98,7 @@ returns a `GeoDataFrame` in EPSG:4326, one row per capture date, newest first:
 | `source_descriptions` | distinct Esri source descriptions |
 | `source_resolutions_m` | distinct Esri native source resolutions in metres |
 | `source_accuracies_m` | distinct Esri positional accuracies in metres |
-| `min_map_levels`, `max_map_levels` | Esri source scale ranges, reported only as provenance |
+| `min_map_levels`, `max_map_levels` | Esri source scale ranges, reported as provenance; never affect the requested zoom |
 | `geometry` | covered area, clipped to the AOI |
 
 `coverage` is an area fraction, computed as a planar ratio in EPSG:3857. That
@@ -113,10 +111,33 @@ See [How availability is resolved](#how-availability-is-resolved).
 
 `gdf.attrs` records `zoom`, `provider`, `n_aoi_tiles` and `method` —
 `"region-query"` for Esri, `"per-tile"` for Google, or `"none"` when the AOI
-selects no tiles. It reports what ran; it is not selectable.
+selects no tiles.
 
 `availability` reports **capture dates only**. To ask what one published Esri
 snapshot displays, use [`esri_mosaic_as_of`](#esri_mosaic_as_of).
+
+### `esri_wayback_releases`
+
+```python
+esri_wayback_releases(
+    *,
+    cache_dir: str | os.PathLike | None = DEFAULT_CACHE_DIR,
+) -> pandas.DataFrame
+```
+
+Returns Esri's published Wayback release catalogue, newest first. Use it to
+choose an exact stable release ID for `esri_mosaic_as_of` or `download`:
+
+```python
+releases = old_imagery.esri_wayback_releases()
+print(releases.head())
+```
+
+| column | type | meaning |
+| --- | --- | --- |
+| `release_id` | string | stable ID such as `WB_2026_R07` |
+| `release_date` | `datetime64[ns]` | publication date |
+| `release_title` | string | Esri catalogue title |
 
 ### Dates always mean capture, never release
 
@@ -126,12 +147,11 @@ imagery was **captured**. Esri imagery versions whose capture metadata is
 unavailable are omitted; a Wayback release date is never substituted for a
 missing capture date.
 
-Exactly one argument in this package means publication instead:
-`esri_mosaic_as_of`'s `as_of_date`, together with `download`'s
-`esri_wayback_*` release selectors. They are named so you can see it at the
-call site.
+Publication is represented by `esri_wayback_releases`'s `release_date`,
+`esri_mosaic_as_of`'s `as_of`, and `download`'s `esri_wayback_*` release
+selectors rather than by capture-date fields.
 
-This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)"`) is when Esri published a snapshot of the basemap; the imagery inside it may have been flown years earlier. In one San Francisco tile, imagery captured `2010-10-26` first appeared in the `2014-02-20` release. The `date` argument is never reinterpreted as a release date.
+This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)"`) is when Esri published a snapshot of the basemap; the imagery inside it may have been flown years earlier. In one San Francisco tile, imagery captured `2010-10-26` first appeared in the `2014-02-20` release.
 
 ### `esri_mosaic_as_of`
 
@@ -139,7 +159,7 @@ This matters for Esri. A Wayback *release* (`"World Imagery (Wayback 2014-02-20)
 esri_mosaic_as_of(
     aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int | Sequence[int],
-    as_of_date: date | str,
+    as_of: date | str,
     *,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_footprints: int = 500,
@@ -155,7 +175,7 @@ A Wayback release is a mosaic stitched from imagery flown across many years, so
 capture footprints, not from probing tiles:
 
 ```python
-seams = old_imagery.esri_mosaic_as_of(aoi, zoom=18, as_of_date="2020-06-01")
+seams = old_imagery.esri_mosaic_as_of(aoi, zoom=18, as_of="2020-06-01")
 print(seams[["zoom", "date", "area_fraction", "release_id"]])
 #    zoom        date  area_fraction   release_id
 # 0    18  2016-04-02          0.617  WB_2020_R05
@@ -170,22 +190,18 @@ print(seams[["zoom", "date", "area_fraction", "release_id"]])
 | `release_id` | stable identifier of the resolved release, e.g. `WB_2026_R03` |
 | `source_provider`, `source_description` | Esri's imagery source name and description |
 | `source_resolution_m`, `source_accuracy_m` | source resolution and positional accuracy in metres |
-| `min_map_level`, `max_map_level` | Esri's source scale range, reported only as provenance |
+| `min_map_level`, `max_map_level` | Esri's source scale range, reported as provenance; never affects the requested zoom |
 | `geometry` | the area showing that date, clipped to the AOI — real footprint boundaries, not tile edges |
 
 `gdf.attrs` records `release_id`, `release_date` (the **publication** date),
-`release_title`, `as_of_date` and `zooms`.
+`release_title`, `as_of` and `zooms`.
 
 Source metadata remains attached when two footprints have the same capture
 date: only footprints with identical source metadata are dissolved together.
-`min_map_level` and `max_map_level` never select or cap a requested zoom.
 
-`as_of_date` is the one date in this package that means publication rather than
-capture, and it is named to say so. The rule is deterministic: take the
-catalogue release with the greatest date less than or equal to the one asked
-for, never a future release. That handles Esri's known one-day inconsistency for
-`WB_2026_R03`, which other Esri configuration calls `2026-03-26` while the WMTS
-title calls `2026-03-25`.
+`as_of` accepts either a date, selecting the catalogue release with the greatest
+date less than or equal to it, or an exact `release_id` from
+`esri_wayback_releases()`.
 
 #### Zoom is an axis here, not just a resolution knob
 
@@ -219,34 +235,19 @@ with old_imagery.download(
     print(src.tags()["selection_mode"])  # "esri-wayback-release"
 ```
 
-This is the only release selector on `download`, and the only way to resolve a
-*service* date to a release is through `esri_mosaic_as_of` — so Esri's
-catalogue-date inconsistencies get handled in exactly one place.
+This is the only release selector on `download`. `date=` cannot substitute for
+it: a release is a mosaic of many capture dates, so asking for one date masks
+out everything captured on any other, costs roughly one request per tile to
+re-derive each tile's release history, and cannot reach a tile whose capture
+metadata is missing at all.
 
 `esri_wayback_release_id` requires `provider="esri"` and `date=None` (the
 default), and rejects a non-default `date_match`; those combinations are errors
 rather than ambiguous requests. Release downloads record
 `esri_wayback_release_id`, `esri_wayback_catalogue_date` and
 `esri_wayback_release_title` in the raster tags instead of `target_date` and
-`date_match`.
-
-#### Why `date=` cannot replace it
-
-A release is a mosaic of imagery captured on many dates, so knowing the capture
-date is not enough to reproduce one. On a 9-tile AOI straddling a real seam
-between `2017-08-31` and `2017-08-20` in release `WB_2020_R07`:
-
-| | `esri_wayback_release_id=…` | `date="2017-08-31", date_match="exact"` |
-| --- | --- | --- |
-| tiles missing | **0 / 9** | **5 / 9** |
-| `dates` tag | `2017-08-20, 2017-08-31` | `2017-08-31` |
-| elapsed | 2.5 s | 19.1 s |
-
-Asking for one capture date masks out everything captured on any other, and
-re-derives each tile's whole release history to do it (~1 request per tile
-against ~58). An exact release download also retains a tile whose capture
-metadata is missing — counted in `tiles_capture_date_unknown` — which `date=`
-cannot reach at all, because Esri's per-tile path drops undated versions.
+`date_match`, and count any tile with missing capture metadata in
+`tiles_capture_date_unknown`.
 
 ### How availability is resolved
 
@@ -257,20 +258,12 @@ cannot reach at all, because Esri's per-tile path drops undated versions.
 - **Esri** returns real capture footprints, so date boundaries follow actual imagery seams. Note these are *not* zoom-independent: Esri publishes metadata per scale (`min(13, 23 - zoom)`), so a different zoom queries a different metadata layer and can return different footprints.
 - **Google** has nothing finer to offer — dbRoot reports dates per tile — so its `geometry` is a union of tile extents. Your AOI's outline survives the clip; internal date boundaries are tile-shaped.
 
-`gdf.attrs["method"]` reports which ran (`"region-query"` or `"per-tile"`), so a result can say how it was obtained. It is not selectable.
+`gdf.attrs["method"]` reports which ran (`"region-query"` or `"per-tile"`), so a
+result can say how it was obtained. It is not selectable.
 
-This used to be a three-valued `method` argument with a tile-count threshold, on the theory that footprints were more accurate but slower. The accuracy holds; the trade-off could not be substantiated well enough to be worth every caller's attention. Request counts on a 12-tile area — the part that does not depend on your connection:
-
-| | tilemap | metadata | bytes |
-| --- | --- | --- | --- |
-| per-tile probing | 456 | 240 — one point query per (release, tile) | 320 KiB |
-| footprints | 456 | **30** — one envelope query per candidate release | 2,843 KiB |
-
-Same 11 capture dates, better geometry, an eighth of the metadata load. Wall-clock is murkier, and worth stating plainly: measured cold-cache end to end, footprints took 14.9 s vs 254.9 s at 6 tiles and 25.8 s vs 42.2 s at 12 tiles, but **127.4 s vs 75.3 s at 36 tiles**. The footprint path downloads real polygons — one sampled had 3,520 vertices — and that payload grows with AOI area while per-tile's tiny responses do not.
-
-Those timings came from a connection whose per-request latency swung about 7× within a single session, so do not calibrate against them. On a large AOI where speed matters more than seam precision, expect footprints to cost you time.
-
-`coverage` is measured as area on both paths, so the two are directly comparable and neither depends on the tile grid. That grid is a transport detail: it bounds the request cost and narrows the release list, but it never shapes the answer. It used to — `coverage` was a tile count, which meant a footprint clipping a sliver off every AOI tile reported `coverage == 1.0` over almost no ground.
+`coverage` is measured as area on both paths, so neither depends on the tile
+grid. That grid is a transport detail: it bounds the request cost and narrows
+the release list, but it never shapes the answer.
 
 ### `download`
 
@@ -288,10 +281,8 @@ download(
 ) -> rasterio.DatasetReader
 ```
 
-`aoi` is a shapely `Polygon`, `MultiPolygon` or `GeometryCollection` enclosing
-some area, interpreted in EPSG:4326. The function returns
-an open, in-memory **3-band uint8 RGB** `rasterio.DatasetReader` covering the
-AOI's bounding box, snapped to tile pixels.
+Returns an open, in-memory **3-band uint8 RGB** `rasterio.DatasetReader`
+covering the AOI's bounding box, snapped to tile pixels.
 
 The CRS is each provider's **native tile grid** — `EPSG:4326` for Google, `EPSG:3857` for Esri — so no resampling happens on the way out. Reproject with `rasterio.warp` if you need something else.
 
@@ -308,8 +299,7 @@ ds.tags()
 Esri downloads additionally include `esri_source_metadata` when source
 metadata is available. It is compact JSON containing the distinct provider,
 description, native resolution, positional accuracy and map-level values used
-by the mosaic. The map-level values are informational and never modify the
-requested `zoom`.
+by the mosaic.
 
 Tiles with no imagery are left black and excluded by the dataset mask, so use `ds.dataset_mask()` or `ds.read(masked=True)` to ignore gaps.
 
@@ -322,37 +312,21 @@ with old_imagery.download(aoi, 17, target, date_match="exact") as src:
     rio_copy(src, "mosaic.tif", driver="GTiff")
 ```
 
-Both functions also take `cache_dir` and `max_tiles` (default 1,000), which
-limits the tile grid spanned by the AOI's bounding box. `download` holds the RGB
-mosaic and its mask in memory: 1,000 full tiles require about 250 MiB for those
-raw buffers, plus the in-memory GeoTIFF and decoding overhead. Raise the guard
-only after estimating the resulting memory and request cost.
+`max_tiles` limits the tile grid spanned by the AOI's bounding box. `download`
+holds the RGB mosaic and its mask in memory: 1,000 full tiles require about
+250 MiB for those raw buffers, plus the in-memory GeoTIFF and decoding
+overhead. Raise the guard only after estimating the resulting memory and
+request cost.
 
-### Concurrency is not a knob
+### Concurrency and failures
 
 There is no `max_workers`. Every parallel section here is network-bound, so the
 pool is sized by what the *service* tolerates and by how much work there is —
 never more threads than tasks, and never more than the per-provider cap (16 for
-Google, 10 for Esri).
-
-Upstream's `--concurrency` defaults to ALL_CPUS. CPU count is the wrong basis by
-about two orders of magnitude. The only real CPU work is JPEG decode, and
-decoding 256×256 RGB tiles on a 10-CPU machine measures:
-
-| threads | 1 | 2 | 4 | 8 | 16 | 32 |
-| --- | --- | --- | --- | --- | --- | --- |
-| tiles/s | 2347 | 4291 | 7373 | 7054 | 7052 | 6800 |
-
-Decode does release the GIL, but it saturates at four threads and costs ~0.4 ms
-per tile against tens of milliseconds to fetch one — roughly 1% of the per-tile
-cost. Any width chosen for the network already exceeds what decode can use, so a
-single network-sized pool is right and a separate CPU-sized pool would be
-machinery for nothing.
-
-The caps are deliberately fixed rather than adaptive. Finding a service's limit
-means exceeding it, and Google's terms prohibit bulk feeds — the polite client
-never goes looking for the ceiling. See `src/old_imagery/_concurrency.py` for
-the measurements and their (stated) uncertainty.
+Google, 10 for Esri). The caps are deliberately fixed rather than adaptive:
+finding a service's limit means exceeding it, and Google's terms prohibit bulk
+feeds. See `src/old_imagery/_concurrency.py` for the measurements behind them
+and their (stated) uncertainty.
 
 Transient HTTP failures are retried. Failures for an individual tile, packet,
 or Wayback release are treated as missing data so one bad response does not
@@ -379,29 +353,46 @@ should monitor or periodically remove this directory.
 
 ## Notes and limitations
 
-- **Antimeridian.** AOIs must lie within longitude −180…180. Split geometries that cross it and query each half. Upstream handles the wrap; this port raises a clear error instead.
-- **Esri is slow either way.** Wayback exposes no bulk per-tile date query, so the per-tile path probes ~195 releases per tile (~58 requests per tile) and the region path issues ~195 metadata queries plus one footprint fetch per capture date. Both take tens of seconds on a cold cache — see the table above. Google is far quicker than either.
-- **Zoom limits.** `availability`, `download` and `esri_mosaic_as_of` reject zooms above **21 for Google** and **20 for Esri Wayback** — the deepest levels at which each service actually publishes imagery, per [upstream's docs](https://github.com/Mbucari/GEHistoricalImagery/blob/master/docs/availability.md). The tile schemes themselves address deeper (Keyhole to level 30, Web Mercator to 23, matching upstream's `KeyholeTile.MaxLevel` and `EsriTile.MaxLevel`), but those levels return well-formed tiles carrying no imagery while costing 4× the requests per level, so they raise rather than fail quietly. The caps are readable as `old_imagery.MAX_IMAGERY_ZOOM`. Upstream's CLI instead applies one `[1,23]` bound to both providers; that follows from its single shared `--zoom` flag rather than from either service's limits, so it is not what is enforced here.
-- **Undated imagery.** Google tiles sometimes carry a provider's undated default imagery. It is excluded from `availability` (matching upstream) but is used by `download` as a last-resort fallback, in which case it contributes nothing to the `dates` tag.
-- **Missing Esri capture metadata.** Normal capture-date searches omit an Esri
-  imagery version when its metadata service does not provide a usable capture
-  date. Exact release downloads retain its pixels and count the tile in
-  `tiles_capture_date_unknown`. Its Wayback release date is never used as a
-  substitute capture date.
+- **Antimeridian.** AOIs must lie within longitude −180…180. Split geometries that cross it and query each half.
+- **Esri is slow.** Wayback exposes no bulk per-tile date query, so an availability call issues ~195 metadata queries plus one footprint fetch per capture date, and takes tens of seconds on a cold cache. Footprint payloads grow with AOI area — one sampled footprint had 3,520 vertices — so large AOIs are slower still. Google is far quicker.
+- **Zoom limits.** `availability`, `download` and `esri_mosaic_as_of` reject zooms above **21 for Google** and **20 for Esri Wayback** — the deepest levels at which each service actually publishes imagery, per [upstream's docs](https://github.com/Mbucari/GEHistoricalImagery/blob/master/docs/availability.md). Deeper levels return well-formed tiles carrying no imagery while costing 4× the requests per level, so they raise rather than fail quietly. The caps are readable as `old_imagery.MAX_IMAGERY_ZOOM`.
+- **Undated imagery.** Google tiles sometimes carry a provider's undated default imagery. It is excluded from `availability` but is used by `download` as a last-resort fallback, in which case it contributes nothing to the `dates` tag.
+- **Missing Esri capture metadata.** Capture-date searches omit an Esri imagery version when its metadata service does not provide a usable capture date. Exact release downloads retain its pixels and count the tile in `tiles_capture_date_unknown`.
 - Only `availability` and `download` are ported. Upstream's `info`, `dump`, DXF output, terrain meshes, and the non-time-machine databases (Mars, Moon, Sky) are not.
 
 ## Development
 
 ```bash
-pip install -e ".[dev]" && pre-commit install
+uv sync && uv run pre-commit install
 ```
 
+`uv sync` creates `.venv`, installs the project editable, and installs the
+`dev` dependency group — development tooling lives in PEP 735
+[`[dependency-groups]`](https://peps.python.org/pep-0735/) rather than in
+extras, so it is never published and cannot be pulled off PyPI by a consumer.
+With pip instead (25.1+ for `--group`):
+
 ```bash
-pytest                  # 184 offline tests, no network
-pytest -m network       # 10 live tests against Google and Esri
+pip install -e . --group dev && pre-commit install
+```
+
+The only published extra is `examples`, which the notebook needs.
+
+```bash
+pytest                  # offline suite, no network
+pytest -m network       # live tests against Google and Esri
 ```
 
 Run the network tests sparingly and against small AOIs — they hit the live services.
+
+The offline suite includes upstream's own pre-computed quadtree subindex fixtures (`test/LibGoogleEarthTest/*IndexDictionary.json`), so a passing run means this port agrees with the C# implementation node-for-node.
+
+`tests/test_examples.py` covers the notebook two ways: offline it checks that
+every cell parses, that the notebook only uses exported names, that all three
+public functions are still demonstrated, and that no outputs are committed;
+under `-m network` it executes the notebook end to end (about 100 s on a cold
+cache). Commit it with outputs cleared — executed outputs would embed fetched
+Google and Esri imagery in the repository.
 
 ### Linting and types
 
@@ -411,14 +402,7 @@ Run the network tests sparingly and against small AOIs — they hit the live ser
 pre-commit run --all-files
 ```
 
-The mypy hook runs from your dev install rather than an isolated environment, so `pip install -e ".[dev]"` is a prerequisite — that way it resolves the same dependency tree CI does, instead of a second list that can drift.
-
-mypy covers `src/` and `tools/`, not `tests/`: the suite deliberately passes
-wrong types to assert the errors they raise, and substitutes fake HTTP clients.
-Full `strict` is not enabled yet; the regular check still validates annotated
-code and checks function bodies.
-
-The offline suite includes upstream's own pre-computed quadtree subindex fixtures (`test/LibGoogleEarthTest/*IndexDictionary.json`), so a passing run means this port agrees with the C# implementation node-for-node.
+The mypy hook runs from your dev install rather than an isolated environment, so the `dev` group is a prerequisite. It is a system hook and resolves `mypy` from `PATH`, so either activate the venv or run the hooks through `uv run pre-commit run --all-files`. mypy covers `src/` and `tools/`, not `tests/`.
 
 ### How the protobuf schemas got here
 

@@ -315,6 +315,28 @@ class StubRelease:
     title: str
 
 
+class CatalogueBackend:
+    def __init__(self):
+        self.layers = [
+            StubRelease(1, "WB_2025_R12", dt.date(2025, 12, 4), "Older release"),
+            StubRelease(2, "WB_2026_R01", dt.date(2026, 1, 8), "Newest release"),
+        ]
+
+
+def test_esri_wayback_releases_returns_the_catalogue_newest_first(stub) -> None:
+    stub(CatalogueBackend())
+
+    releases = old_imagery.esri_wayback_releases()
+
+    assert list(releases.columns) == ["release_id", "release_date", "release_title"]
+    assert list(releases["release_id"]) == ["WB_2026_R01", "WB_2025_R12"]
+    assert list(releases["release_title"]) == ["Newest release", "Older release"]
+    assert str(releases["release_id"].dtype) == "string"
+    assert str(releases["release_title"].dtype) == "string"
+    assert str(releases["release_date"].dtype) == "datetime64[ns]"
+    assert stub.holder["closed"] is True
+
+
 class ReleaseBackend(StubBackend):
     """An Esri-shaped backend serving one exact Wayback release."""
 
@@ -691,6 +713,7 @@ class MosaicBackend:
         )
         self.asked_zooms: list[int] = []
         self.asked_release = None
+        self.asked_identifier = None
         self.seen_max_footprints: list[int] = []
         self.peak_in_flight = 0
         self._in_flight = 0
@@ -705,6 +728,7 @@ class MosaicBackend:
         return self.release
 
     def release_by_identifier(self, identifier):
+        self.asked_identifier = identifier
         return self.release
 
     def release_footprints(self, layer, aoi, zoom, *, max_footprints=500):
@@ -839,7 +863,7 @@ def test_mosaic_resolves_the_latest_release_on_or_before_the_date(stub) -> None:
 
     assert backend.asked_release is backend.release
     assert gdf.attrs["release_date"] == RELEASE_DATE  # publication date
-    assert gdf.attrs["as_of_date"] == later  # what was asked for
+    assert gdf.attrs["as_of"] == later  # what was asked for
     assert gdf.attrs["release_title"] == backend.release.title
 
 
@@ -852,7 +876,18 @@ def test_mosaic_rejects_a_date_before_the_archive(stub) -> None:
 def test_mosaic_accepts_an_iso_string_date(stub) -> None:
     stub(MosaicBackend({18: [(D1, AOI)]}))
     gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE.isoformat())
-    assert gdf.attrs["as_of_date"] == RELEASE_DATE
+    assert gdf.attrs["as_of"] == RELEASE_DATE
+
+
+def test_mosaic_accepts_an_exact_release_id(stub) -> None:
+    backend = stub(MosaicBackend({18: [(D1, AOI)]}))
+
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, "WB_2014_R01")
+
+    assert backend.asked_identifier == "WB_2014_R01"
+    assert backend.asked_release is backend.release
+    assert gdf.attrs["as_of"] == "WB_2014_R01"
+    assert gdf.attrs["release_id"] == "WB_2014_R01"
 
 
 @pytest.mark.parametrize("zoom", [21, 99])

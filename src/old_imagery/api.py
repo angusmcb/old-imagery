@@ -1,4 +1,4 @@
-"""Public API: :func:`availability` and :func:`download`."""
+"""Public functions for finding, selecting, and downloading historical imagery."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Literal
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 import shapely.geometry.base
 from rasterio.errors import NotGeoreferencedWarning
@@ -434,12 +435,39 @@ def _empty_availability(
 
 
 # --------------------------------------------------------------------------
+# esri_wayback_releases
+# --------------------------------------------------------------------------
+def esri_wayback_releases(
+    *,
+    cache_dir: str | os.PathLike | None = DEFAULT_CACHE_DIR,
+) -> pd.DataFrame:
+    """Return the published Esri Wayback release catalogue.
+
+    Returns one row per release, newest first. ``release_id`` is Esri's stable
+    WMTS identifier, ``release_date`` is the publication date, and
+    ``release_title`` is the title published in Esri's catalogue.
+    """
+    backend, client = _backend("esri", cache_dir)
+    try:
+        layers = sorted(backend.layers, key=lambda layer: layer.date, reverse=True)
+        return pd.DataFrame(
+            {
+                "release_id": pd.Series([layer.identifier for layer in layers], dtype="string"),
+                "release_date": pd.Series([layer.date for layer in layers], dtype="datetime64[ns]"),
+                "release_title": pd.Series([layer.title for layer in layers], dtype="string"),
+            }
+        )
+    finally:
+        client.close()
+
+
+# --------------------------------------------------------------------------
 # esri_mosaic_as_of
 # --------------------------------------------------------------------------
 def esri_mosaic_as_of(
     aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int | Sequence[int],
-    as_of_date: DateLike,
+    as_of: DateLike,
     *,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_footprints: int = 500,
@@ -464,10 +492,11 @@ def esri_mosaic_as_of(
         same ground in the same release can carry a different capture date at
         different zooms.  Pass several to see that.  Zooms of 10 and below all
         resolve to the same metadata layer and so return identical geometry.
-    as_of_date : datetime.date | str
-        The date to look at the archive on.  The latest release published on or
-        before this date is used; it is a **publication** date, not a capture
-        date, and no capture-date matching happens.
+    as_of : datetime.date | str
+        The date to look at the archive on, or an exact stable release ID such
+        as ``"WB_2026_R07"``. For a date, the latest release published on or
+        before it is used. It is a **publication** date, not a capture date,
+        and no capture-date matching happens.
     cache_dir : str | os.PathLike[str] | None
         On-disk response cache. Pass ``None`` to disable caching.
     max_footprints : int
@@ -509,7 +538,7 @@ def esri_mosaic_as_of(
             capture-footprint boundaries, not tile edges.
 
         ``gdf.attrs`` records ``release_id``, ``release_date`` (the publication
-        date), ``release_title``, ``as_of_date`` and ``zooms``.
+        date), ``release_title``, ``as_of`` and ``zooms``.
 
         Footprints sharing a zoom, capture date and identical source metadata
         are dissolved into one row. Ground the release publishes no footprint
@@ -519,8 +548,8 @@ def esri_mosaic_as_of(
     Raises
     ------
     ValueError
-        If ``as_of_date`` precedes the archive, a zoom is out of range, or the
-        release publishes more than ``max_footprints`` footprints here.
+        If ``as_of`` is unknown or precedes the archive, a zoom is out of range,
+        or the release publishes more than ``max_footprints`` footprints here.
     RequestFailed
         If Esri's metadata service returned an incomplete feature list.  A
         partial seam map is refused rather than returned, because its holes
@@ -534,13 +563,22 @@ def esri_mosaic_as_of(
     """
     aoi = normalize_aoi(aoi)
     zooms = _normalise_zooms(zoom)
-    as_of = _as_date(as_of_date)
-    if as_of is None:
-        raise ValueError("as_of_date is required")
-
     backend, client = _backend("esri", cache_dir)
     try:
-        layer = backend.release_on_or_before(as_of)
+        if isinstance(as_of, str):
+            try:
+                requested_as_of: _dt.date | str = _dt.date.fromisoformat(as_of)
+            except ValueError:
+                requested_as_of = as_of
+                layer = backend.release_by_identifier(as_of)
+            else:
+                layer = backend.release_on_or_before(requested_as_of)
+        else:
+            requested_date = _as_date(as_of)
+            if requested_date is None:
+                raise ValueError("as_of is required")
+            requested_as_of = requested_date
+            layer = backend.release_on_or_before(requested_date)
 
         def work(z: int) -> list[tuple]:
             footprints = backend.release_footprints(layer, aoi, z, max_footprints=max_footprints)
@@ -592,7 +630,7 @@ def esri_mosaic_as_of(
         release_id=layer.identifier,
         release_date=layer.date,
         release_title=layer.title,
-        as_of_date=as_of,
+        as_of=requested_as_of,
         zooms=zooms,
     )
     return gdf
