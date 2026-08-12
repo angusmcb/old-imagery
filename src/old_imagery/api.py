@@ -467,7 +467,7 @@ def esri_wayback_releases(
 def esri_mosaic_as_of(
     aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int | Sequence[int],
-    as_of: DateLike,
+    as_of: DateLike | str,
     *,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_footprints: int = 500,
