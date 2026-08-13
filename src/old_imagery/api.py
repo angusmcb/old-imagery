@@ -10,6 +10,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Literal
 
 import geopandas as gpd
@@ -19,6 +20,7 @@ import rasterio
 import shapely.geometry.base
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
+from shapely import MultiPoint, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 
 from ._concurrency import workers_for
@@ -30,6 +32,40 @@ WGS84 = "EPSG:4326"
 MERCATOR = "EPSG:3857"
 
 DateLike = _dt.date | str
+TileGeometry = Point | MultiPoint | Polygon | MultiPolygon
+
+
+@dataclass(frozen=True)
+class SourceMetadata:
+    """Provider provenance sampled at the centre of one native image tile."""
+
+    provider: str | None = None
+    description: str | None = None
+    resolution_m: float | None = None
+    accuracy_m: float | None = None
+    min_map_level: int | None = None
+    max_map_level: int | None = None
+
+
+@dataclass(frozen=True)
+class DownloadedTile:
+    """One unchanged provider image payload and its selection provenance."""
+
+    content: bytes
+    image_format: str
+    media_type: str
+    provider: Literal["google", "esri"]
+    tile_scheme: str
+    zoom: int
+    column: int
+    row: int
+    bounds_wgs84: tuple[float, float, float, float]
+    capture_date_at_center: _dt.date | None
+    source_metadata_at_center: SourceMetadata | None
+    release_id: str | None = None
+    release_date: _dt.date | None = None
+    release_title: str | None = None
+
 
 # The two string-valued options are spelled out as Literals in each signature
 # rather than hidden behind named aliases, so `help()`, an IDE tooltip and the
@@ -677,8 +713,195 @@ def _area_fractions(
 
 
 # --------------------------------------------------------------------------
-# download
+# download_tiles / download
 # --------------------------------------------------------------------------
+def _validate_download_selection(
+    provider: str,
+    date: DateLike | None,
+    date_match: str,
+    esri_wayback_release_id: str | None,
+) -> _dt.date | None:
+    """Validate the selection shared by raw tiles and mosaics."""
+    target = _as_date(date)
+    if esri_wayback_release_id is not None:
+        if provider != "esri":
+            raise ValueError(
+                "esri_wayback_release_id requires provider='esri'; "
+                "it selects a publication snapshot, not a capture date"
+            )
+        if target is not None:
+            raise ValueError(
+                "Choose either date (capture-date mode) or esri_wayback_release_id, not both"
+            )
+        if date_match != "closest":
+            raise ValueError(
+                "date_match cannot be set with esri_wayback_release_id; "
+                "the exact release layer is used without date fallback"
+            )
+    elif target is None:
+        raise ValueError("A target date is required")
+    else:
+        # Validate even when the geometry later selects no tiles.
+        sort_by_nearest_date([], target, date_match)
+    return target
+
+
+def _validate_tile_geometry(
+    geometry: shapely.geometry.base.BaseGeometry,
+) -> TileGeometry:
+    """Validate one WGS84 point collection or polygonal tile selector."""
+    allowed = (Point, MultiPoint, Polygon, MultiPolygon)
+    if not isinstance(geometry, allowed):
+        choices = "Point, MultiPoint, Polygon or MultiPolygon"
+        raise TypeError(f"geometry must be a {choices}, not {type(geometry).__name__}")
+    if geometry.is_empty:
+        raise ValueError("The tile-selection geometry is empty")
+    minx, miny, maxx, maxy = geometry.bounds
+    if minx < -180.0 or maxx > 180.0:
+        raise ValueError("Longitudes must lie within [-180, 180]")
+    if miny < -90.0 or maxy > 90.0:
+        raise ValueError("Latitudes must lie within [-90, 90]")
+    return geometry
+
+
+def _tiles_for_geometry(grid, geometry: TileGeometry, zoom: int, max_tiles: int) -> list:
+    """Resolve point or polygon selectors onto one provider's native grid."""
+    geometry = _validate_tile_geometry(geometry)
+    if isinstance(geometry, (Point, MultiPoint)):
+        points = [geometry] if isinstance(geometry, Point) else list(geometry.geoms)
+        tiles = {grid.tile_at_point(float(point.x), float(point.y), zoom) for point in points}
+        if len(tiles) > max_tiles:
+            raise ValueError(
+                f"The geometry selects {len(tiles):,} tiles at zoom {zoom}, above the "
+                f"limit of {max_tiles:,}. Use fewer points or raise max_tiles."
+            )
+        return sorted(tiles, key=lambda tile: (tile.row, tile.column))
+    return grid.tiles(normalize_aoi(geometry), zoom, max_tiles)
+
+
+def _source_metadata(backend, candidate, provider: str) -> SourceMetadata | None:
+    source = getattr(candidate, "source", None)
+    if source is not None:
+        return SourceMetadata(
+            provider=source.provider,
+            description=source.description,
+            resolution_m=source.resolution_m,
+            accuracy_m=source.accuracy_m,
+            min_map_level=source.min_map_level,
+            max_map_level=source.max_map_level,
+        )
+    if provider == "google":
+        name = backend.provider_copyright(candidate.provider)
+        return SourceMetadata(provider=name) if name else None
+    return None
+
+
+def _inspect_tile_payload(raw: bytes) -> tuple[str, str]:
+    """Validate a native tile entirely in memory without changing its bytes."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NotGeoreferencedWarning)
+            with MemoryFile(raw) as memory, memory.open() as source:
+                driver = str(source.driver).upper()
+                size = (source.width, source.height)
+    except Exception as error:
+        raise ValueError("provider returned an invalid image payload") from error
+    if size != (TILE_PX, TILE_PX):
+        raise ValueError(
+            f"provider returned a {size[0]}x{size[1]} tile; expected {TILE_PX}x{TILE_PX}"
+        )
+    formats = {
+        "JPEG": ("jpeg", "image/jpeg"),
+        "PNG": ("png", "image/png"),
+        "WEBP": ("webp", "image/webp"),
+    }
+    try:
+        return formats[driver]
+    except KeyError as error:
+        raise ValueError(f"provider returned unsupported image format {driver!r}") from error
+
+
+def download_tiles(
+    geometry: TileGeometry,
+    zoom: int,
+    date: DateLike | None = None,
+    *,
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
+    esri_wayback_release_id: str | None = None,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 1_000,
+    include_metadata: bool = True,
+) -> list[DownloadedTile]:
+    """Download complete native image tiles selected by a WGS84 geometry.
+
+    ``Point`` and ``MultiPoint`` select the one provider-native tile containing
+    each point. ``Polygon`` and ``MultiPolygon`` select every tile they
+    intersect. Returned payloads are full, unclipped provider images in
+    deterministic row-major order. Any selected tile that is missing, fails to
+    download, or is not a supported 256x256 image aborts the whole call.
+
+    Payloads remain in memory and are returned unchanged. This function never
+    creates output or temporary files. The existing HTTP response cache is the
+    only possible disk write; pass ``cache_dir=None`` for a fully diskless call.
+
+    Date and release selection have exactly the same meaning as in
+    :func:`download`. Esri capture and source metadata are sampled at each
+    tile's centre and therefore need not describe every pixel where a source
+    footprint seam crosses the tile.
+    """
+    _validate_zoom(zoom, provider)
+    target = _validate_download_selection(provider, date, date_match, esri_wayback_release_id)
+    backend, client = _backend(provider, cache_dir)
+    try:
+        release_layer = _resolve_release(backend, esri_wayback_release_id)
+        tiles = _tiles_for_geometry(backend.grid, geometry, zoom, max_tiles)
+        if not tiles:
+            raise ValueError("The geometry selects no tiles")
+
+        def work(tile) -> DownloadedTile:
+            if release_layer is not None:
+                candidate = backend.tile_at_release(
+                    tile, release_layer, include_metadata=include_metadata
+                )
+            else:
+                assert target is not None
+                candidates = backend.dated_tiles(tile)
+                ordered = sort_by_nearest_date(candidates, target, date_match)
+                candidate = next(ordered, None)
+                if candidate is None:
+                    raise ValueError(
+                        f"No imagery found for tile z{zoom}/{tile.column}/{tile.row} "
+                        f"with date_match={date_match!r}"
+                    )
+            raw = backend.download_tile_image(candidate)
+            image_format, media_type = _inspect_tile_payload(raw)
+            layer = getattr(candidate, "layer", None) or release_layer
+            return DownloadedTile(
+                content=raw,
+                image_format=image_format,
+                media_type=media_type,
+                provider=provider,
+                tile_scheme=backend.grid.tile_scheme,
+                zoom=zoom,
+                column=tile.column,
+                row=tile.row,
+                bounds_wgs84=tile.bounds_wgs84,
+                capture_date_at_center=candidate.date if include_metadata else None,
+                source_metadata_at_center=(
+                    _source_metadata(backend, candidate, provider) if include_metadata else None
+                ),
+                release_id=getattr(layer, "identifier", None),
+                release_date=getattr(layer, "date", None),
+                release_title=getattr(layer, "title", None),
+            )
+
+        with ThreadPoolExecutor(max_workers=workers_for(provider, len(tiles))) as pool:
+            return list(pool.map(work, tiles))
+    finally:
+        client.close()
+
+
 def download(
     aoi: shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection,
     zoom: int,
@@ -766,24 +989,7 @@ def download(
     """
     _validate_zoom(zoom, provider)
     aoi = normalize_aoi(aoi)
-    target = _as_date(date)
-    if esri_wayback_release_id is not None:
-        if provider != "esri":
-            raise ValueError(
-                "esri_wayback_release_id requires provider='esri'; "
-                "it selects a publication snapshot, not a capture date"
-            )
-        if target is not None:
-            raise ValueError(
-                "Choose either date (capture-date mode) or esri_wayback_release_id, not both"
-            )
-        if date_match != "closest":
-            raise ValueError(
-                "date_match cannot be set with esri_wayback_release_id; "
-                "the exact release layer is used without date fallback"
-            )
-    elif target is None:
-        raise ValueError("A target date is required")
+    target = _validate_download_selection(provider, date, date_match, esri_wayback_release_id)
     backend, client = _backend(provider, cache_dir)
 
     try:

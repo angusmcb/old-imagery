@@ -285,14 +285,20 @@ class WayBack:
             f"No Esri Wayback release was visible on or before {visible_date.isoformat()}{detail}"
         )
 
-    def tile_at_release(self, tile: MercatorTile, layer: Layer) -> DatedEsriTile:
+    def tile_at_release(
+        self,
+        tile: MercatorTile,
+        layer: Layer,
+        *,
+        include_metadata: bool = True,
+    ) -> DatedEsriTile:
         """The tile served by one exact Wayback release snapshot.
 
         Unlike :meth:`dated_tiles`, this does not search or fall back across
         releases. The capture date may be unknown, but the requested layer is
         retained so downloading always targets that exact published snapshot.
         """
-        metadata = self._tile_metadata(layer, tile)
+        metadata = self._tile_metadata(layer, tile) if include_metadata else None
         return DatedEsriTile(
             tile=tile,
             date=metadata[0] if metadata is not None else None,

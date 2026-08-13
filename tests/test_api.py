@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import threading
 import time
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pytest
-from shapely.geometry import box
+from shapely.geometry import LineString, MultiPoint, box
 
 import old_imagery
 from old_imagery import api
@@ -276,6 +277,91 @@ def test_esri_download_records_source_metadata_without_changing_zoom(stub) -> No
 
 
 # --------------------------------------------------------------------------
+# download_tiles
+# --------------------------------------------------------------------------
+def test_download_tiles_point_returns_the_unchanged_native_payload(stub) -> None:
+    backend = stub(StubBackend([D1], colors={D1: 73}))
+    point = AOI.centroid
+
+    tiles = old_imagery.download_tiles(point, ZOOM, D1, cache_dir=None)
+
+    assert len(tiles) == 1
+    result = tiles[0]
+    native = backend.grid.tile_at_point(point.x, point.y, ZOOM)
+    assert result.content == _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
+    assert result.image_format == "jpeg"
+    assert result.media_type == "image/jpeg"
+    assert result.provider == "google"
+    assert result.tile_scheme == "GoogleEarthKeyhole"
+    assert (result.row, result.column) == (native.row, native.column)
+    assert result.bounds_wgs84 == native.bounds_wgs84
+    assert result.capture_date_at_center == D1
+    assert result.source_metadata_at_center == old_imagery.SourceMetadata(provider="Test Provider")
+
+
+def test_download_tiles_multipoint_deduplicates_and_orders_tiles(stub) -> None:
+    stub(StubBackend([D1]))
+    grid = KeyholeGrid()
+    selected = grid.tiles(AOI, ZOOM, 1_000)
+    points = MultiPoint([tile.center for tile in reversed(selected)] + [selected[0].center])
+
+    results = old_imagery.download_tiles(points, ZOOM, D1)
+
+    addresses = [(result.row, result.column) for result in results]
+    assert addresses == sorted({(tile.row, tile.column) for tile in selected})
+
+
+def test_download_tiles_polygon_returns_complete_intersecting_tiles(stub) -> None:
+    backend = stub(StubBackend([D1]))
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+
+    results = old_imagery.download_tiles(AOI, ZOOM, D1)
+
+    assert len(results) == len(selected)
+    assert [(tile.row, tile.column) for tile in results] == [
+        (tile.row, tile.column) for tile in selected
+    ]
+    assert all(tile.bounds_wgs84 != AOI.bounds for tile in results)
+
+
+def test_download_tiles_is_strict_when_one_selected_tile_is_missing(stub) -> None:
+    selected = KeyholeGrid().tiles(AOI, ZOOM, 1_000)
+    stub(StubBackend([D1], missing={selected[0]}))
+
+    with pytest.raises(ValueError, match="No imagery found for tile"):
+        old_imagery.download_tiles(AOI, ZOOM, D1)
+
+
+def test_download_tiles_is_strict_when_a_payload_is_invalid(stub) -> None:
+    backend = stub(StubBackend([D1]))
+    backend.download_tile_image = lambda dated: b"not an image"
+
+    with pytest.raises(ValueError, match="invalid image payload"):
+        old_imagery.download_tiles(AOI.centroid, ZOOM, D1)
+
+
+def test_download_tiles_writes_nothing_when_cache_is_disabled(stub, tmp_path, monkeypatch) -> None:
+    stub(StubBackend([D1]))
+    monkeypatch.chdir(tmp_path)
+
+    old_imagery.download_tiles(AOI.centroid, ZOOM, D1, cache_dir=None)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_tiles_rejects_lines(stub) -> None:
+    stub(StubBackend([D1]))
+    with pytest.raises(TypeError, match="Point, MultiPoint, Polygon or MultiPolygon"):
+        old_imagery.download_tiles(LineString([(0, 0), (1, 1)]), ZOOM, D1)
+
+
+def test_download_tiles_date_annotation_matches_download() -> None:
+    tile_date = inspect.signature(old_imagery.download_tiles).parameters["date"].annotation
+    mosaic_date = inspect.signature(old_imagery.download).parameters["date"].annotation
+    assert tile_date == mosaic_date
+
+
+# --------------------------------------------------------------------------
 # misc
 # --------------------------------------------------------------------------
 # Zoom chosen so the AOI yields comfortably more tiles than the switch threshold.
@@ -351,6 +437,7 @@ class ReleaseBackend(StubBackend):
         self.capture_date = capture_date
         self.dated_tile_calls = 0
         self.release_tile_calls = 0
+        self.release_metadata_requests = []
 
     def release_by_identifier(self, identifier):
         if identifier != self.release.identifier:
@@ -362,10 +449,15 @@ class ReleaseBackend(StubBackend):
             raise ValueError(f"No Esri Wayback release was visible on or before {visible_date}")
         return self.release
 
-    def tile_at_release(self, tile, release):
+    def tile_at_release(self, tile, release, *, include_metadata=True):
         assert release is self.release
         self.release_tile_calls += 1
-        return StubDated(tile, self.capture_date, release.id)
+        self.release_metadata_requests.append(include_metadata)
+        return StubDated(
+            tile,
+            self.capture_date if include_metadata else None,
+            release.id,
+        )
 
     def dated_tiles(self, tile):
         self.dated_tile_calls += 1
@@ -428,6 +520,40 @@ def test_release_download_keeps_tiles_with_unknown_capture_date(stub) -> None:
     assert "dates" not in tags
     assert tags["tiles_capture_date_unknown"] == tags["tiles_total"]
     assert (ds.dataset_mask() > 0).all()
+
+
+def test_download_tiles_exact_release_carries_separate_release_provenance(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+
+    result = old_imagery.download_tiles(
+        AOI.centroid,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_id=backend.release.identifier,
+    )[0]
+
+    assert result.release_id == backend.release.identifier
+    assert result.release_date == RELEASE_DATE
+    assert result.release_title == backend.release.title
+    assert result.capture_date_at_center == D1
+    assert backend.release_metadata_requests == [True]
+
+
+def test_download_tiles_can_skip_exact_release_metadata(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+
+    result = old_imagery.download_tiles(
+        AOI.centroid,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_id=backend.release.identifier,
+        include_metadata=False,
+    )[0]
+
+    assert result.release_id == backend.release.identifier
+    assert result.capture_date_at_center is None
+    assert result.source_metadata_at_center is None
+    assert backend.release_metadata_requests == [False]
 
 
 def test_download_no_longer_accepts_an_as_of_date(stub) -> None:

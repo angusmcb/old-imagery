@@ -55,13 +55,15 @@ The `old-imagery` package itself needs no `protoc` build step.
 
 ## API
 
-The public surface is the four functions below, the constants their defaults
-refer to, and the two exceptions; `old_imagery.__all__` is the complete list.
+The public surface is the five functions below, their result types, the
+constants their defaults refer to, and the two exceptions;
+`old_imagery.__all__` is the complete list.
 
 `availability` and `download` are the common pair — which capture dates exist,
-then give me the pixels for one. `esri_mosaic_as_of` answers a separate
-question, about what a published Esri snapshot displays rather than what the
-archive holds.
+then give me a mosaic of the pixels for one. `download_tiles` applies the same
+selection directly to unchanged provider image payloads. `esri_mosaic_as_of`
+answers a separate question, about what a published Esri snapshot displays
+rather than what the archive holds.
 
 The protocol layer beneath this — the Keyhole quadtree walker, dbRoot client
 and cached HTTP client — lives in underscore modules. It is reachable, but it
@@ -265,6 +267,66 @@ result can say how it was obtained. It is not selectable.
 grid. That grid is a transport detail: it bounds the request cost and narrows
 the release list, but it never shapes the answer.
 
+### `download_tiles`
+
+```python
+download_tiles(
+    geometry: Point | MultiPoint | Polygon | MultiPolygon,
+    zoom: int,
+    date: date | str | None = None,
+    *,
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
+    esri_wayback_release_id: str | None = None,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 1_000,
+    include_metadata: bool = True,
+) -> list[DownloadedTile]
+```
+
+Selects provider-native tiles using a geometry interpreted in EPSG:4326. A
+`Point` selects its containing tile; a `MultiPoint` selects and deduplicates
+the containing tile for every point. A polygon selects every tile it
+intersects. Results are complete, unclipped tiles in deterministic row-major
+order. Each records the native scheme, address and WGS84 bounds so the result
+is reproducible without assuming that Google and Esri share a grid.
+
+```python
+tiles = old_imagery.download_tiles(
+    aoi,
+    zoom=17,
+    provider="esri",
+    esri_wayback_release_id="WB_2023_R10",
+    cache_dir=cache_dir,
+)
+tile = tiles[0]
+tile.content                       # unchanged provider image payload
+tile.image_format                  # "jpeg"
+tile.capture_date_at_center        # date | None
+tile.source_metadata_at_center     # SourceMetadata | None
+tile.column, tile.row
+tile.bounds_wgs84
+```
+
+The capture date and source metadata are sampled at the tile centre. An Esri
+source-footprint seam can cross a tile, so those values do not claim to
+describe every pixel. Exact-release results also carry the release ID,
+publication date and title separately from capture metadata.
+
+This function is deliberately strict: if any selected tile is missing, cannot
+be downloaded, or is not a supported 256×256 image, the whole call raises and
+returns no partial list. Payloads are validated with Rasterio's in-memory
+`MemoryFile` and returned byte-for-byte unchanged. No output, temporary or
+sidecar file is created. The existing HTTP cache is the only possible disk
+write; pass `cache_dir=None` to make the call fully diskless.
+
+Date matching and exact Esri release selection are identical to `download`.
+The library owns the worker pool, deduplicates multipoint selections, and
+enforces the same provider concurrency limits and `max_tiles` guard. Pass
+`include_metadata=False` to skip the extra centre-point metadata lookup for an
+exact Esri release; capture-date selection still needs that metadata internally
+to choose each tile, but omits it from the returned objects.
+
 ### `download`
 
 ```python
@@ -328,10 +390,12 @@ finding a service's limit means exceeding it, and Google's terms prohibit bulk
 feeds. See `src/old_imagery/_concurrency.py` for the measurements behind them
 and their (stated) uncertainty.
 
-Transient HTTP failures are retried. Failures for an individual tile, packet,
-or Wayback release are treated as missing data so one bad response does not
-usually abort the whole call. A failure while loading the initial Google
-dbRoot or Esri capabilities document raises `old_imagery.RequestFailed`.
+Transient HTTP failures are retried. `download_tiles` is strict and aborts on
+any failed selected tile. The mosaic and availability functions instead treat
+many individual tile, packet or release failures as missing data so one bad
+response does not usually abort the whole call. A failure while loading the
+initial Google dbRoot or Esri capabilities document raises
+`old_imagery.RequestFailed`.
 
 ## Caching
 
@@ -358,7 +422,7 @@ should monitor or periodically remove this directory.
 - **Zoom limits.** `availability`, `download` and `esri_mosaic_as_of` reject zooms above **21 for Google** and **20 for Esri Wayback** — the deepest levels at which each service actually publishes imagery, per [upstream's docs](https://github.com/Mbucari/GEHistoricalImagery/blob/master/docs/availability.md). Deeper levels return well-formed tiles carrying no imagery while costing 4× the requests per level, so they raise rather than fail quietly. The caps are readable as `old_imagery.MAX_IMAGERY_ZOOM`.
 - **Undated imagery.** Google tiles sometimes carry a provider's undated default imagery. It is excluded from `availability` but is used by `download` as a last-resort fallback, in which case it contributes nothing to the `dates` tag.
 - **Missing Esri capture metadata.** Capture-date searches omit an Esri imagery version when its metadata service does not provide a usable capture date. Exact release downloads retain its pixels and count the tile in `tiles_capture_date_unknown`.
-- Only `availability` and `download` are ported. Upstream's `info`, `dump`, DXF output, terrain meshes, and the non-time-machine databases (Mars, Moon, Sky) are not.
+- Only the historical-imagery availability, tile/mosaic download and Esri seam-map paths are ported. Upstream's `info`, `dump`, DXF output, terrain meshes, and the non-time-machine databases (Mars, Moon, Sky) are not.
 
 ## Development
 

@@ -70,6 +70,9 @@ class TileGrid(Protocol):
     """A tiling scheme: tile selection, pixel space, and output georeferencing."""
 
     crs: str
+    tile_scheme: str
+
+    def tile_at_point(self, longitude: float, latitude: float, level: int): ...
 
     def tiles(self, aoi: BaseGeometry, level: int, max_tiles: int) -> list: ...
 
@@ -108,6 +111,16 @@ class KeyholeGrid:
     """Square plate-carree grid: 360 degrees across *and* down."""
 
     crs = "EPSG:4326"
+    tile_scheme = "GoogleEarthKeyhole"
+
+    def tile_at_point(self, longitude: float, latitude: float, level: int) -> KeyholeTile:
+        """Return the one native tile containing a WGS84 point."""
+        n = validate_level(level)
+
+        def index(degrees: float) -> int:
+            return _clamp_index((degrees + 180.0) / 360.0 * n, n)
+
+        return KeyholeTile.from_row_col(index(latitude), index(longitude), level)
 
     def tiles(self, aoi: BaseGeometry, level: int, max_tiles: int = MAX_TILES) -> list[KeyholeTile]:
         n = validate_level(level)
@@ -193,7 +206,17 @@ def _lat_to_mercator(lat: float) -> float:
 
 class MercatorGrid:
     crs = "EPSG:3857"
+    tile_scheme = "WebMercatorQuad"
     max_level = 23
+
+    def tile_at_point(self, longitude: float, latitude: float, level: int) -> MercatorTile:
+        """Return the one XYZ tile containing a WGS84 point."""
+        if not (0 <= level <= self.max_level):
+            raise ValueError(f"zoom must be in [0, {self.max_level}] for Esri Wayback")
+        n = 1 << level
+        column = _clamp_index((longitude + 180.0) / 360.0 * n, n)
+        row = _clamp_index(_lat_to_mercator(latitude) * n, n)
+        return MercatorTile(row, column, level)
 
     def tiles(
         self, aoi: BaseGeometry, level: int, max_tiles: int = MAX_TILES

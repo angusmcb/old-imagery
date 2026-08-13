@@ -13,8 +13,8 @@ attribution. The combined old-imagery work is GPL-3.0-only.
 This library retrieves imagery but does not license it — imagery remains the
 copyright of Google, Esri or their providers, and their terms of service apply.
 
-A Python port of the protocol layer of Mbucari/GEHistoricalImagery, exposing
-four functions for use from Python rather than a command line tool:
+A Python port of the protocol layer of Mbucari/GEHistoricalImagery, exposing a
+small set of functions for use from Python rather than a command line tool:
 
 >>> import old_imagery
 >>> from shapely.geometry import box
@@ -37,8 +37,11 @@ date**, never a provider's publication or release date. ``esri_mosaic_as_of``'s
 from ._http import DEFAULT_CACHE_DIR, NotFound, RequestFailed
 from .api import (
     MAX_IMAGERY_ZOOM,
+    DownloadedTile,
+    SourceMetadata,
     availability,
     download,
+    download_tiles,
     esri_mosaic_as_of,
     esri_wayback_releases,
 )
@@ -58,8 +61,12 @@ __all__ = [
     # public API
     "availability",
     "download",
+    "download_tiles",
     "esri_mosaic_as_of",
     "esri_wayback_releases",
+    # result types
+    "DownloadedTile",
+    "SourceMetadata",
     # constants
     "MAX_IMAGERY_ZOOM",
     "DEFAULT_CACHE_DIR",

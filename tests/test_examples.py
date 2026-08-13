@@ -73,7 +73,13 @@ def test_notebook_only_uses_the_public_api() -> None:
 def test_notebook_covers_every_public_function() -> None:
     """A tour that quietly stops covering a function is a stale tour."""
     source = "".join("".join(cell["source"]) for cell in _code_cells(_notebook()))
-    for name in ("availability", "download", "esri_wayback_releases", "esri_mosaic_as_of"):
+    for name in (
+        "availability",
+        "download",
+        "download_tiles",
+        "esri_wayback_releases",
+        "esri_mosaic_as_of",
+    ):
         assert f"old_imagery.{name}(" in source, f"{name} is no longer demonstrated"
 
 
