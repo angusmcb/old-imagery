@@ -23,7 +23,7 @@ from rasterio.io import MemoryFile
 from shapely import MultiPoint, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 
-from ._concurrency import workers_for
+from ._concurrency import adaptive_metadata_map, adaptive_tile_map, workers_for
 from ._dbroot import Database, DbRoot
 from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, RequestFailed
 from ._region import TILE_PX, dissolve, normalize_aoi, sort_by_nearest_date
@@ -343,8 +343,8 @@ def availability(
                     by_date[d.date].add(tile)
                     providers[d.date].add(d.provider)
 
-        with ThreadPoolExecutor(max_workers=workers_for(provider, len(tiles))) as pool:
-            list(pool.map(work, tiles))
+        metadata_workload = "google-quadtree" if provider == "google" else "esri-tilemap"
+        adaptive_metadata_map(metadata_workload, work, tiles)
 
         if not by_date:
             return _empty_availability(zoom, provider, len(tiles), "per-tile")
@@ -859,7 +859,7 @@ def download_tiles(
         if not tiles:
             raise ValueError("The geometry selects no tiles")
 
-        def work(tile) -> DownloadedTile:
+        def resolve(tile):
             if release_layer is not None:
                 candidate = backend.tile_at_release(
                     tile, release_layer, include_metadata=include_metadata
@@ -874,6 +874,30 @@ def download_tiles(
                         f"No imagery found for tile z{zoom}/{tile.column}/{tile.row} "
                         f"with date_match={date_match!r}"
                     )
+            return tile, candidate
+
+        # Catalogue, quadtree and capture-metadata services adapt independently
+        # from raw payloads and from one another. A fast tilemap path must not
+        # teach the slow feature service to use its wider pool.
+        if provider == "google":
+            metadata_workload = "google-quadtree"
+        elif release_layer is not None and include_metadata:
+            metadata_workload = "esri-point"
+        elif release_layer is None:
+            metadata_workload = "esri-tilemap"
+        else:
+            metadata_workload = None
+
+        # An exact Esri release without centre metadata is URL construction,
+        # not network work, so do it directly rather than training a controller
+        # on thread scheduling overhead.
+        if metadata_workload is None:
+            resolved = [resolve(tile) for tile in tiles]
+        else:
+            resolved = adaptive_metadata_map(metadata_workload, resolve, tiles)
+
+        def fetch(resolved_tile) -> DownloadedTile:
+            tile, candidate = resolved_tile
             raw = backend.download_tile_image(candidate)
             image_format, media_type = _inspect_tile_payload(raw)
             layer = getattr(candidate, "layer", None) or release_layer
@@ -896,8 +920,7 @@ def download_tiles(
                 release_title=getattr(layer, "title", None),
             )
 
-        with ThreadPoolExecutor(max_workers=workers_for(provider, len(tiles))) as pool:
-            return list(pool.map(work, tiles))
+        return adaptive_tile_map(provider, fetch, resolved)
     finally:
         client.close()
 
@@ -1008,41 +1031,56 @@ def download(
         used_esri_sources: set = set()
         missing = 0
         unknown_capture_dates = 0
-        lock = threading.Lock()
 
-        def work(tile) -> None:
-            nonlocal missing, unknown_capture_dates
+        def resolve(tile):
             if release_layer is not None:
-                result = _fetch_release_tile(backend, tile, release_layer)
-            else:
-                assert target is not None
-                result = _fetch_tile(backend, tile, target, date_match)
+                return [backend.tile_at_release(tile, release_layer)]
+            assert target is not None
+            return list(sort_by_nearest_date(backend.dated_tiles(tile), target, date_match))
+
+        if provider == "google":
+            metadata_workload = "google-quadtree"
+        elif release_layer is not None:
+            metadata_workload = "esri-point"
+        else:
+            metadata_workload = "esri-tilemap"
+        selections = adaptive_metadata_map(metadata_workload, resolve, tiles)
+
+        def fetch(candidates):
+            for candidate in candidates:
+                try:
+                    raw = backend.download_tile_image(candidate)
+                except (RequestFailed, OSError, ValueError):
+                    continue
+                arr = _decode_image(raw)
+                if arr is not None:
+                    return arr, candidate
+            return None
+
+        fetched = adaptive_tile_map(provider, fetch, selections)
+
+        for tile, result in zip(tiles, fetched, strict=True):
             if result is None:
-                with lock:
-                    missing += 1
-                return
+                missing += 1
+                continue
             arr, candidate = result
             tile_date = candidate.date
             ox, oy = grid.tile_origin(tile)
             x0, x1 = max(ox, left), min(ox + TILE_PX, right)
             y0, y1 = max(oy, top), min(oy + TILE_PX, bottom)
             if x0 >= x1 or y0 >= y1:
-                return
-            with lock:
-                rgb[:, y0 - top : y1 - top, x0 - left : x1 - left] = arr[
-                    :, y0 - oy : y1 - oy, x0 - ox : x1 - ox
-                ]
-                mask[y0 - top : y1 - top, x0 - left : x1 - left] = 255
-                if tile_date is not None:
-                    used_dates.add(tile_date)
-                else:
-                    unknown_capture_dates += 1
-                source = getattr(candidate, "source", None)
-                if source is not None:
-                    used_esri_sources.add(source)
-
-        with ThreadPoolExecutor(max_workers=workers_for(provider, len(tiles))) as pool:
-            list(pool.map(work, tiles))
+                continue
+            rgb[:, y0 - top : y1 - top, x0 - left : x1 - left] = arr[
+                :, y0 - oy : y1 - oy, x0 - ox : x1 - ox
+            ]
+            mask[y0 - top : y1 - top, x0 - left : x1 - left] = 255
+            if tile_date is not None:
+                used_dates.add(tile_date)
+            else:
+                unknown_capture_dates += 1
+            source = getattr(candidate, "source", None)
+            if source is not None:
+                used_esri_sources.add(source)
 
         if not mask.any():
             if release_layer is not None:
@@ -1103,34 +1141,6 @@ def download(
         return dataset
     finally:
         client.close()
-
-
-def _fetch_tile(backend, tile, target: _dt.date, date_match: str):
-    """Return ``(array, selected candidate)`` for the best match, or ``None``."""
-    candidates = backend.dated_tiles(tile)
-    if not candidates:
-        return None
-
-    for candidate in sort_by_nearest_date(candidates, target, date_match):
-        try:
-            raw = backend.download_tile_image(candidate)
-        except (RequestFailed, OSError, ValueError):
-            continue  # try the next-nearest date
-        arr = _decode_image(raw)
-        if arr is not None:
-            return arr, candidate
-    return None
-
-
-def _fetch_release_tile(backend, tile, release_layer):
-    """Return ``(array, candidate)`` from one exact Esri release, or ``None``."""
-    candidate = backend.tile_at_release(tile, release_layer)
-    try:
-        raw = backend.download_tile_image(candidate)
-    except (RequestFailed, OSError, ValueError):
-        return None
-    arr = _decode_image(raw)
-    return None if arr is None else (arr, candidate)
 
 
 def _source_as_dict(source) -> dict:

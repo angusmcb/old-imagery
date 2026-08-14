@@ -10,7 +10,7 @@ This is a Python port of the protocol layer of [Mbucari/GEHistoricalImagery](htt
 >
 > Imagery you fetch with `old-imagery` stays the copyright of Google, Esri, or their imagery providers, and their terms of service govern what you may do with it. [Google Earth's terms](https://maps.google.com/intl/en_all/help/terms_maps-earth/) prohibit mass downloads and bulk feeds; Esri content may carry provider-specific rights and restrictions. **Whether a particular use is permitted is your call to make, and your responsibility** — check the current terms and item details, and get permission where you need it. Research, archival and journalistic uses are not automatically exempt.
 >
-> The library defaults to at most 1,000 tiles, caches responses to avoid refetching, and caps concurrency at what each service has been measured to tolerate (16 for Google, 10 for Esri) rather than letting callers raise it, but it cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
+> The library defaults to at most 1,000 tiles, caches responses to avoid refetching, and owns its concurrency policy rather than letting callers raise it. Metadata endpoints and resolved image payloads adapt independently over real requested work because measurements found different throughput knees on local, GCE and HPC network paths. It cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
 >
 > **Not affiliated with Google or Esri.** Google and Google Earth are trademarks of Google LLC; Esri, ArcGIS and World Imagery Wayback are trademarks of Environmental Systems Research Institute, Inc. They are named here only to identify the services this software talks to. This project is not affiliated with, endorsed by, or sponsored by either company.
 
@@ -322,7 +322,7 @@ write; pass `cache_dir=None` to make the call fully diskless.
 
 Date matching and exact Esri release selection are identical to `download`.
 The library owns the worker pool, deduplicates multipoint selections, and
-enforces the same provider concurrency limits and `max_tiles` guard. Pass
+enforces its provider concurrency policy and `max_tiles` guard. Pass
 `include_metadata=False` to skip the extra centre-point metadata lookup for an
 exact Esri release; capture-date selection still needs that metadata internally
 to choose each tile, but omits it from the returned objects.
@@ -383,12 +383,37 @@ request cost.
 ### Concurrency and failures
 
 There is no `max_workers`. Every parallel section here is network-bound, so the
-pool is sized by what the *service* tolerates and by how much work there is —
-never more threads than tasks, and never more than the per-provider cap (16 for
-Google, 10 for Esri). The caps are deliberately fixed rather than adaptive:
-finding a service's limit means exceeding it, and Google's terms prohibit bulk
-feeds. See `src/old_imagery/_concurrency.py` for the measurements behind them
-and their (stated) uncertainty.
+package, rather than the CPU count or caller, owns the worker pools.
+
+Metadata is split by endpoint because one value was not portable: Google
+quadtree discovery tries 8–32 workers; Esri point metadata and tilemap/history
+discovery try 16–96; and the much slower Esri feature service tries only
+10–32. Geometry payload groups retain a fixed cap of 10 because there are
+usually too few of them to calibrate and their large response bodies, rather
+than request count, dominate. Once immutable image URLs have been resolved,
+raw payload downloads start at 8 workers for Google and 32 for Esri and may
+widen to 16 and 104 respectively. Each adaptive endpoint has independent state,
+and each candidate width needs two timing observations so one noisy batch does
+not determine the result.
+
+Learning does not stop after calibration. Large later requests remain split
+into measured batches. Three consecutive throughput drops of at least 20%
+back off one width; after eight stable batches the next width is tried again
+and retained only when it improves throughput without materially worsening
+latency. Calibration and recovery use tiles already requested — they never
+duplicate requests as probes. State expires after 30 minutes and exists only
+in process memory: no tuning state is written to disk, no environment variable
+changes it, and there is no public override.
+
+Metadata and image downloads are separate stages, and metadata endpoint states
+are separate too, so a fast raw-tile or tilemap path cannot teach Esri's
+capture-footprint feature service to use its wider pool. An incomplete ArcGIS
+feature response is never accepted as a useful calibration observation and
+causes monitored operation to back off immediately. Small calls do not have
+enough work for a meaningful tuning sample and use the endpoint's safe starting
+width. See
+`src/old_imagery/_concurrency.py` for the measured GCE/Baobab rationale and the
+adaptation thresholds.
 
 Transient HTTP failures are retried. `download_tiles` is strict and aborts on
 any failed selected tile. The mosaic and availability functions instead treat

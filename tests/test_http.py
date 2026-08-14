@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from old_imagery._concurrency import RAW_TILE_CONNECTION_LIMIT
 from old_imagery._http import CachedHttpClient, NotFound, RequestFailed
 
 
@@ -125,6 +126,24 @@ def test_cache_can_be_disabled(client, tmp_path) -> None:
     c._client = httpx.Client(transport=FakeTransport([200, 200]))
     assert c.get(URL) == b"payload"
     assert c.get(URL) == b"payload"
+
+
+def test_transport_capacity_does_not_bind_the_adaptive_raw_tile_ceiling(monkeypatch) -> None:
+    seen = {}
+
+    class DummyClient:
+        def close(self):
+            pass
+
+    def build_client(**kwargs):
+        seen.update(kwargs)
+        return DummyClient()
+
+    monkeypatch.setattr("old_imagery._http.httpx.Client", build_client)
+    CachedHttpClient(None).close()
+    limits = seen["limits"]
+    assert limits.max_connections == RAW_TILE_CONNECTION_LIMIT
+    assert limits.max_keepalive_connections == RAW_TILE_CONNECTION_LIMIT
 
 
 # --------------------------------------------------------------------------

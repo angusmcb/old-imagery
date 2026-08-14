@@ -349,6 +349,30 @@ def test_download_tiles_writes_nothing_when_cache_is_disabled(stub, tmp_path, mo
     assert list(tmp_path.iterdir()) == []
 
 
+def test_download_tiles_finishes_metadata_before_adapting_raw_payloads(stub) -> None:
+    selected = KeyholeGrid().tiles(AOI, ZOOM, 10_000)
+
+    class PhaseBackend(StubBackend):
+        def __init__(self):
+            super().__init__([D1])
+            self.resolved = 0
+            self.lock = threading.Lock()
+
+        def dated_tiles(self, tile):
+            result = super().dated_tiles(tile)
+            with self.lock:
+                self.resolved += 1
+            return result
+
+        def download_tile_image(self, dated):
+            assert self.resolved == len(selected)
+            return super().download_tile_image(dated)
+
+    backend = stub(PhaseBackend())
+    old_imagery.download_tiles(AOI, ZOOM, D1, cache_dir=None)
+    assert backend.resolved == len(selected)
+
+
 def test_download_tiles_rejects_lines(stub) -> None:
     stub(StubBackend([D1]))
     with pytest.raises(TypeError, match="Point, MultiPoint, Polygon or MultiPolygon"):
@@ -1138,21 +1162,21 @@ def test_download_pool_is_sized_from_the_provider_not_the_cpu_count(stub) -> Non
     from old_imagery import _concurrency
 
     seen = []
-    real = _concurrency.workers_for
+    real = _concurrency.adaptive_metadata_map
 
-    def recording(provider, n_tasks):
-        seen.append((provider, n_tasks))
-        return real(provider, n_tasks)
+    def recording(workload, function, items, **kwargs):
+        seen.append((workload, len(items)))
+        return real(workload, function, items, **kwargs)
 
     stub(StubBackend([D1]))
     tiles = KeyholeGrid().tiles(AOI, ZOOM, 10_000)
-    api.workers_for = recording
+    api.adaptive_metadata_map = recording
     try:
         old_imagery.download(AOI, ZOOM, D1)
     finally:
-        api.workers_for = real
+        api.adaptive_metadata_map = real
 
-    assert seen == [("google", len(tiles))]
+    assert seen == [("google-quadtree", len(tiles))]
 
 
 def test_coverage_is_area_not_touched_tiles(stub) -> None:

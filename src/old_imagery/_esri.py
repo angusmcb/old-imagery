@@ -17,7 +17,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ._concurrency import workers_for
+from ._concurrency import adaptive_metadata_map, workers_for
 from ._http import CachedHttpClient, RequestFailed
 from ._region import MERCATOR_EQUATOR, TILE_PX, MercatorGrid, MercatorTile
 
@@ -369,7 +369,7 @@ class WayBack:
         )
 
     # -- region-wide availability -----------------------------------------
-    def candidate_releases(self, tiles, *, max_workers: int | None = None) -> list[Layer]:
+    def candidate_releases(self, tiles) -> list[Layer]:
         """Releases that changed the imagery over ``tiles``, newest first.
 
         Answers "which releases do we even need to ask about?" using only the
@@ -404,11 +404,8 @@ class WayBack:
         a capture date, which is indistinguishable from the archive not having
         one.
         """
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers or workers_for("esri", len(tiles))
-        ) as pool:
-            found = pool.map(self._candidate_releases_for_tile, tiles)
-            ids = {layer.id for layers in found for layer in layers}
+        found = adaptive_metadata_map("esri-tilemap", self._candidate_releases_for_tile, tiles)
+        ids = {layer.id for layers in found for layer in layers}
         # Back into document order, which is newest first.
         return [layer for layer in self.layers if layer.id in ids]
 
@@ -482,17 +479,17 @@ class WayBack:
         # geometry-free, one request per release.
         wanted: list[tuple[Layer, _dt.date, int]] = []
 
-        def query(layer: Layer):
+        def query(layer: Layer) -> bool:
             with lock:
                 limit = cancel_after[0]
             if limit is not None and layer.date > limit:
-                return  # an older release already proved the tail is empty
+                return True  # an older release already proved the tail is empty
 
             # Partial results are accepted here on purpose: availability over a
             # flaky archive degrades to "less found" rather than raising.
             found, _complete = self._query_layer(layer, envelope, zoom)
             if not found:
-                return
+                return _complete
 
             matched = []
             saw_later = False
@@ -515,11 +512,9 @@ class WayBack:
                     # questions, and merging them buries this comment.
                     if cancel_after[0] is None or layer.date < cancel_after[0]:
                         cancel_after[0] = layer.date
+            return _complete
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=workers_for("esri", len(layers))
-        ) as pool:
-            list(pool.map(query, layers))
+        adaptive_metadata_map("esri-feature", query, layers, is_acceptable=bool)
 
         if not wanted:
             return []

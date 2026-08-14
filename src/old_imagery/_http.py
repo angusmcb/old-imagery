@@ -11,6 +11,8 @@ from pathlib import Path
 
 import httpx
 
+from ._concurrency import RAW_TILE_CONNECTION_LIMIT
+
 
 def _default_cache_dir() -> Path:
     """Where to cache responses, following each platform's own convention.
@@ -88,7 +90,10 @@ class CachedHttpClient:
             timeout=timeout,
             headers={"User-Agent": _USER_AGENT},
             follow_redirects=True,
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+            limits=httpx.Limits(
+                max_connections=RAW_TILE_CONNECTION_LIMIT,
+                max_keepalive_connections=RAW_TILE_CONNECTION_LIMIT,
+            ),
         )
         self._lock = threading.Lock()
 
