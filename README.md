@@ -55,15 +55,16 @@ The `old-imagery` package itself needs no `protoc` build step.
 
 ## API
 
-The public surface is the five functions below, their result types, the
+The public surface is the six functions below, their result types, the
 constants their defaults refer to, and the two exceptions;
 `old_imagery.__all__` is the complete list.
 
 `availability` and `download` are the common pair — which capture dates exist,
 then give me a mosaic of the pixels for one. `download_tiles` applies the same
-selection directly to unchanged provider image payloads. `esri_mosaic_as_of`
-answers a separate question, about what a published Esri snapshot displays
-rather than what the archive holds.
+selection directly to unchanged provider image payloads, and
+`download_geopackage` stores those native payloads as a portable tile archive
+without reprojection. `esri_mosaic_as_of` answers a separate question, about
+what a published Esri snapshot displays rather than what the archive holds.
 
 The protocol layer beneath this — the Keyhole quadtree walker, dbRoot client
 and cached HTTP client — lives in underscore modules. It is reachable, but it
@@ -326,6 +327,61 @@ enforces its provider concurrency policy and `max_tiles` guard. Pass
 `include_metadata=False` to skip the extra centre-point metadata lookup for an
 exact Esri release; capture-date selection still needs that metadata internally
 to choose each tile, but omits it from the returned objects.
+
+### `download_geopackage`
+
+```python
+download_geopackage(
+    aoi: shapely.Polygon | shapely.MultiPolygon,
+    zoom: int,
+    date: date | str | None = None,
+    *,
+    output: str | os.PathLike[str],
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
+    esri_wayback_release_id: str | None = None,
+    table_name: str = "imagery",
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 1_000,
+    include_metadata: bool = True,
+    overwrite: bool = False,
+) -> pathlib.Path
+```
+
+Writes a sparse OGC GeoPackage tile pyramid while preserving each JPEG or PNG
+provider payload byte-for-byte. Lower-resolution power-of-two overview tiles
+are generated locally with Lanczos resampling, so zoomed-out QGIS rendering
+does not need to repeatedly resample the native tiles:
+
+```python
+path = old_imagery.download_geopackage(
+    aoi,
+    zoom=17,
+    date="1993-07-10",
+    output="historical-imagery.gpkg",
+)
+```
+
+Esri's native `WebMercatorQuad` addresses become the standard
+`GoogleMapsCompatible` EPSG:3857 matrix directly. Google's square plate-carree
+grid maps to `WorldCRS84Quad` without resampling: Google zoom `z` is stored as
+GeoPackage zoom `z - 1`, with its south-origin native row translated to the
+north-origin CRS84 row. Google zooms 0 and 1 cannot be expressed as complete
+CRS84 tiles without cutting or combining payloads, so this function requires
+Google zoom 2 or greater.
+
+The requested tile table defaults to `imagery`. GeoPackage's standard metadata
+extension makes the conversion auditable: dataset-level JSON records the
+overall selection and overview factors, and row-referenced tile metadata
+records both address systems plus capture, source and release provenance. The
+native tile level remains byte-preserved; overview tiles are derived locally.
+The GeoPackage is first completed and reopened through GDAL at a temporary
+path, then published atomically. Existing outputs are refused unless
+`overwrite=True`.
+
+The tile selection is deliberately as strict as `download_tiles`: one missing
+or invalid selected tile aborts the output. GeoPackage improves portability; it
+does not change the imagery owner's terms or grant redistribution rights.
 
 ### `download`
 

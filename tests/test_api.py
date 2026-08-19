@@ -5,19 +5,21 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import json
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, MultiPoint, box
+import rasterio
+from shapely.geometry import LineString, MultiPoint, MultiPolygon, box
 
 import old_imagery
 from old_imagery import api
 from old_imagery._esri import EsriFootprint, EsriSource
 from old_imagery._keyhole import KeyholeTile
-from old_imagery._region import KeyholeGrid
+from old_imagery._region import KeyholeGrid, MercatorGrid
 
 AOI = box(-122.4000, 37.7920, -122.3960, 37.7950)
 ZOOM = 17
@@ -383,6 +385,265 @@ def test_download_tiles_date_annotation_matches_download() -> None:
     tile_date = inspect.signature(old_imagery.download_tiles).parameters["date"].annotation
     mosaic_date = inspect.signature(old_imagery.download).parameters["date"].annotation
     assert tile_date == mosaic_date
+
+
+# --------------------------------------------------------------------------
+# download_geopackage
+# --------------------------------------------------------------------------
+def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1], colors={D1: 73}))
+    output = tmp_path / "google.gpkg"
+
+    result = old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None)
+
+    assert result == output
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+    with sqlite3.connect(output) as connection:
+        stored = connection.execute(
+            "SELECT zoom_level, tile_column, tile_row, tile_data "
+            "FROM imagery WHERE zoom_level = ? ORDER BY tile_row, tile_column",
+            (ZOOM - 1,),
+        ).fetchall()
+        metadata = json.loads(
+            connection.execute(
+                "SELECT metadata FROM gpkg_metadata WHERE md_scope = 'dataset'"
+            ).fetchone()[0]
+        )
+        matrix = connection.execute(
+            "SELECT matrix_width, matrix_height FROM gpkg_tile_matrix "
+            "WHERE table_name = 'imagery' AND zoom_level = ?",
+            (ZOOM - 1,),
+        ).fetchone()
+        crs_wkt = connection.execute(
+            "SELECT definition_12_063 FROM gpkg_spatial_ref_sys WHERE srs_id = 4326"
+        ).fetchone()
+        crs_extension = connection.execute(
+            "SELECT COUNT(*) FROM gpkg_extensions "
+            "WHERE table_name = 'gpkg_spatial_ref_sys' "
+            "AND column_name = 'definition_12_063'"
+        ).fetchone()
+        tile_metadata = [
+            json.loads(row[0])
+            for row in connection.execute(
+                "SELECT m.metadata FROM gpkg_metadata AS m "
+                "JOIN gpkg_metadata_reference AS r ON r.md_file_id = m.id "
+                "JOIN imagery AS i ON i.id = r.row_id_value "
+                "WHERE m.md_scope = 'tile' ORDER BY i.tile_row, i.tile_column"
+            )
+        ]
+        custom_tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'old_imagery_%'"
+        ).fetchall()
+
+    expected_addresses = [
+        (
+            ZOOM - 1,
+            tile.column,
+            (1 << ZOOM) - 1 - tile.row - (1 << ZOOM) // 4,
+        )
+        for tile in sorted(
+            selected,
+            key=lambda tile: (
+                (1 << ZOOM) - 1 - tile.row - (1 << ZOOM) // 4,
+                tile.column,
+            ),
+        )
+    ]
+    assert [(zoom, column, row) for zoom, column, row, _ in stored] == expected_addresses
+    assert all(
+        payload == _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
+        for *_, payload in stored
+    )
+    assert [
+        (
+            item["native_zoom"],
+            item["native_column"],
+            item["native_row"],
+            item["capture_date"],
+        )
+        for item in tile_metadata
+    ] == [
+        (ZOOM, tile.column, tile.row, D1.isoformat())
+        for tile in sorted(
+            selected,
+            key=lambda tile: (
+                (1 << ZOOM) - 1 - tile.row - (1 << ZOOM) // 4,
+                tile.column,
+            ),
+        )
+    ]
+    assert custom_tables == []
+    assert metadata["provider"] == "google"
+    assert metadata["native_zoom"] == ZOOM
+    assert metadata["geopackage_zoom"] == ZOOM - 1
+    assert metadata["overviews"]["resampling"] == "lanczos"
+    assert metadata["overviews"]["factors"]
+    assert matrix == (1 << ZOOM, 1 << (ZOOM - 1))
+    assert crs_wkt is not None and crs_wkt[0].startswith("GEODCRS[")
+    assert crs_extension == (1,)
+
+    with rasterio.open(output) as dataset:
+        assert dataset.crs == rasterio.CRS.from_epsg(4326)
+        assert dataset.width > 0 and dataset.height > 0
+        assert dataset.read(1).mean() == pytest.approx(73, abs=2)
+        expected_bounds = (
+            min(tile.bounds_wgs84[0] for tile in selected),
+            min(tile.bounds_wgs84[1] for tile in selected),
+            max(tile.bounds_wgs84[2] for tile in selected),
+            max(tile.bounds_wgs84[3] for tile in selected),
+        )
+        assert tuple(dataset.bounds) == pytest.approx(expected_bounds)
+
+    with sqlite3.connect(output) as connection:
+        overview_counts = dict(
+            connection.execute(
+                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
+            )
+        )
+    assert overview_counts[ZOOM - 1] == len(selected)
+    assert overview_counts[ZOOM - 2] > 0
+
+
+def test_download_geopackage_preserves_esri_web_mercator_tiles(stub, tmp_path) -> None:
+    backend = StubBackend([D1], colors={D1: 121})
+    backend.grid = MercatorGrid()
+    stub(backend)
+    output = tmp_path / "esri.gpkg"
+
+    old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, provider="esri", cache_dir=None)
+
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+    with sqlite3.connect(output) as connection:
+        stored = connection.execute(
+            "SELECT zoom_level, tile_column, tile_row, tile_data "
+            "FROM imagery WHERE zoom_level = ? ORDER BY tile_row, tile_column",
+            (ZOOM,),
+        ).fetchall()
+        matrix = connection.execute(
+            "SELECT matrix_width, matrix_height FROM gpkg_tile_matrix "
+            "WHERE table_name = 'imagery' AND zoom_level = ?",
+            (ZOOM,),
+        ).fetchone()
+
+    assert [(zoom, column, row) for zoom, column, row, _ in stored] == [
+        (ZOOM, tile.column, tile.row) for tile in selected
+    ]
+    assert all(
+        payload == _encode_jpeg(np.full((3, 256, 256), 121, dtype=np.uint8))
+        for *_, payload in stored
+    )
+    assert matrix == (1 << ZOOM, 1 << ZOOM)
+    with rasterio.open(output) as dataset:
+        assert dataset.crs == rasterio.CRS.from_epsg(3857)
+        assert dataset.read(1).mean() == pytest.approx(121, abs=2)
+
+    with sqlite3.connect(output) as connection:
+        overview_counts = dict(
+            connection.execute(
+                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
+            )
+        )
+    assert overview_counts[ZOOM] == len(selected)
+    assert overview_counts[ZOOM - 1] > 0
+
+
+def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1], colors={D1: 73}))
+    sparse_aoi = MultiPolygon(
+        [
+            box(-122.3999, 37.7921, -122.3995, 37.7925),
+            box(-122.3965, 37.7945, -122.3961, 37.7949),
+        ]
+    )
+    output = tmp_path / "sparse.gpkg"
+
+    old_imagery.download_geopackage(
+        sparse_aoi, ZOOM, D1, output=output, cache_dir=None
+    )
+
+    selected = backend.grid.tiles(sparse_aoi, ZOOM, 1_000)
+    assert len(selected) == 2
+    with sqlite3.connect(output) as connection:
+        counts = dict(
+            connection.execute(
+                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
+            )
+        )
+        source_zoom = ZOOM - 1
+        source_payloads = connection.execute(
+            "SELECT tile_data FROM imagery WHERE zoom_level = ?",
+            (source_zoom,),
+        ).fetchall()
+        overview_payload = connection.execute(
+            "SELECT tile_data FROM imagery WHERE zoom_level = ? LIMIT 1",
+            (source_zoom - 1,),
+        ).fetchone()[0]
+
+    assert counts[source_zoom] == len(selected)
+    assert 0 < counts[source_zoom - 1] <= counts[source_zoom]
+    assert min(count for zoom, count in counts.items() if zoom < source_zoom) < counts[source_zoom]
+    expected_payload = _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
+    assert all(payload[0] == expected_payload for payload in source_payloads)
+    with rasterio.io.MemoryFile(overview_payload) as memory, memory.open() as overview:
+        assert overview.width == overview.height == 256
+        assert overview.count == 4
+        assert overview.read(4).min() == 0
+
+
+def test_download_geopackage_refuses_existing_output_before_downloading(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1]))
+    output = tmp_path / "existing.gpkg"
+    output.write_bytes(b"keep me")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        old_imagery.download_geopackage(AOI, ZOOM, D1, output=output)
+
+    assert output.read_bytes() == b"keep me"
+    assert backend.downloads == 0
+
+
+def test_download_geopackage_can_atomically_overwrite(stub, tmp_path) -> None:
+    stub(StubBackend([D1], colors={D1: 88}))
+    output = tmp_path / "existing.gpkg"
+    output.write_bytes(b"replace me")
+
+    old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None, overwrite=True)
+
+    with rasterio.open(output) as dataset:
+        assert dataset.read(1).mean() == pytest.approx(88, abs=2)
+
+
+def test_download_geopackage_failure_leaves_no_output(stub, tmp_path) -> None:
+    selected = KeyholeGrid().tiles(AOI, ZOOM, 1_000)
+    stub(StubBackend([D1], missing={selected[0]}))
+    output = tmp_path / "failed.gpkg"
+
+    with pytest.raises(ValueError, match="No imagery found for tile"):
+        old_imagery.download_geopackage(AOI, ZOOM, D1, output=output)
+
+    assert not output.exists()
+
+
+def test_download_geopackage_write_failure_leaves_no_output(stub, tmp_path) -> None:
+    stub(StubBackend([D1]))
+    output = tmp_path / "failed-write.gpkg"
+
+    with pytest.raises(ValueError, match="reserved"):
+        old_imagery.download_geopackage(
+            AOI, ZOOM, D1, output=output, table_name="gpkg_contents", cache_dir=None
+        )
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_geopackage_rejects_unrepresentable_google_zooms(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1]))
+
+    with pytest.raises(ValueError, match="zoom 2 or greater"):
+        old_imagery.download_geopackage(box(-1, -1, 1, 1), 1, D1, output=tmp_path / "low.gpkg")
+
+    assert backend.downloads == 0
 
 
 # --------------------------------------------------------------------------

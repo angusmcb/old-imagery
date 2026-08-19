@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import geopandas as gpd
@@ -713,7 +714,7 @@ def _area_fractions(
 
 
 # --------------------------------------------------------------------------
-# download_tiles / download
+# download_tiles / download_geopackage / download
 # --------------------------------------------------------------------------
 def _validate_download_selection(
     provider: str,
@@ -923,6 +924,78 @@ def download_tiles(
         return adaptive_tile_map(provider, fetch, resolved)
     finally:
         client.close()
+
+
+def download_geopackage(
+    aoi: shapely.Polygon | shapely.MultiPolygon,
+    zoom: int,
+    date: DateLike | None = None,
+    *,
+    output: str | os.PathLike[str],
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
+    esri_wayback_release_id: str | None = None,
+    table_name: str = "imagery",
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 1_000,
+    include_metadata: bool = True,
+    overwrite: bool = False,
+) -> Path:
+    """Download native image tiles into an OGC GeoPackage without reprojection.
+
+    Esri's Web Mercator tile addresses and encoded payloads are stored directly.
+    Google's square plate-carree grid is represented by the equivalent
+    ``WorldCRS84Quad`` matrix: native zoom ``z`` becomes GeoPackage zoom
+    ``z - 1`` and only the row address changes. Google zooms below 2 cannot be
+    represented as complete CRS84 tiles and are rejected.
+
+    The GeoPackage contains the requested native zoom plus locally generated,
+    power-of-two lower-resolution overview tiles using Lanczos resampling. The
+    source tile payloads remain byte-for-byte unchanged; overview tiles are
+    derived locally and are recorded in dataset metadata. Dataset- and
+    tile-level provenance is attached through GeoPackage's standard metadata
+    extension. The complete file is validated through GDAL and published
+    atomically; an error does not leave a partial destination behind.
+
+    Parameters other than ``output``, ``table_name`` and ``overwrite`` have the
+    same selection meaning as :func:`download_tiles`. Existing outputs are
+    refused unless ``overwrite=True``.
+    """
+    output_path = Path(output)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists: {output_path}")
+    if provider == "google" and zoom < 2:
+        raise ValueError(
+            "Google zooms 0 and 1 cannot be represented as complete CRS84 tiles "
+            "without cutting or combining native images; use zoom 2 or greater"
+        )
+    tiles = download_tiles(
+        aoi,
+        zoom,
+        date,
+        date_match=date_match,
+        provider=provider,
+        esri_wayback_release_id=esri_wayback_release_id,
+        cache_dir=cache_dir,
+        max_tiles=max_tiles,
+        include_metadata=include_metadata,
+    )
+    from ._geopackage import write_geopackage
+
+    target = _as_date(date)
+    selection = {
+        "date": target.isoformat() if target else None,
+        "date_match": date_match if esri_wayback_release_id is None else None,
+        "esri_wayback_release_id": esri_wayback_release_id,
+        "include_metadata": include_metadata,
+    }
+    return write_geopackage(
+        tiles,
+        output_path,
+        table_name=table_name,
+        selection=selection,
+        overwrite=overwrite,
+    )
 
 
 def download(

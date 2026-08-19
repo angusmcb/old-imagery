@@ -23,7 +23,9 @@ small set of functions for use from Python rather than a command line tool:
 >>> img = old_imagery.download(aoi, zoom=18, date="1993-07-10")    # doctest: +SKIP
 
 ``availability`` and ``download`` answer "which capture dates exist here?" and
-"give me the pixels for one of them". The third function answers a different
+"give me the pixels for one of them". ``download_tiles`` exposes unchanged
+native payloads, and ``download_geopackage`` stores those payloads in a native
+tile matrix without reprojection. Another function answers a different
 question -- what a published Esri Wayback snapshot *displays*, and how old each
 part of it is:
 
@@ -41,6 +43,7 @@ from .api import (
     SourceMetadata,
     availability,
     download,
+    download_geopackage,
     download_tiles,
     esri_mosaic_as_of,
     esri_wayback_releases,
@@ -61,6 +64,7 @@ __all__ = [
     # public API
     "availability",
     "download",
+    "download_geopackage",
     "download_tiles",
     "esri_mosaic_as_of",
     "esri_wayback_releases",
