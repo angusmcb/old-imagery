@@ -11,7 +11,12 @@ import pytest
 from shapely.geometry import box
 
 from old_imagery import RequestFailed
-from old_imagery._esri import WayBack, _parse_capabilities
+from old_imagery._esri import (
+    _METADATA_MAX_AGE,
+    _TILEMAP_MAX_AGE,
+    WayBack,
+    _parse_capabilities,
+)
 from old_imagery._region import MercatorTile
 
 SAMPLE = (Path(__file__).parent / "data" / "wayback_capabilities_sample.xml").read_bytes()
@@ -82,9 +87,11 @@ class FakeClient:
     def __init__(self, responses):
         self.responses = responses
         self.requested = []
+        self.requested_ages = []
 
     def get(self, url, *, max_age=None):
         self.requested.append(url)
+        self.requested_ages.append(max_age)
         if url.endswith("wmtscapabilities.xml"):
             return SAMPLE
         for fragment, payload in self.responses.items():
@@ -109,6 +116,19 @@ def _wayback(responses):
 def test_dated_tiles_empty_when_no_layer_has_data() -> None:
     wb, _ = _wayback({})
     assert wb.dated_tiles(TILE) == []
+
+
+def test_tilemap_requests_use_a_long_refresh_window() -> None:
+    wb, client = _wayback({})
+    wb.dated_tiles(TILE)
+    assert client.requested_ages
+    assert all(age == _TILEMAP_MAX_AGE for age in client.requested_ages)
+
+
+def test_source_metadata_requests_use_a_daily_refresh_window() -> None:
+    wb, client = _wayback({})
+    wb._tile_metadata(wb.layers[0], TILE)
+    assert client.requested_ages == [_METADATA_MAX_AGE]
 
 
 def test_dated_tiles_omits_imagery_without_capture_metadata() -> None:
@@ -332,6 +352,7 @@ class RegionClient:
         self.geometry_queries: list[tuple[int, int]] = []
         # One entry per HTTP request, so batching itself can be asserted on.
         self.geometry_requests: list[tuple[int, tuple[int, ...]]] = []
+        self.post_ages: list[float | None] = []
 
     @staticmethod
     def _layer_id_from(url: str) -> int:
@@ -340,6 +361,7 @@ class RegionClient:
         return int(token.split("_r")[-1])
 
     def post(self, url, data, *, max_age=None):
+        self.post_ages.append(max_age)
         layer_id = self._layer_id_from(url)
         if data.get("returnGeometry") == "true":
             oids = [int(token) for token in data["objectIds"].split(",")]
@@ -471,6 +493,7 @@ def test_fetch_geometries_batches_ids_into_one_request() -> None:
     assert len(rows) == 10
     assert len(client.geometry_requests) == 1
     assert client.geometry_requests[0] == (1, tuple(range(11, 21)))
+    assert client.post_ages == [_METADATA_MAX_AGE]
     assert all(row.date == CAPTURE and not row.geometry.is_empty for row in rows)
 
 
@@ -518,10 +541,11 @@ def test_fetch_geometries_drops_only_the_failing_batch() -> None:
 # --------------------------------------------------------------------------
 def test_query_layer_reports_complete_on_a_normal_result() -> None:
     layers = [_layer(1, "2014-02-20")]
-    wb, _ = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
     rows, complete = wb._query_layer(layers[0], {}, 17)
     assert rows == [(CAPTURE, 11)]
     assert complete is True
+    assert client.post_ages == [_METADATA_MAX_AGE]
 
 
 def test_query_layer_reports_complete_on_a_genuinely_empty_result() -> None:

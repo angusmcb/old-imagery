@@ -1477,9 +1477,14 @@ def test_public_tile_guard_matches_the_internal_default() -> None:
 
     from old_imagery._region import MAX_TILES
 
-    for fn in (old_imagery.availability, old_imagery.download):
+    for fn in (
+        old_imagery.availability,
+        old_imagery.download_tiles,
+        old_imagery.download_geopackage,
+        old_imagery.download,
+    ):
         default = inspect.signature(fn).parameters["max_tiles"].default
-        assert default == MAX_TILES == 1_000, fn.__name__
+        assert default == MAX_TILES == 10_000, fn.__name__
 
 
 def test_option_values_are_visible_in_the_signature() -> None:

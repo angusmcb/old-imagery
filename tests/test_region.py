@@ -95,10 +95,10 @@ def test_normalize_rejects_out_of_range_latitude() -> None:
 # --------------------------------------------------------------------------
 # tile selection
 # --------------------------------------------------------------------------
-def test_default_max_tiles_caps_raw_mosaic_buffers_at_250_mib() -> None:
+def test_default_max_tiles_caps_raw_mosaic_buffers_at_2500_mib() -> None:
     bytes_per_pixel = 4  # RGB + dataset mask
-    assert MAX_TILES == 1_000
-    assert MAX_TILES * TILE_PX**2 * bytes_per_pixel == 250 * 1024**2
+    assert MAX_TILES == 10_000
+    assert MAX_TILES * TILE_PX**2 * bytes_per_pixel == 2_500 * 1024**2
 
 
 @pytest.mark.parametrize("grid", [KeyholeGrid(), MercatorGrid()])

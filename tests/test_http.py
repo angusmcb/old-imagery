@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -33,15 +35,20 @@ class FakeTransport(httpx.BaseTransport):
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    def build(script, retries=3):
-        c = CachedHttpClient(tmp_path, retries=retries)
+    clients = []
+
+    def build(script, retries=3, backend=None):
+        c = CachedHttpClient(tmp_path, retries=retries, cache_backend=backend)
         transport = FakeTransport(script)
         c._client = httpx.Client(transport=transport)
         c._transport = transport
+        clients.append(c)
         monkeypatch.setattr("old_imagery._http.time.sleep", lambda _s: None)
         return c
 
-    return build
+    yield build
+    for c in clients:
+        c.close()
 
 
 URL = "https://example.invalid/asset"
@@ -52,6 +59,14 @@ def test_successful_request_is_cached(client) -> None:
     assert c.get(URL) == b"payload"
     assert c.get(URL) == b"payload"
     assert c._transport.calls == 1  # second call served from disk
+
+
+@pytest.mark.parametrize("backend", ["file", "sqlite"])
+def test_successful_request_is_cached_for_each_backend(client, backend) -> None:
+    c = client([200], backend=backend)
+    assert c.get(URL) == b"payload"
+    assert c.get(URL) == b"payload"
+    assert c._transport.calls == 1
 
 
 def test_transport_error_is_retried_then_succeeds(client) -> None:
@@ -126,6 +141,78 @@ def test_cache_can_be_disabled(client, tmp_path) -> None:
     c._client = httpx.Client(transport=FakeTransport([200, 200]))
     assert c.get(URL) == b"payload"
     assert c.get(URL) == b"payload"
+
+
+def test_sqlite_cache_is_one_container_file(tmp_path) -> None:
+    c = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    c._write_cache(URL, b"payload")
+    c.close()
+
+    database = tmp_path / "responses.sqlite3"
+    assert database.exists()
+    assert not list(tmp_path.glob("[0-9a-f][0-9a-f]"))
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT body FROM responses").fetchone() == (b"payload",)
+
+
+def test_sqlite_cache_close_flushes_queued_writes(tmp_path) -> None:
+    c = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    c._write_cache(URL, b"payload")
+    c.close()
+
+    reopened = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    try:
+        assert reopened._read_cache(URL, None) == b"payload"
+    finally:
+        reopened.close()
+
+
+def test_sqlite_cache_reads_pending_write_before_commit(tmp_path) -> None:
+    c = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    try:
+        c._write_cache(URL, b"payload")
+        assert c._read_cache(URL, None) == b"payload"
+    finally:
+        c.close()
+
+
+def test_sqlite_cache_concurrent_writes_are_durable(tmp_path) -> None:
+    c = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    entries = [(f"{URL}/{index}", f"payload-{index}".encode()) for index in range(256)]
+    try:
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            list(pool.map(lambda item: c._write_cache(*item), entries))
+    finally:
+        c.close()
+
+    reopened = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    try:
+        assert [reopened._read_cache(key, None) for key, _ in entries] == [
+            body for _, body in entries
+        ]
+    finally:
+        reopened.close()
+
+
+def test_cache_backend_can_be_selected_from_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OLD_IMAGERY_CACHE_BACKEND", "file")
+    file_client = CachedHttpClient(tmp_path)
+    try:
+        assert file_client.cache_backend == "file"
+    finally:
+        file_client.close()
+
+    monkeypatch.setenv("OLD_IMAGERY_CACHE_BACKEND", "sqlite")
+    sqlite_client = CachedHttpClient(tmp_path / "sqlite")
+    try:
+        assert sqlite_client.cache_backend == "sqlite"
+    finally:
+        sqlite_client.close()
+
+
+def test_unknown_cache_backend_is_rejected(tmp_path) -> None:
+    with pytest.raises(ValueError, match="expected 'file' or 'sqlite'"):
+        CachedHttpClient(tmp_path, cache_backend="unknown")
 
 
 def test_transport_capacity_does_not_bind_the_adaptive_raw_tile_ceiling(monkeypatch) -> None:

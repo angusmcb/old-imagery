@@ -10,7 +10,7 @@ This is a Python port of the protocol layer of [Mbucari/GEHistoricalImagery](htt
 >
 > Imagery you fetch with `old-imagery` stays the copyright of Google, Esri, or their imagery providers, and their terms of service govern what you may do with it. [Google Earth's terms](https://maps.google.com/intl/en_all/help/terms_maps-earth/) prohibit mass downloads and bulk feeds; Esri content may carry provider-specific rights and restrictions. **Whether a particular use is permitted is your call to make, and your responsibility** — check the current terms and item details, and get permission where you need it. Research, archival and journalistic uses are not automatically exempt.
 >
-> The library defaults to at most 1,000 tiles, caches responses to avoid refetching, and owns its concurrency policy rather than letting callers raise it. Metadata endpoints and resolved image payloads adapt independently over real requested work because measurements found different throughput knees on local, GCE and HPC network paths. It cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
+> The library defaults to at most 10,000 tiles, caches responses to avoid refetching, and owns its concurrency policy rather than letting callers raise it. Metadata endpoints and resolved image payloads adapt independently over real requested work because measurements found different throughput knees on local, GCE and HPC network paths. It cannot tell whether your use is allowed. Consider official alternatives first: the [Google Earth Engine data catalogue](https://developers.google.com/earth-engine/datasets/) provides other historical Earth-observation datasets under their listed terms (not the Google Earth basemap archive), and Esri's [ArcGIS World Imagery Wayback](https://livingatlas.arcgis.com/wayback/) is the official interface to the Wayback archive.
 >
 > **Not affiliated with Google or Esri.** Google and Google Earth are trademarks of Google LLC; Esri, ArcGIS and World Imagery Wayback are trademarks of Environmental Systems Research Institute, Inc. They are named here only to identify the services this software talks to. This project is not affiliated with, endorsed by, or sponsored by either company.
 
@@ -82,7 +82,7 @@ availability(
     max_date: date | str | None = None,
     provider: Literal["google", "esri"] = "google",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
 ) -> geopandas.GeoDataFrame
 ```
 
@@ -280,7 +280,7 @@ download_tiles(
     provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
     include_metadata: bool = True,
 ) -> list[DownloadedTile]
 ```
@@ -342,7 +342,7 @@ download_geopackage(
     esri_wayback_release_id: str | None = None,
     table_name: str = "imagery",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
     include_metadata: bool = True,
     overwrite: bool = False,
 ) -> pathlib.Path
@@ -395,7 +395,7 @@ download(
     provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
 ) -> rasterio.DatasetReader
 ```
 
@@ -431,8 +431,8 @@ with old_imagery.download(aoi, 17, target, date_match="exact") as src:
 ```
 
 `max_tiles` limits the tile grid spanned by the AOI's bounding box. `download`
-holds the RGB mosaic and its mask in memory: 1,000 full tiles require about
-250 MiB for those raw buffers, plus the in-memory GeoTIFF and decoding
+holds the RGB mosaic and its mask in memory: 10,000 full tiles require about
+2,500 MiB (roughly 2.4 GiB) for those raw buffers, plus the in-memory GeoTIFF and decoding
 overhead. Raise the guard only after estimating the resulting memory and
 request cost.
 
@@ -480,7 +480,11 @@ initial Google dbRoot or Esri capabilities document raises
 
 ## Caching
 
-Responses are cached on disk, in the location each platform expects:
+Responses are cached on disk, in the location each platform expects. The default
+backend is a SQLite container named `responses.sqlite3`; writes are best-effort,
+batched by a background writer, and drained when the HTTP client closes. The
+original one-response-per-file backend remains available for comparison with
+`OLD_IMAGERY_CACHE_BACKEND=file`.
 
 | platform | default | |
 | --- | --- | --- |
@@ -491,10 +495,15 @@ Responses are cached on disk, in the location each platform expects:
 Read `old_imagery.DEFAULT_CACHE_DIR` to see the resolved path. Override it with
 `$OLD_IMAGERY_CACHE_DIR` before importing the package, or per call with the
 `cache_dir` argument; pass `cache_dir=None` to disable. Keyhole assets are addressed by
-epoch and therefore immutable, so cache entries never go stale; only dbRoot and
-the Esri capabilities document are re-fetched, daily and weekly respectively.
-There is no automatic size limit or eviction policy, so long-running workflows
-should monitor or periodically remove this directory.
+epoch and therefore immutable, so image and packet entries never go stale. Mutable
+catalogue and provenance responses are refreshed by policy: dbRoot daily, Esri
+source metadata daily, release-specific tilemaps every 30 days, and the Esri
+capabilities document weekly.
+SQLite cache writes are bounded to 64 MiB of queued payloads, so a fast download
+cannot grow the writer queue without limit. There is no automatic size limit or
+eviction policy, so long-running workflows should monitor or periodically remove
+this directory. `tools/benchmark_cache.py` compares the SQLite and file
+backends using a synthetic concurrent workload.
 
 ## Notes and limitations
 

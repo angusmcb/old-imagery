@@ -207,6 +207,8 @@ def _resolve_release(backend, release_id: str | None):
 
 def _backend(provider: str, cache_dir: str | os.PathLike | None):
     """Build a provider backend and the HTTP client that owns its connections."""
+    if provider not in {"google", "esri"}:
+        raise ValueError(f"Unknown provider {provider!r}; expected 'google' or 'esri'")
     client = CachedHttpClient(cache_dir)
     try:
         if provider == "google":
@@ -219,7 +221,7 @@ def _backend(provider: str, cache_dir: str | os.PathLike | None):
         client.close()
         raise
     client.close()
-    raise ValueError(f"Unknown provider {provider!r}; expected 'google' or 'esri'")
+    raise AssertionError(f"validated provider {provider!r} did not select a backend")
 
 
 # --------------------------------------------------------------------------
@@ -233,7 +235,7 @@ def availability(
     max_date: DateLike | None = None,
     provider: Literal["google", "esri"] = "google",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
 ) -> gpd.GeoDataFrame:
     """Find which imagery capture dates are available over an area.
 
@@ -255,7 +257,7 @@ def availability(
         On-disk response cache. Pass ``None`` to disable caching.
     max_tiles : int
         Maximum number of tile-grid cells spanned by the AOI's bounding box.
-        Default 1,000.
+        Default 10,000.
 
     Returns
     -------
@@ -831,7 +833,7 @@ def download_tiles(
     provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
     include_metadata: bool = True,
 ) -> list[DownloadedTile]:
     """Download complete native image tiles selected by a WGS84 geometry.
@@ -937,7 +939,7 @@ def download_geopackage(
     esri_wayback_release_id: str | None = None,
     table_name: str = "imagery",
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
     include_metadata: bool = True,
     overwrite: bool = False,
 ) -> Path:
@@ -1007,7 +1009,7 @@ def download(
     provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_tiles: int = 1_000,
+    max_tiles: int = 10_000,
 ) -> rasterio.DatasetReader:
     """Download and mosaic historical imagery over an area.
 
@@ -1050,7 +1052,7 @@ def download(
         On-disk response cache. Pass ``None`` to disable caching.
     max_tiles : int
         Maximum number of tile-grid cells spanned by the AOI's bounding box.
-        Default 1,000.
+        Default 10,000.
 
     Returns
     -------

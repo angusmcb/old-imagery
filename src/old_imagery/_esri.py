@@ -26,6 +26,11 @@ WMTS_CAPABILITIES = (
     "mapserver/wmts/1.0.0/wmtscapabilities.xml"
 )
 _CAPS_MAX_AGE = 7 * 24 * 3600
+# A tilemap is tied to one immutable Wayback release id. Keep a long refresh
+# window in case Esri repairs or reindexes the historical service.
+_TILEMAP_MAX_AGE = 30 * 24 * 3600
+# Source metadata can be corrected independently of the imagery release.
+_METADATA_MAX_AGE = 24 * 3600
 # Esri serves these with an https scheme, which is unusual for XML namespaces;
 # accept either so the parser does not hinge on that detail.
 _OWS_NAMESPACES = ("https://www.opengis.net/ows/1.1", "http://www.opengis.net/ows/1.1")
@@ -210,9 +215,9 @@ class WayBack:
         self._lock = threading.Lock()
 
     # -- helpers -----------------------------------------------------------
-    def _json(self, url: str) -> dict | None:
+    def _json(self, url: str, *, max_age: float | None = None) -> dict | None:
         try:
-            return json.loads(self._client.get(url))
+            return json.loads(self._client.get(url, max_age=max_age))
         except (RequestFailed, ValueError, UnicodeDecodeError):
             return None
 
@@ -236,7 +241,7 @@ class WayBack:
             "returnGeometry": "false",
         }
         url = layer.metadata_query_url(tile.level) + "?" + _query_string(query)
-        payload = self._json(url)
+        payload = self._json(url, max_age=_METADATA_MAX_AGE)
         # A release date is not an image capture date. If the metadata service
         # gives us nothing usable, omit this version rather than silently
         # changing the meaning of every date exposed by the public API.
@@ -330,7 +335,7 @@ class WayBack:
                 else:
                     continue
 
-            payload = self._json(layer.tilemap_url(tile))
+            payload = self._json(layer.tilemap_url(tile), max_age=_TILEMAP_MAX_AGE)
             effective = layer
             select = (payload or {}).get("select")
             if select:
@@ -418,7 +423,7 @@ class WayBack:
                     skip_until = None
                 else:
                     continue
-            payload = self._json(layer.tilemap_url(tile))
+            payload = self._json(layer.tilemap_url(tile), max_age=_TILEMAP_MAX_AGE)
             effective = layer
             select = (payload or {}).get("select")
             if select:
@@ -645,7 +650,9 @@ class WayBack:
             if offset:
                 form["resultOffset"] = str(offset)
             try:
-                payload = json.loads(self._client.post(url, form))
+                payload = json.loads(
+                    self._client.post(url, form, max_age=_METADATA_MAX_AGE)
+                )
             except (RequestFailed, OSError, ValueError):
                 return out, False
             if "error" in payload:
@@ -730,7 +737,9 @@ class WayBack:
             "outSR": "3857",
         }
         try:
-            raw = self._client.post(layer.metadata_query_url(zoom), form)
+            raw = self._client.post(
+                layer.metadata_query_url(zoom), form, max_age=_METADATA_MAX_AGE
+            )
             payload = json.loads(raw)
         except (RequestFailed, OSError, ValueError):
             return []

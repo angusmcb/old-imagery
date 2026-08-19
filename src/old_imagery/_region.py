@@ -21,9 +21,9 @@ from shapely.prepared import prep
 from ._keyhole import EQUATOR_DEGREES, KeyholeTile, validate_level
 
 # Shared request/memory guard for the public API.  A download allocates four
-# uint8 values per output pixel (RGB + mask), so 1,000 full 256 px tiles are
-# already about 250 MiB before the in-memory GeoTIFF and decoder overhead.
-MAX_TILES = 1_000
+# uint8 values per output pixel (RGB + mask), so 10,000 full 256 px tiles are
+# already about 2.4 GiB before the in-memory GeoTIFF and decoder overhead.
+MAX_TILES = 10_000
 TILE_PX = 256
 MERCATOR_EQUATOR = 40075016.68557849
 MERCATOR_MAX_LAT = 85.051128779806589
