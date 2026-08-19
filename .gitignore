@@ -6,3 +6,4 @@ dist/
 build/
 *.egg-info/
 .claude/settings.json
+.DS_Store
