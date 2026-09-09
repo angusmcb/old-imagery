@@ -36,8 +36,10 @@ _METADATA_MAX_AGE = 24 * 3600
 _OWS_NAMESPACES = ("https://www.opengis.net/ows/1.1", "http://www.opengis.net/ows/1.1")
 _KEY_TEXT = "/World_Imagery"
 _DATE_IN_TITLE = re.compile(r"\(Wayback (\d{4}-\d{2}-\d{2})\)")
-# Guard against a runaway pagination loop on a very large area of interest.
-_MAX_FEATURES = 20_000
+# How many metadata records to request by OBJECTID at once.  Esri caps feature
+# responses, but documents returnIdsOnly responses as unlimited.  Discover all
+# matching IDs first, then keep each attribute response comfortably bounded.
+_ATTRIBUTE_BATCH = 1_000
 # How many OBJECTIDs to ask for in one geometry request.  Footprints are large,
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
@@ -595,7 +597,7 @@ class WayBack:
         the release genuinely does not cover.
         """
         envelope = _envelope_3857(aoi)
-        found, complete = self._query_layer(layer, envelope, zoom)
+        object_ids, complete = self._query_object_ids(layer, envelope, zoom)
         if not complete:
             raise RequestFailed(
                 f"The Esri metadata service did not return a complete feature "
@@ -603,16 +605,16 @@ class WayBack:
                 f"may succeed; a partial list is refused here because it would "
                 f"read as missing imagery rather than a failed request."
             )
-        if len(found) > max_footprints:
+        if len(object_ids) > max_footprints:
             raise ValueError(
-                f"Release {layer.identifier} publishes {len(found):,} capture "
+                f"Release {layer.identifier} publishes {len(object_ids):,} capture "
                 f"footprints over this area at zoom {zoom}, above the limit of "
                 f"{max_footprints:,}. Use a smaller area or a lower zoom, or "
                 f"raise max_footprints."
             )
-        if not found:
+        if not object_ids:
             return []
-        return self._fetch_geometries(layer, zoom, sorted({oid for _date, oid in found}))
+        return self._fetch_geometries(layer, zoom, object_ids)
 
     def _query_layer(
         self, layer: Layer, envelope: dict, zoom: int
@@ -625,53 +627,124 @@ class WayBack:
         megabytes ~195 times.  Geometry is fetched in batches by
         :meth:`_fetch_geometries` instead.
 
-        ``complete`` is False when the walk stopped before the service said it
-        was done -- a failed or errored request, or the ``_MAX_FEATURES``
-        pagination guard.  An empty result set with no error is *complete*: it
-        means the release genuinely publishes nothing here.  Callers that build a
-        map of what is displayed must not treat a partial list as the whole
-        truth; :meth:`dated_regions` accepts partial results on purpose, while
+        Esri limits feature responses but not ``returnIdsOnly`` responses.  The
+        matching IDs are therefore discovered in one request and their capture
+        dates fetched in bounded batches, rather than walking an open-ended
+        sequence of offsets.
+
+        ``complete`` is False when either ID discovery or an attribute batch is
+        failed, malformed, or truncated.  Callers that build a map of what is
+        displayed must not treat a partial list as the whole truth;
+        :meth:`dated_regions` accepts partial results on purpose, while
         :meth:`release_footprints` refuses them.
         """
-        url = layer.metadata_query_url(zoom)
-        offset = 0
+        object_ids, complete = self._query_object_ids(layer, envelope, zoom)
+        if not object_ids:
+            return [], complete
+
         out: list[tuple[_dt.date, int]] = []
+        for start in range(0, len(object_ids), _ATTRIBUTE_BATCH):
+            batch = object_ids[start : start + _ATTRIBUTE_BATCH]
+            rows = self._fetch_attribute_batch(layer, zoom, batch)
+            if rows is None:
+                return out, False
+            out.extend(rows)
+        return out, complete
 
-        while True:
-            form = {
-                "f": "json",
-                "outFields": _SOURCE_FIELDS,
-                "spatialRel": "esriSpatialRelIntersects",
-                "geometryType": "esriGeometryEnvelope",
-                "inSR": "3857",
-                "geometry": json.dumps(envelope),
-                "returnGeometry": "false",
-            }
-            if offset:
-                form["resultOffset"] = str(offset)
-            try:
-                payload = json.loads(
-                    self._client.post(url, form, max_age=_METADATA_MAX_AGE)
+    def _query_object_ids(
+        self, layer: Layer, envelope: dict, zoom: int
+    ) -> tuple[list[int], bool]:
+        """Return every matching OBJECTID and whether Esri's answer was complete."""
+        url = layer.metadata_query_url(zoom)
+        form = {
+            "f": "json",
+            "spatialRel": "esriSpatialRelIntersects",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "3857",
+            "geometry": json.dumps(envelope),
+            "returnGeometry": "false",
+            "returnIdsOnly": "true",
+        }
+        try:
+            payload = json.loads(self._client.post(url, form, max_age=_METADATA_MAX_AGE))
+        except (RequestFailed, OSError, ValueError):
+            return [], False
+        if "error" in payload or "objectIds" not in payload:
+            return [], False
+
+        raw_ids = payload.get("objectIds")
+        if raw_ids is None:
+            raw_ids = []
+        if not isinstance(raw_ids, list):
+            return [], False
+        try:
+            object_ids = [int(oid) for oid in raw_ids]
+        except (TypeError, ValueError):
+            return [], False
+
+        unique_ids = sorted(set(object_ids))
+        # Treat repeated IDs like the old offset implementation did: collapse
+        # them before downstream geometry work.  They do not make the set of
+        # matching features incomplete.
+        complete = not payload.get("exceededTransferLimit", False)
+        return unique_ids, complete
+
+    def _fetch_attribute_batch(
+        self, layer: Layer, zoom: int, object_ids: Sequence[int]
+    ) -> list[tuple[_dt.date, int]] | None:
+        """Fetch capture dates, splitting a batch if the service truncates it."""
+        form = {
+            "f": "json",
+            "outFields": "OBJECTID,SRC_DATE2",
+            "objectIds": ",".join(str(oid) for oid in object_ids),
+            "returnGeometry": "false",
+        }
+        try:
+            payload = json.loads(
+                self._client.post(
+                    layer.metadata_query_url(zoom), form, max_age=_METADATA_MAX_AGE
                 )
-            except (RequestFailed, OSError, ValueError):
-                return out, False
-            if "error" in payload:
-                return out, False
-            if not payload.get("features"):
-                return out, True
+            )
+        except (RequestFailed, OSError, ValueError):
+            return None
+        if "error" in payload or not isinstance(payload.get("features"), list):
+            return None
 
-            for feature in payload["features"]:
-                attributes = feature.get("attributes") or {}
-                date = _coerce_date(attributes.get("SRC_DATE2"))
-                oid = attributes.get("OBJECTID")
-                if date is not None and oid is not None:
-                    out.append((date, int(oid)))
+        by_id: dict[int, _dt.date | None] = {}
+        for feature in payload["features"]:
+            attributes = feature.get("attributes") or {}
+            oid = attributes.get("OBJECTID")
+            if oid is None:
+                return None
+            try:
+                oid = int(oid)
+            except (TypeError, ValueError):
+                return None
+            if oid in by_id:
+                return None
+            by_id[oid] = _coerce_date(attributes.get("SRC_DATE2"))
 
-            if not payload.get("exceededTransferLimit"):
-                return out, True
-            offset += len(payload["features"])
-            if offset > _MAX_FEATURES:
-                return out, False
+        expected = set(object_ids)
+        if set(by_id) == expected and not payload.get("exceededTransferLimit", False):
+            return [
+                (date, oid)
+                for oid in object_ids
+                if (date := by_id[oid]) is not None
+            ]
+
+        # Some services enforce a smaller feature limit than advertised.  Split
+        # and retry instead of baking another service-specific ceiling into the
+        # client.  A one-record batch cannot make further progress.
+        if len(object_ids) <= 1 or not set(by_id).issubset(expected):
+            return None
+        middle = len(object_ids) // 2
+        left = self._fetch_attribute_batch(layer, zoom, object_ids[:middle])
+        if left is None:
+            return None
+        right = self._fetch_attribute_batch(layer, zoom, object_ids[middle:])
+        if right is None:
+            return None
+        return left + right
 
     def _fetch_geometries(
         self, layer: Layer, zoom: int, object_ids: Sequence[int]

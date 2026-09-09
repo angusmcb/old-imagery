@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -348,6 +349,7 @@ class RegionClient:
     def __init__(self, per_layer):
         self.per_layer = per_layer  # {layer_id: [(date, oid), ...]}
         self.date_queries: list[int] = []
+        self.attribute_requests: list[tuple[int, tuple[int, ...]]] = []
         # Every (layer, oid) pair asked for, regardless of how they were grouped.
         self.geometry_queries: list[tuple[int, int]] = []
         # One entry per HTTP request, so batching itself can be asserted on.
@@ -371,12 +373,25 @@ class RegionClient:
                 self.geometry_queries.append((layer_id, oid))
                 pairs.append((oid, next(d for d, o in self.per_layer[layer_id] if o == oid)))
             return _esrijson(pairs)
-        self.date_queries.append(layer_id)
         rows = self.per_layer.get(layer_id, [])
+        if data.get("returnIdsOnly") == "true":
+            self.date_queries.append(layer_id)
+            return json.dumps({"objectIds": [oid for _date, oid in rows]}).encode()
+
+        oids = tuple(int(token) for token in data["objectIds"].split(","))
+        self.attribute_requests.append((layer_id, oids))
+        dates = {oid: date for date, oid in rows}
         return json.dumps(
             {
                 "features": [
-                    {"attributes": {"OBJECTID": o, "SRC_DATE2": _millis(d)}} for d, o in rows
+                    {
+                        "attributes": {
+                            "OBJECTID": oid,
+                            "SRC_DATE2": _millis(dates[oid]),
+                        }
+                    }
+                    for oid in oids
+                    if oid in dates
                 ]
             }
         ).encode()
@@ -545,7 +560,7 @@ def test_query_layer_reports_complete_on_a_normal_result() -> None:
     rows, complete = wb._query_layer(layers[0], {}, 17)
     assert rows == [(CAPTURE, 11)]
     assert complete is True
-    assert client.post_ages == [_METADATA_MAX_AGE]
+    assert client.post_ages == [_METADATA_MAX_AGE, _METADATA_MAX_AGE]
 
 
 def test_query_layer_reports_complete_on_a_genuinely_empty_result() -> None:
@@ -583,22 +598,88 @@ def test_query_layer_reports_incomplete_on_an_error_payload() -> None:
     assert complete is False
 
 
-def test_query_layer_reports_incomplete_when_pagination_runs_away() -> None:
-    """The _MAX_FEATURES guard truncates, and must say so."""
+def test_query_layer_has_no_artificial_feature_limit() -> None:
+    """ID discovery and batching can retrieve the reported 34,840-feature case."""
     from old_imagery import _esri
 
     layers = [_layer(1, "2014-02-20")]
-    wb, client = _wayback_with(layers, {1: []})
-
-    page = [{"attributes": {"OBJECTID": oid, "SRC_DATE2": _millis(CAPTURE)}} for oid in range(500)]
-
-    def endless(url, data, *, max_age=None):
-        return json.dumps({"features": page, "exceededTransferLimit": True}).encode()
-
-    client.post = endless
+    count = 34_840
+    wb, client = _wayback_with(
+        layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]}
+    )
     rows, complete = wb._query_layer(layers[0], {}, 17)
+
+    assert complete is True
+    assert len(rows) == count
+    assert len(client.attribute_requests) == math.ceil(count / _esri._ATTRIBUTE_BATCH)
+    assert [oid for _layer_id, batch in client.attribute_requests for oid in batch] == list(
+        range(1, count + 1)
+    )
+
+
+def test_query_layer_splits_a_truncated_attribute_batch() -> None:
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    count = _esri._ATTRIBUTE_BATCH
+    wb, client = _wayback_with(
+        layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]}
+    )
+    real_post = client.post
+
+    def limited(url, data, *, max_age=None):
+        raw = real_post(url, data, max_age=max_age)
+        if data.get("returnIdsOnly") == "true":
+            return raw
+        payload = json.loads(raw)
+        if len(payload["features"]) > 100:
+            payload["features"] = payload["features"][:100]
+            payload["exceededTransferLimit"] = True
+        return json.dumps(payload).encode()
+
+    client.post = limited
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+
+    assert complete is True
+    assert len(rows) == count
+    assert len(client.attribute_requests) > 1
+
+
+def test_query_layer_reports_incomplete_when_one_record_cannot_be_fetched() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    real_post = client.post
+
+    def truncated(url, data, *, max_age=None):
+        if data.get("returnIdsOnly") == "true":
+            return real_post(url, data, max_age=max_age)
+        return json.dumps({"features": [], "exceededTransferLimit": True}).encode()
+
+    client.post = truncated
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+
+    assert rows == []
     assert complete is False
-    assert len(rows) > _esri._MAX_FEATURES
+
+
+def test_query_layer_reports_incomplete_on_duplicate_attribute_records() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    real_post = client.post
+
+    def duplicated(url, data, *, max_age=None):
+        raw = real_post(url, data, max_age=max_age)
+        if data.get("returnIdsOnly") == "true":
+            return raw
+        payload = json.loads(raw)
+        payload["features"] *= 2
+        return json.dumps(payload).encode()
+
+    client.post = duplicated
+    rows, complete = wb._query_layer(layers[0], {}, 17)
+
+    assert rows == []
+    assert complete is False
 
 
 # --------------------------------------------------------------------------
@@ -668,6 +749,7 @@ def test_release_footprints_rejects_more_footprints_than_the_limit() -> None:
 
     with pytest.raises(ValueError, match="above the limit of 5"):
         wb.release_footprints(layers[0], AOI, 17, max_footprints=5)
+    assert client.attribute_requests == []  # the ID count is enough to refuse
     assert client.geometry_requests == []  # refused before fetching geometry
 
 
