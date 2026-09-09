@@ -486,6 +486,7 @@ def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> 
     with rasterio.open(output) as dataset:
         assert dataset.crs == rasterio.CRS.from_epsg(4326)
         assert dataset.width > 0 and dataset.height > 0
+        assert dataset.tags(ns="rio_overview") == {}
         assert dataset.read(1).mean() == pytest.approx(73, abs=2)
         expected_bounds = (
             min(tile.bounds_wgs84[0] for tile in selected),

@@ -475,8 +475,6 @@ def write_geopackage(
                 [tile.content for tile in tiles],
                 overview_factors,
             )
-            with rasterio.open(temporary, "r+") as dataset:
-                dataset.update_tags(ns="rio_overview", resampling="average")
 
         # Reopen through GDAL before publishing the file. This catches schema,
         # georeferencing and driver-compatibility errors that SQLite alone does

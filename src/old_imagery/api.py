@@ -959,7 +959,8 @@ def download_geopackage(
     overview tiles with populated native descendants are generated, so sparse
     selections do not require scanning or storing the empty parts of their
     bounding canvas. The source tile payloads remain byte-for-byte unchanged;
-    overview tiles are derived locally and are recorded in dataset metadata.
+    overview tiles are derived locally and are described in the GeoPackage
+    provenance metadata.
     Dataset- and tile-level provenance is attached through GeoPackage's
     standard metadata extension. The complete file is validated through GDAL
     and published atomically; an error does not leave a partial destination
