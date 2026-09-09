@@ -8,12 +8,15 @@ import math
 import os
 import sqlite3
 import tempfile
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import rasterio
-from rasterio.enums import Resampling
+from rasterio.errors import NotGeoreferencedWarning
+from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
 from ._region import MERCATOR_EQUATOR, TILE_PX
@@ -143,6 +146,134 @@ def _overview_factors(width: int, height: int, geopackage_zoom: int) -> tuple[in
     return tuple(factors)
 
 
+def _rgba_tile(payload: bytes) -> np.ndarray:
+    """Decode one native or overview payload to an RGBA uint8 tile."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NotGeoreferencedWarning)
+        with MemoryFile(payload) as memory, memory.open() as source:
+            data = source.read()
+
+    if data.dtype != np.uint8:
+        data = np.clip(data, 0, 255).astype(np.uint8)
+    if data.shape[1:] != (TILE_PX, TILE_PX):
+        raise ValueError(
+            f"overview source payload is {data.shape[2]}x{data.shape[1]}; "
+            f"expected {TILE_PX}x{TILE_PX}"
+        )
+    if data.shape[0] == 1:
+        rgb = np.repeat(data, 3, axis=0)
+        alpha = np.full((TILE_PX, TILE_PX), 255, dtype=np.uint8)
+    elif data.shape[0] == 2:
+        rgb = np.repeat(data[:1], 3, axis=0)
+        alpha = data[1]
+    else:
+        rgb = data[:3]
+        alpha = data[3] if data.shape[0] >= 4 else np.full((TILE_PX, TILE_PX), 255, dtype=np.uint8)
+    return np.concatenate((rgb, alpha[None, ...]), axis=0)
+
+
+def _average_2x2(rgba: np.ndarray) -> np.ndarray:
+    """Average a tile by two, excluding transparent pixels from RGB values."""
+    values = rgba.astype(np.float32)
+    top_left = values[:, 0::2, 0::2]
+    top_right = values[:, 0::2, 1::2]
+    bottom_left = values[:, 1::2, 0::2]
+    bottom_right = values[:, 1::2, 1::2]
+    weights = (top_left[3] + top_right[3] + bottom_left[3] + bottom_right[3]) / 255.0
+    weighted_rgb = (
+        top_left[:3] * top_left[3]
+        + top_right[:3] * top_right[3]
+        + bottom_left[:3] * bottom_left[3]
+        + bottom_right[:3] * bottom_right[3]
+    ) / 255.0
+
+    result = np.zeros((4, TILE_PX // 2, TILE_PX // 2), dtype=np.uint8)
+    rgb = np.zeros_like(weighted_rgb)
+    np.divide(weighted_rgb, weights[None, ...], out=rgb, where=weights[None, ...] > 0)
+    result[:3] = np.rint(rgb).astype(np.uint8)
+    result[3] = np.rint(weights * (255.0 / 4.0)).astype(np.uint8)
+    return result
+
+
+def _encode_rgba_tile(rgba: np.ndarray) -> bytes:
+    """Encode one derived overview tile as JPEG or transparent PNG."""
+    opaque = bool(np.all(rgba[3] == 255))
+    driver = "JPEG" if opaque else "PNG"
+    extension = ".jpg" if opaque else ".png"
+    data = rgba[:3] if opaque else rgba
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NotGeoreferencedWarning)
+        with MemoryFile(ext=extension) as memory:
+            with memory.open(
+                driver=driver,
+                width=TILE_PX,
+                height=TILE_PX,
+                count=data.shape[0],
+                dtype="uint8",
+            ) as destination:
+                destination.write(data)
+            return memory.read()
+
+
+def _build_sparse_overviews(
+    path: Path,
+    quoted_table: str,
+    addresses: list[tuple[int, int, int]],
+    payloads: list[bytes],
+    overview_factors: tuple[int, ...],
+) -> None:
+    """Build overview rows only for parents of populated child tiles.
+
+    GDAL's dataset-level overview builder has to inspect the whole raster
+    canvas, which is particularly expensive when the native tile set is
+    sparse. The tile matrix is a quadtree, so a two-to-one pass can derive the
+    same pyramid while touching only occupied child tiles. Transparent pixels
+    represent gaps and are excluded from the average.
+    """
+    if not overview_factors:
+        return
+
+    zoom = addresses[0][0]
+    current = {
+        (column, row): payload
+        for (_, column, row), payload in zip(addresses, payloads, strict=True)
+    }
+    insert_sql = (
+        f"INSERT INTO {quoted_table} "
+        "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)"
+    )
+    with sqlite3.connect(path) as connection:
+        for level, factor in enumerate(overview_factors, start=1):
+            expected_factor = 1 << level
+            if factor != expected_factor:
+                raise ValueError("Overview factors must be consecutive powers of two")
+            parents: dict[tuple[int, int], list[tuple[int, int, bytes]]] = {}
+            for (column, row), payload in current.items():
+                parents.setdefault((column // 2, row // 2), []).append((column, row, payload))
+
+            next_level: dict[tuple[int, int], bytes] = {}
+            for (parent_column, parent_row), children in sorted(parents.items()):
+                parent = np.zeros((4, TILE_PX, TILE_PX), dtype=np.uint8)
+                for column, row, payload in children:
+                    try:
+                        reduced = _average_2x2(_rgba_tile(payload))
+                    except Exception as error:
+                        raise ValueError(
+                            "Could not decode a tile while building overviews"
+                        ) from error
+                    left = (column & 1) * (TILE_PX // 2)
+                    top = (row & 1) * (TILE_PX // 2)
+                    parent[:, top : top + TILE_PX // 2, left : left + TILE_PX // 2] = reduced
+                encoded = _encode_rgba_tile(parent)
+                connection.execute(
+                    insert_sql,
+                    (zoom - level, parent_column, parent_row, sqlite3.Binary(encoded)),
+                )
+                next_level[(parent_column, parent_row)] = encoded
+            current = next_level
+        connection.commit()
+
+
 def _overall_metadata(
     tiles,
     selection: Mapping[str, object],
@@ -158,7 +289,7 @@ def _overall_metadata(
         "geopackage_zoom": geopackage_zoom,
         "tile_count": len(tiles),
         "selection": selection,
-        "overviews": {"resampling": "lanczos", "factors": overview_factors},
+        "overviews": {"resampling": "average", "factors": overview_factors},
     }
     return json.dumps(values, separators=(",", ":"), default=str)
 
@@ -333,11 +464,19 @@ def write_geopackage(
 
         # Build lower-resolution raster tile matrices from the unchanged native
         # tiles. This is local resampling only: no provider payloads are
-        # replaced, and no additional network requests are made.
+        # replaced, and no additional network requests are made. The sparse
+        # builder inserts only overview tiles with at least one populated child
+        # tile; GDAL's dataset-level builder would scan the entire canvas.
         if overview_factors:
+            _build_sparse_overviews(
+                temporary,
+                quoted_table,
+                addresses,
+                [tile.content for tile in tiles],
+                overview_factors,
+            )
             with rasterio.open(temporary, "r+") as dataset:
-                dataset.build_overviews(overview_factors, Resampling.lanczos)
-                dataset.update_tags(ns="rio_overview", resampling="lanczos")
+                dataset.update_tags(ns="rio_overview", resampling="average")
 
         # Reopen through GDAL before publishing the file. This catches schema,
         # georeferencing and driver-compatibility errors that SQLite alone does

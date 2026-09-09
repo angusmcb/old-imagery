@@ -477,7 +477,7 @@ def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> 
     assert metadata["provider"] == "google"
     assert metadata["native_zoom"] == ZOOM
     assert metadata["geopackage_zoom"] == ZOOM - 1
-    assert metadata["overviews"]["resampling"] == "lanczos"
+    assert metadata["overviews"]["resampling"] == "average"
     assert metadata["overviews"]["factors"]
     assert matrix == (1 << ZOOM, 1 << (ZOOM - 1))
     assert crs_wkt is not None and crs_wkt[0].startswith("GEODCRS[")
@@ -583,12 +583,53 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
     assert counts[source_zoom] == len(selected)
     assert 0 < counts[source_zoom - 1] <= counts[source_zoom]
     assert min(count for zoom, count in counts.items() if zoom < source_zoom) < counts[source_zoom]
+    expected_addresses = {
+        (
+            tile.column,
+            (1 << ZOOM) - 1 - tile.row - (1 << ZOOM) // 4,
+        )
+        for tile in selected
+    }
+    expected_counts = {source_zoom: len(expected_addresses)}
+    for overview_zoom in range(source_zoom - 1, min(counts) - 1, -1):
+        expected_addresses = {
+            (column // 2, row // 2) for column, row in expected_addresses
+        }
+        expected_counts[overview_zoom] = len(expected_addresses)
+    assert counts == expected_counts
     expected_payload = _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
     assert all(payload[0] == expected_payload for payload in source_payloads)
     with rasterio.io.MemoryFile(overview_payload) as memory, memory.open() as overview:
         assert overview.width == overview.height == 256
         assert overview.count == 4
         assert overview.read(4).min() == 0
+
+
+def test_geopackage_overview_sampling_averages_opaque_pixels_and_ignores_gaps() -> None:
+    from old_imagery._geopackage import _average_2x2, _encode_rgba_tile
+
+    rgba = np.zeros((4, 256, 256), dtype=np.uint8)
+    rgba[:3, 0:2, 0:2] = np.array(
+        [
+            [[10, 30], [50, 70]],
+            [[20, 40], [60, 80]],
+            [[30, 50], [70, 90]],
+        ],
+        dtype=np.uint8,
+    )
+    rgba[3, 0:2, 0:2] = 255
+    rgba[:3, 2:4, 2:4] = 255
+
+    overview = _average_2x2(rgba)
+
+    np.testing.assert_array_equal(overview[:, 0, 0], [40, 50, 60, 255])
+    np.testing.assert_array_equal(overview[:, 1, 1], [0, 0, 0, 0])
+
+    opaque = np.full((4, 256, 256), 255, dtype=np.uint8)
+    sparse = opaque.copy()
+    sparse[3, 0, 0] = 0
+    assert _encode_rgba_tile(opaque).startswith(b"\xff\xd8")
+    assert _encode_rgba_tile(sparse).startswith(b"\x89PNG")
 
 
 def test_download_geopackage_refuses_existing_output_before_downloading(stub, tmp_path) -> None:

@@ -355,8 +355,12 @@ download_geopackage(
 
 Writes a sparse OGC GeoPackage tile pyramid while preserving each JPEG or PNG
 provider payload byte-for-byte. Lower-resolution power-of-two overview tiles
-are generated locally with Lanczos resampling, so zoomed-out QGIS rendering
-does not need to repeatedly resample the native tiles:
+are generated locally with average resampling, so zoomed-out QGIS rendering
+does not need to repeatedly resample the native tiles. For sparse selections,
+an overview tile is written only when it has at least one populated child tile;
+empty gaps in the selected tile layout are left transparent and are not
+materialized as overview tiles. Fully opaque derived tiles use JPEG; tiles with
+transparent gaps use PNG:
 
 ```python
 path = old_imagery.download_geopackage(

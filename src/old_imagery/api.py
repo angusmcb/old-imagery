@@ -955,12 +955,15 @@ def download_geopackage(
     represented as complete CRS84 tiles and are rejected.
 
     The GeoPackage contains the requested native zoom plus locally generated,
-    power-of-two lower-resolution overview tiles using Lanczos resampling. The
-    source tile payloads remain byte-for-byte unchanged; overview tiles are
-    derived locally and are recorded in dataset metadata. Dataset- and
-    tile-level provenance is attached through GeoPackage's standard metadata
-    extension. The complete file is validated through GDAL and published
-    atomically; an error does not leave a partial destination behind.
+    power-of-two lower-resolution overview tiles using average resampling. Only
+    overview tiles with populated native descendants are generated, so sparse
+    selections do not require scanning or storing the empty parts of their
+    bounding canvas. The source tile payloads remain byte-for-byte unchanged;
+    overview tiles are derived locally and are recorded in dataset metadata.
+    Dataset- and tile-level provenance is attached through GeoPackage's
+    standard metadata extension. The complete file is validated through GDAL
+    and published atomically; an error does not leave a partial destination
+    behind.
 
     Parameters other than ``output``, ``table_name`` and ``overwrite`` have the
     same selection meaning as :func:`download_tiles`. Existing outputs are
