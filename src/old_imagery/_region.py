@@ -13,7 +13,7 @@ from collections.abc import Iterable, Sequence
 from typing import Protocol, TypeVar
 
 from affine import Affine
-from shapely.geometry import box
+from shapely.geometry import MultiPolygon, box
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 from shapely.prepared import prep
@@ -87,21 +87,33 @@ def _clamp_index(value: float, n: int) -> int:
     return min(max(int(value), 0), n - 1)
 
 
-def _select(tile_factory, rows: range, cols: range, aoi: BaseGeometry, level: int, max_tiles: int):
-    count = len(rows) * len(cols)
-    if count > max_tiles:
-        raise ValueError(
-            f"The area of interest spans {count:,} tiles at zoom {level}, above the limit "
-            f"of {max_tiles:,}. Use a lower zoom or a smaller area, or raise max_tiles."
-        )
+def _select(tile_factory, ranges, aoi: BaseGeometry, level: int, max_tiles: int):
+    """Select unique intersecting tiles from component-sized row/column ranges."""
     prepared = prep(aoi)
     out = []
-    for row in rows:
-        for col in cols:
-            tile = tile_factory(row, col, level)
-            if prepared.intersects(box(*tile.bounds_wgs84)):
-                out.append(tile)
-    return out
+    selected = set()
+    for rows, cols in ranges:
+        for row in rows:
+            for col in cols:
+                address = row, col
+                if address in selected:
+                    continue
+                tile = tile_factory(row, col, level)
+                if prepared.intersects(box(*tile.bounds_wgs84)):
+                    selected.add(address)
+                    out.append(tile)
+                    if len(out) > max_tiles:
+                        raise ValueError(
+                            f"The area of interest selects more than {max_tiles:,} tiles "
+                            f"at zoom {level}. Use a lower zoom or a smaller area, or raise "
+                            "max_tiles."
+                        )
+    return sorted(out, key=lambda tile: (tile.row, tile.column))
+
+
+def _polygon_parts(aoi: BaseGeometry) -> Iterable[BaseGeometry]:
+    """Yield a Polygon directly, or the components of a MultiPolygon."""
+    return aoi.geoms if isinstance(aoi, MultiPolygon) else (aoi,)
 
 
 # --------------------------------------------------------------------------
@@ -124,14 +136,16 @@ class KeyholeGrid:
 
     def tiles(self, aoi: BaseGeometry, level: int, max_tiles: int = MAX_TILES) -> list[KeyholeTile]:
         n = validate_level(level)
-        minx, miny, maxx, maxy = aoi.bounds
 
         def index(deg: float) -> int:
             return _clamp_index((deg + 180.0) / 360.0 * n, n)
 
-        rows = range(index(miny), index(maxy) + 1)
-        cols = range(index(minx), index(maxx) + 1)
-        return _select(KeyholeTile.from_row_col, rows, cols, aoi, level, max_tiles)
+        def ranges():
+            for part in _polygon_parts(aoi):
+                minx, miny, maxx, maxy = part.bounds
+                yield range(index(miny), index(maxy) + 1), range(index(minx), index(maxx) + 1)
+
+        return _select(KeyholeTile.from_row_col, ranges(), aoi, level, max_tiles)
 
     def pixel_bounds(self, aoi: BaseGeometry, level: int) -> tuple[int, int, int, int]:
         size = TILE_PX * (1 << level)
@@ -224,16 +238,21 @@ class MercatorGrid:
         if not (0 <= level <= self.max_level):
             raise ValueError(f"zoom must be in [0, {self.max_level}] for Esri Wayback")
         n = 1 << level
-        minx, miny, maxx, maxy = aoi.bounds
-        cols = range(
-            _clamp_index((minx + 180.0) / 360.0 * n, n),
-            _clamp_index((maxx + 180.0) / 360.0 * n, n) + 1,
-        )
-        rows = range(
-            _clamp_index(_lat_to_mercator(maxy) * n, n),
-            _clamp_index(_lat_to_mercator(miny) * n, n) + 1,
-        )
-        return _select(MercatorTile, rows, cols, aoi, level, max_tiles)
+
+        def ranges():
+            for part in _polygon_parts(aoi):
+                minx, miny, maxx, maxy = part.bounds
+                cols = range(
+                    _clamp_index((minx + 180.0) / 360.0 * n, n),
+                    _clamp_index((maxx + 180.0) / 360.0 * n, n) + 1,
+                )
+                rows = range(
+                    _clamp_index(_lat_to_mercator(maxy) * n, n),
+                    _clamp_index(_lat_to_mercator(miny) * n, n) + 1,
+                )
+                yield rows, cols
+
+        return _select(MercatorTile, ranges(), aoi, level, max_tiles)
 
     def pixel_bounds(self, aoi: BaseGeometry, level: int) -> tuple[int, int, int, int]:
         size = TILE_PX * (1 << level)

@@ -6,7 +6,7 @@ import datetime as dt
 from dataclasses import dataclass
 
 import pytest
-from shapely.geometry import Point, box
+from shapely.geometry import MultiPolygon, Point, box
 
 from old_imagery._keyhole import KeyholeTile
 from old_imagery._region import (
@@ -124,8 +124,29 @@ def test_tile_count_grows_fourfold_per_level(grid) -> None:
 
 @pytest.mark.parametrize("grid", [KeyholeGrid(), MercatorGrid()])
 def test_max_tiles_is_enforced(grid) -> None:
-    with pytest.raises(ValueError, match="above the limit"):
+    with pytest.raises(ValueError, match="selects more than"):
         grid.tiles(box(-30, -30, 30, 30), 14, max_tiles=100)
+
+
+@pytest.mark.parametrize("grid", [KeyholeGrid(), MercatorGrid()])
+def test_sparse_multipolygon_limit_counts_selected_tiles_not_envelope(grid) -> None:
+    zoom = 12
+
+    def tile_interior(longitude: float):
+        west, south, east, north = grid.tile_at_point(longitude, 0.0, zoom).bounds_wgs84
+        dx = (east - west) / 4
+        dy = (north - south) / 4
+        return box(west + dx, south + dy, east - dx, north - dy)
+
+    sparse = MultiPolygon([tile_interior(-120.0), tile_interior(120.0)])
+    tiles = grid.tiles(sparse, zoom, max_tiles=2)
+
+    assert len(tiles) == 2
+    assert [(tile.row, tile.column) for tile in tiles] == sorted(
+        (tile.row, tile.column) for tile in tiles
+    )
+    with pytest.raises(ValueError, match="selects more than 1 tile"):
+        grid.tiles(sparse, zoom, max_tiles=1)
 
 
 def test_a_point_selects_a_single_tile() -> None:
