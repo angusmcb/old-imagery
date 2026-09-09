@@ -154,7 +154,7 @@ def test_esri_mosaic_as_of_resolves_a_different_date_per_zoom() -> None:
     gdf = old_imagery.esri_mosaic_as_of(small, [13, 19], "2020-06-01")
 
     assert sorted(gdf["zoom"].unique()) == [13, 19]
-    by_zoom = {z: set(g["date"]) for z, g in gdf.groupby("zoom")}
+    by_zoom = {z: set(g["capture_date"]) for z, g in gdf.groupby("zoom")}
     assert by_zoom[13] != by_zoom[19], (
         "this AOI is known to show different capture dates at zoom 13 and 19; "
         "if Esri has recomposed the release, pick another area rather than "
@@ -165,7 +165,7 @@ def test_esri_mosaic_as_of_resolves_a_different_date_per_zoom() -> None:
 def test_esri_mosaic_as_of_agrees_with_the_downloaded_pixels() -> None:
     small = box(-122.404, 37.792, -122.396, 37.798)
     gdf = old_imagery.esri_mosaic_as_of(small, 18, "2020-06-01")
-    mapped = set(gdf["date"])
+    mapped = set(gdf["capture_date"])
 
     with old_imagery.download(
         small, zoom=18, provider="esri", esri_wayback_release_id=gdf.attrs["release_id"]
@@ -218,7 +218,7 @@ def test_release_download_beats_capture_date_across_a_seam() -> None:
 
     # The same area asked for by capture date loses everything flown otherwise.
     with old_imagery.download(
-        seam, 18, provider="esri", date=gdf["date"].iloc[0], date_match="exact"
+        seam, 18, provider="esri", date=gdf["capture_date"].iloc[0], date_match="exact"
     ) as src:
         capture_tags = src.tags()
     assert int(capture_tags["tiles_missing"]) > 0

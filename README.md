@@ -179,8 +179,8 @@ capture footprints, not from probing tiles:
 
 ```python
 seams = old_imagery.esri_mosaic_as_of(aoi, zoom=18, as_of="2020-06-01")
-print(seams[["zoom", "date", "area_fraction", "release_id"]])
-#    zoom        date  area_fraction   release_id
+print(seams[["zoom", "capture_date", "area_fraction", "release_id"]])
+#    zoom  capture_date  area_fraction   release_id
 # 0    18  2016-04-02          0.617  WB_2020_R05
 # 1    18  2010-10-26          0.383  WB_2020_R05
 ```
@@ -188,7 +188,7 @@ print(seams[["zoom", "date", "area_fraction", "release_id"]])
 | column | meaning |
 | --- | --- |
 | `zoom` | the zoom this row was resolved at |
-| `date` | **capture date** of the imagery displayed here |
+| `capture_date` | **capture date** of the imagery displayed here, as a pandas datetime column |
 | `area_fraction` | this row's share of the AOI, as a planar area ratio in EPSG:3857 |
 | `release_id` | stable identifier of the resolved release, e.g. `WB_2026_R03` |
 | `source_provider`, `source_description` | Esri's imagery source name and description |

@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, box
@@ -1172,7 +1173,8 @@ def test_mosaic_returns_one_row_per_zoom_and_date(stub) -> None:
 
     assert list(gdf.columns) == api.ESRI_MOSAIC_COLUMNS
     assert gdf.crs == "EPSG:4326"
-    assert list(gdf["date"]) == [D2, D1]  # newest first within a zoom
+    assert list(gdf["capture_date"]) == [pd.Timestamp(D2), pd.Timestamp(D1)]  # newest first within a zoom
+    assert str(gdf["capture_date"].dtype) == "datetime64[ns]"
     assert set(gdf["zoom"]) == {18}
     assert (gdf["release_id"] == "WB_2014_R01").all()
 
@@ -1249,7 +1251,7 @@ def test_mosaic_reports_a_different_date_per_zoom(stub) -> None:
     gdf = old_imagery.esri_mosaic_as_of(AOI, [19, 13], RELEASE_DATE)
 
     assert list(gdf["zoom"]) == [13, 19]  # sorted ascending
-    assert list(gdf["date"]) == [D2, D1]
+    assert list(gdf["capture_date"]) == [pd.Timestamp(D2), pd.Timestamp(D1)]
     assert sorted(backend.asked_zooms) == [13, 19]
     assert gdf.attrs["zooms"] == [13, 19]
 

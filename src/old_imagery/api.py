@@ -99,7 +99,7 @@ AVAILABILITY_COLUMNS = [
 _COMPLETE_TOLERANCE = 1e-9
 ESRI_MOSAIC_COLUMNS = [
     "zoom",
-    "date",
+    "capture_date",
     "area_fraction",
     "release_id",
     "source_provider",
@@ -551,7 +551,7 @@ def esri_mosaic_as_of(
 
         ``zoom``
             The zoom the row was resolved at.
-        ``date``
+        ``capture_date``
             The **capture date** of the imagery displayed in this area.
         ``area_fraction``
             This row's share of the AOI, as a planar area ratio computed in
@@ -645,7 +645,7 @@ def esri_mosaic_as_of(
     rows = [
         {
             "zoom": z,
-            "date": date,
+            "capture_date": date,
             "area_fraction": fraction,
             "release_id": layer.identifier,
             "source_provider": source.provider,
@@ -664,6 +664,9 @@ def esri_mosaic_as_of(
         columns=ESRI_MOSAIC_COLUMNS,
         geometry="geometry",
         crs=WGS84,
+    )
+    gdf["capture_date"] = pd.Series(
+        pd.to_datetime(gdf["capture_date"]), index=gdf.index, dtype="datetime64[ns]"
     )
     gdf.attrs.update(
         release_id=layer.identifier,
