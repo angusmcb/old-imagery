@@ -1142,7 +1142,7 @@ class MosaicBackend:
         self.asked_identifier = identifier
         return self.release
 
-    def release_footprints(self, layer, aoi, zoom, *, max_footprints=500):
+    def release_footprints(self, layer, aoi, zoom, *, max_footprints=1_000):
         with self._lock:
             self._in_flight += 1
             self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
@@ -1341,6 +1341,12 @@ def test_mosaic_passes_max_footprints_through(stub) -> None:
     backend = stub(MosaicBackend({18: [(D1, AOI)]}))
     old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE, max_footprints=7)
     assert backend.seen_max_footprints == [7]
+
+
+def test_mosaic_default_max_footprints_is_1000(stub) -> None:
+    backend = stub(MosaicBackend({18: [(D1, AOI)]}))
+    old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+    assert backend.seen_max_footprints == [1_000]
 
 
 def test_mosaic_propagates_a_refused_partial_answer(stub) -> None:

@@ -165,7 +165,7 @@ esri_mosaic_as_of(
     as_of: date | str,
     *,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_footprints: int = 500,
+    max_footprints: int = 1_000,
 ) -> geopandas.GeoDataFrame
 ```
 
@@ -220,6 +220,11 @@ Zooms of 10 and below all resolve to the same metadata layer and so return
 identical geometry. Cost scales with the number of capture footprints, not the
 number of tiles — which is why the guard is `max_footprints` and there is no
 `max_tiles`.
+
+The AOI's actual polygon rings are used for Esri metadata discovery, so sparse
+multipart areas do not fetch every footprint in their bounding box. Very large
+multipart request bodies are split between independent polygon components and
+their matching footprint IDs are deduplicated.
 
 Unlike `availability`, this refuses partial answers: if Esri's metadata service
 returns an incomplete feature list, it raises `RequestFailed` rather than

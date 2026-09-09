@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from shapely.geometry import box
+from shapely.geometry import LinearRing, MultiPolygon, Polygon, box
 
 from old_imagery import RequestFailed
 from old_imagery._esri import (
@@ -349,6 +349,7 @@ class RegionClient:
     def __init__(self, per_layer):
         self.per_layer = per_layer  # {layer_id: [(date, oid), ...]}
         self.date_queries: list[int] = []
+        self.id_requests: list[dict[str, str]] = []
         self.attribute_requests: list[tuple[int, tuple[int, ...]]] = []
         # Every (layer, oid) pair asked for, regardless of how they were grouped.
         self.geometry_queries: list[tuple[int, int]] = []
@@ -376,6 +377,7 @@ class RegionClient:
         rows = self.per_layer.get(layer_id, [])
         if data.get("returnIdsOnly") == "true":
             self.date_queries.append(layer_id)
+            self.id_requests.append(dict(data))
             return json.dumps({"objectIds": [oid for _date, oid in rows]}).encode()
 
         oids = tuple(int(token) for token in data["objectIds"].split(","))
@@ -557,17 +559,55 @@ def test_fetch_geometries_drops_only_the_failing_batch() -> None:
 def test_query_layer_reports_complete_on_a_normal_result() -> None:
     layers = [_layer(1, "2014-02-20")]
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
     assert rows == [(CAPTURE, 11)]
     assert complete is True
     assert client.post_ages == [_METADATA_MAX_AGE, _METADATA_MAX_AGE]
+
+
+def test_query_layer_sends_the_exact_polygon_with_esri_ring_orientation() -> None:
+    layers = [_layer(1, "2014-02-20")]
+    polygon = Polygon(
+        [(-122.4, 37.79), (-122.39, 37.79), (-122.39, 37.80), (-122.4, 37.80)],
+        holes=[
+            [(-122.398, 37.792), (-122.392, 37.792), (-122.392, 37.798), (-122.398, 37.798)]
+        ],
+    )
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+
+    wb._query_layer(layers[0], polygon, 17)
+
+    request = client.id_requests[0]
+    geometry = json.loads(request["geometry"])
+    assert request["geometryType"] == "esriGeometryPolygon"
+    assert len(geometry["rings"]) == 2
+    assert LinearRing(geometry["rings"][0]).is_ccw is False
+    assert LinearRing(geometry["rings"][1]).is_ccw is True
+
+
+def test_query_layer_splits_large_multipart_queries_and_deduplicates_ids(
+    monkeypatch,
+) -> None:
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    sparse = MultiPolygon([box(-122.4, 37.79, -122.39, 37.80), box(10, 10, 11, 11)])
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    monkeypatch.setattr(_esri, "_QUERY_GEOMETRY_MAX_BYTES", 1)
+
+    rows, complete = wb._query_layer(layers[0], sparse, 17)
+
+    assert rows == [(CAPTURE, 11)]
+    assert complete is True
+    assert len(client.id_requests) == 2
+    assert client.attribute_requests == [(1, (11,))]
 
 
 def test_query_layer_reports_complete_on_a_genuinely_empty_result() -> None:
     """No features and no error means the release publishes nothing here."""
     layers = [_layer(1, "2014-02-20")]
     wb, _ = _wayback_with(layers, {1: []})
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
     assert rows == []
     assert complete is True
 
@@ -580,7 +620,7 @@ def test_query_layer_reports_incomplete_when_the_request_fails() -> None:
         raise RequestFailed("service down")
 
     client.post = broken
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
     assert rows == []
     assert complete is False
 
@@ -593,7 +633,7 @@ def test_query_layer_reports_incomplete_on_an_error_payload() -> None:
         return json.dumps({"error": {"code": 500, "message": "boom"}}).encode()
 
     client.post = errored
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
     assert rows == []
     assert complete is False
 
@@ -607,7 +647,7 @@ def test_query_layer_has_no_artificial_feature_limit() -> None:
     wb, client = _wayback_with(
         layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]}
     )
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
 
     assert complete is True
     assert len(rows) == count
@@ -638,7 +678,7 @@ def test_query_layer_splits_a_truncated_attribute_batch() -> None:
         return json.dumps(payload).encode()
 
     client.post = limited
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
 
     assert complete is True
     assert len(rows) == count
@@ -656,7 +696,7 @@ def test_query_layer_reports_incomplete_when_one_record_cannot_be_fetched() -> N
         return json.dumps({"features": [], "exceededTransferLimit": True}).encode()
 
     client.post = truncated
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
 
     assert rows == []
     assert complete is False
@@ -676,7 +716,7 @@ def test_query_layer_reports_incomplete_on_duplicate_attribute_records() -> None
         return json.dumps(payload).encode()
 
     client.post = duplicated
-    rows, complete = wb._query_layer(layers[0], {}, 17)
+    rows, complete = wb._query_layer(layers[0], AOI, 17)
 
     assert rows == []
     assert complete is False

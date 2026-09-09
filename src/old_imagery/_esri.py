@@ -40,6 +40,12 @@ _DATE_IN_TITLE = re.compile(r"\(Wayback (\d{4}-\d{2}-\d{2})\)")
 # responses, but documents returnIdsOnly responses as unlimited.  Discover all
 # matching IDs first, then keep each attribute response comfortably bounded.
 _ATTRIBUTE_BATCH = 1_000
+# Keep multipart polygon query bodies bounded.  A single component may exceed
+# this and is still sent whole; splitting it without changing its footprint
+# would require clipping against an artificial grid.  MultiPolygon components,
+# on the other hand, can be divided into independent queries and their IDs
+# safely unioned.
+_QUERY_GEOMETRY_MAX_BYTES = 256_000
 # How many OBJECTIDs to ask for in one geometry request.  Footprints are large,
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
@@ -451,10 +457,11 @@ class WayBack:
         Returns source-attributed capture footprints. The capture date and
         Wayback release title remain distinct pieces of provenance.
 
-        One query per Wayback release against the metadata feature service,
-        rather than probing every release for every tile.  The returned geometry
-        is the true capture footprint rather than a tile-quantised
-        approximation.
+        One logical query per Wayback release against the metadata feature
+        service, rather than probing every release for every tile. Very large
+        multipart AOIs may split that query by independent polygon component.
+        The returned geometry is the true capture footprint rather than a
+        tile-quantised approximation.
 
         Pass the AOI's ``tiles`` to let :meth:`candidate_releases` cut the
         release list down first, which on a small area replaces most of ~195
@@ -477,13 +484,13 @@ class WayBack:
         if not layers:
             return []
 
-        envelope = _envelope_3857(aoi)
         cancel_after: list[_dt.date | None] = [None]
         results: list[EsriFootprint] = []
         lock = threading.Lock()
 
-        # Phase 1: which capture dates does each release expose here? Cheap,
-        # geometry-free, one request per release.
+        # Phase 1: which capture dates does each release expose here? Cheap and
+        # geometry-free; normally one request per release, with large multipart
+        # query bodies split by independent AOI component.
         wanted: list[tuple[Layer, _dt.date, int]] = []
 
         def query(layer: Layer) -> bool:
@@ -494,7 +501,7 @@ class WayBack:
 
             # Partial results are accepted here on purpose: availability over a
             # flaky archive degrades to "less found" rather than raising.
-            found, _complete = self._query_layer(layer, envelope, zoom)
+            found, _complete = self._query_layer(layer, aoi, zoom)
             if not found:
                 return _complete
 
@@ -579,7 +586,7 @@ class WayBack:
 
     # -- one exact release ------------------------------------------------
     def release_footprints(
-        self, layer: Layer, aoi, zoom: int, *, max_footprints: int = 500
+        self, layer: Layer, aoi, zoom: int, *, max_footprints: int = 1_000
     ) -> list[EsriFootprint]:
         """Capture footprints displayed by one exact release at one zoom.
 
@@ -596,8 +603,7 @@ class WayBack:
         truncated feature list would produce holes indistinguishable from ground
         the release genuinely does not cover.
         """
-        envelope = _envelope_3857(aoi)
-        object_ids, complete = self._query_object_ids(layer, envelope, zoom)
+        object_ids, complete = self._query_object_ids(layer, aoi, zoom)
         if not complete:
             raise RequestFailed(
                 f"The Esri metadata service did not return a complete feature "
@@ -617,7 +623,7 @@ class WayBack:
         return self._fetch_geometries(layer, zoom, object_ids)
 
     def _query_layer(
-        self, layer: Layer, envelope: dict, zoom: int
+        self, layer: Layer, aoi, zoom: int
     ) -> tuple[list[tuple[_dt.date, int]], bool]:
         """Return ``([(capture_date, object_id), ...], complete)`` for one release.
 
@@ -628,9 +634,9 @@ class WayBack:
         :meth:`_fetch_geometries` instead.
 
         Esri limits feature responses but not ``returnIdsOnly`` responses.  The
-        matching IDs are therefore discovered in one request and their capture
-        dates fetched in bounded batches, rather than walking an open-ended
-        sequence of offsets.
+        matching IDs are therefore discovered with size-bounded exact-polygon
+        requests and their capture dates fetched in bounded batches, rather
+        than walking an open-ended sequence of offsets.
 
         ``complete`` is False when either ID discovery or an attribute batch is
         failed, malformed, or truncated.  Callers that build a map of what is
@@ -638,7 +644,7 @@ class WayBack:
         :meth:`dated_regions` accepts partial results on purpose, while
         :meth:`release_footprints` refuses them.
         """
-        object_ids, complete = self._query_object_ids(layer, envelope, zoom)
+        object_ids, complete = self._query_object_ids(layer, aoi, zoom)
         if not object_ids:
             return [], complete
 
@@ -652,42 +658,42 @@ class WayBack:
         return out, complete
 
     def _query_object_ids(
-        self, layer: Layer, envelope: dict, zoom: int
+        self, layer: Layer, aoi, zoom: int
     ) -> tuple[list[int], bool]:
-        """Return every matching OBJECTID and whether Esri's answer was complete."""
+        """Return IDs intersecting the exact AOI and whether every query completed."""
         url = layer.metadata_query_url(zoom)
-        form = {
-            "f": "json",
-            "spatialRel": "esriSpatialRelIntersects",
-            "geometryType": "esriGeometryEnvelope",
-            "inSR": "3857",
-            "geometry": json.dumps(envelope),
-            "returnGeometry": "false",
-            "returnIdsOnly": "true",
-        }
-        try:
-            payload = json.loads(self._client.post(url, form, max_age=_METADATA_MAX_AGE))
-        except (RequestFailed, OSError, ValueError):
-            return [], False
-        if "error" in payload or "objectIds" not in payload:
-            return [], False
+        object_ids: set[int] = set()
+        for geometry in _polygon_queries_3857(aoi):
+            form = {
+                "f": "json",
+                "spatialRel": "esriSpatialRelIntersects",
+                "geometryType": "esriGeometryPolygon",
+                "inSR": "3857",
+                "geometry": geometry,
+                "returnGeometry": "false",
+                "returnIdsOnly": "true",
+            }
+            try:
+                payload = json.loads(
+                    self._client.post(url, form, max_age=_METADATA_MAX_AGE)
+                )
+            except (RequestFailed, OSError, ValueError):
+                return sorted(object_ids), False
+            if "error" in payload or "objectIds" not in payload:
+                return sorted(object_ids), False
 
-        raw_ids = payload.get("objectIds")
-        if raw_ids is None:
-            raw_ids = []
-        if not isinstance(raw_ids, list):
-            return [], False
-        try:
-            object_ids = [int(oid) for oid in raw_ids]
-        except (TypeError, ValueError):
-            return [], False
-
-        unique_ids = sorted(set(object_ids))
-        # Treat repeated IDs like the old offset implementation did: collapse
-        # them before downstream geometry work.  They do not make the set of
-        # matching features incomplete.
-        complete = not payload.get("exceededTransferLimit", False)
-        return unique_ids, complete
+            raw_ids = payload.get("objectIds")
+            if raw_ids is None:
+                raw_ids = []
+            if not isinstance(raw_ids, list):
+                return sorted(object_ids), False
+            try:
+                object_ids.update(int(oid) for oid in raw_ids)
+            except (TypeError, ValueError):
+                return sorted(object_ids), False
+            if payload.get("exceededTransferLimit", False):
+                return sorted(object_ids), False
+        return sorted(object_ids), True
 
     def _fetch_attribute_batch(
         self, layer: Layer, zoom: int, object_ids: Sequence[int]
@@ -847,27 +853,64 @@ def _query_string(params: dict[str, str]) -> str:
     return urlencode(params)
 
 
-def _envelope_3857(aoi) -> dict:
-    """The AOI's bounding box in Web Mercator, as an Esri envelope.
+def _polygon_queries_3857(aoi) -> list[str]:
+    """Encode an AOI as size-bounded Esri JSON multipart polygon queries.
 
-    A bounding box is deliberately used rather than the AOI's own rings: it is
-    only a server-side prefilter, and the exact clip happens locally with
-    shapely.  That sidesteps Esri's orientation-based ring/hole encoding, which
-    is easy to get subtly wrong when translating from a shapely geometry.
+    Esri expects clockwise exterior rings and counter-clockwise holes.  Each
+    polygon and its holes stay in the same request; independent components may
+    be split across requests, whose returned OBJECTIDs are unioned by the
+    caller.  This keeps a sparse AOI sparse instead of expanding it to one vast
+    bounding envelope.
     """
     from pyproj import Transformer
+    from shapely import make_valid
+    from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+    from shapely.geometry.polygon import orient
+    from shapely.ops import transform
 
-    minx, miny, maxx, maxy = aoi.bounds
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    x0, y0 = transformer.transform(minx, miny)
-    x1, y1 = transformer.transform(maxx, maxy)
-    return {
-        "xmin": x0,
-        "ymin": y0,
-        "xmax": x1,
-        "ymax": y1,
-        "spatialReference": {"wkid": 3857},
-    }
+    projected = make_valid(transform(transformer.transform, aoi))
+
+    def polygons(geometry):
+        if isinstance(geometry, Polygon):
+            yield geometry
+        elif isinstance(geometry, (MultiPolygon, GeometryCollection)):
+            for part in geometry.geoms:
+                yield from polygons(part)
+
+    # Store each polygon's exterior and holes as one atomic group so chunking
+    # cannot separate a hole from the exterior ring that gives it meaning.
+    encoded_parts: list[list[str]] = []
+    for polygon in polygons(projected):
+        oriented = orient(polygon, sign=-1.0)
+        rings = [oriented.exterior, *oriented.interiors]
+        encoded_parts.append(
+            [
+                json.dumps(list(ring.coords), separators=(",", ":"))
+                for ring in rings
+            ]
+        )
+
+    prefix = '{"rings":['
+    suffix = '],"spatialReference":{"wkid":3857}}'
+
+    def encoded_size(rings: Sequence[str]) -> int:
+        return len(prefix) + sum(map(len, rings)) + max(0, len(rings) - 1) + len(suffix)
+
+    queries: list[str] = []
+    current: list[str] = []
+    for part in encoded_parts:
+        candidate = current + part
+        if current and encoded_size(candidate) > _QUERY_GEOMETRY_MAX_BYTES:
+            queries.append(prefix + ",".join(current) + suffix)
+            current = list(part)
+        else:
+            current = candidate
+    if current:
+        queries.append(prefix + ",".join(current) + suffix)
+    if not queries:
+        raise ValueError("The area of interest has no polygonal components")
+    return queries
 
 
 def _rows_to_dated_geometries(frame) -> list[EsriFootprint]:

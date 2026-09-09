@@ -259,7 +259,7 @@ def test_region_narrowing_gives_the_same_answer_as_querying_every_release() -> N
 
 def test_candidate_releases_finds_the_same_dates_as_the_whole_catalogue() -> None:
     """The property the narrowing rests on, checked against the live service."""
-    from old_imagery._esri import WayBack, _envelope_3857
+    from old_imagery._esri import WayBack
     from old_imagery._http import CachedHttpClient
     from old_imagery._region import MercatorGrid
 
@@ -267,11 +267,10 @@ def test_candidate_releases_finds_the_same_dates_as_the_whole_catalogue() -> Non
     tiles = MercatorGrid().tiles(small, 17, 10_000)
     with CachedHttpClient() as client:
         wb = WayBack(client)
-        env = _envelope_3857(small)
         candidates = wb.candidate_releases(tiles)
         assert 0 < len(candidates) < len(wb.layers)
 
         def dates(layers):
-            return {d for layer in layers for d, _oid in wb._query_layer(layer, env, 17)[0]}
+            return {d for layer in layers for d, _oid in wb._query_layer(layer, small, 17)[0]}
 
         assert dates(candidates) == dates(wb.layers)

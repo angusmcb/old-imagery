@@ -509,7 +509,7 @@ def esri_mosaic_as_of(
     as_of: DateLike | str,
     *,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
-    max_footprints: int = 500,
+    max_footprints: int = 1_000,
 ) -> gpd.GeoDataFrame:
     """Map what one Esri Wayback snapshot displays, and where each piece came from.
 
@@ -540,7 +540,7 @@ def esri_mosaic_as_of(
         On-disk response cache. Pass ``None`` to disable caching.
     max_footprints : int
         Reject areas where the release publishes more capture footprints than
-        this at some zoom. Default 500. Footprint count, not tile count, is what
+        this at some zoom. Default 1,000. Footprint count, not tile count, is what
         this call costs.
 
     Returns
