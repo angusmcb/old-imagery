@@ -17,6 +17,7 @@ from old_imagery._esri import (
     _TILEMAP_MAX_AGE,
     WayBack,
     _parse_capabilities,
+    _rows_to_dated_geometries,
 )
 from old_imagery._region import MercatorTile
 
@@ -744,6 +745,25 @@ def test_release_footprints_returns_dated_footprints_for_one_release() -> None:
     # Only the release we asked for was touched; this is not a catalogue search.
     assert client.date_queries == [1]
     assert [layer_id for layer_id, _oids in client.geometry_requests] == [1]
+
+
+def test_repaired_footprints_keep_only_polygonal_components() -> None:
+    import geopandas as gpd
+
+    # make_valid repairs the spike as GeometryCollection(Polygon, LineString).
+    spiked = Polygon([(0, 0), (2, 0), (2, 2), (1, 2), (1, 3), (1, 2), (0, 2), (0, 0)])
+    collapsed = Polygon([(0, 0), (1, 0), (2, 0), (0, 0)])
+    frame = gpd.GeoDataFrame(
+        {"SRC_DATE2": [CAPTURE.isoformat(), CAPTURE.isoformat()]},
+        geometry=[spiked, collapsed],
+        crs="EPSG:4326",
+    )
+
+    rows = _rows_to_dated_geometries(frame)
+
+    assert len(rows) == 1
+    assert rows[0].geometry.geom_type == "Polygon"
+    assert rows[0].geometry.area == pytest.approx(4.0)
 
 
 def test_release_footprints_asks_the_metadata_layer_for_the_given_zoom() -> None:

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from ._concurrency import adaptive_metadata_map, workers_for
 from ._http import CachedHttpClient, RequestFailed
-from ._region import MERCATOR_EQUATOR, TILE_PX, MercatorGrid, MercatorTile
+from ._region import MERCATOR_EQUATOR, TILE_PX, MercatorGrid, MercatorTile, _polygonal_only
 
 WMTS_CAPABILITIES = (
     "https://wayback.maptiles.arcgis.com/arcgis/rest/services/world_imagery/"
@@ -915,8 +915,6 @@ def _polygon_queries_3857(aoi) -> list[str]:
 
 def _rows_to_dated_geometries(frame) -> list[EsriFootprint]:
     """Convert queried features to source-attributed EPSG:4326 footprints."""
-    from shapely import make_valid
-
     if frame.crs is not None:
         frame = frame.to_crs("EPSG:4326")
 
@@ -929,11 +927,11 @@ def _rows_to_dated_geometries(frame) -> list[EsriFootprint]:
         date = _coerce_date(date_value)
         if date is None:
             continue
-        if not geom.is_valid:
-            # Capture footprints are routinely self-intersecting.
-            geom = make_valid(geom)
-            if geom.is_empty:
-                continue
+        # Capture footprints are routinely self-intersecting. Repair them, but
+        # discard collapsed line/point remnants: a footprint must have area.
+        geom = _polygonal_only(geom)
+        if geom is None:
+            continue
         out.append(
             EsriFootprint(
                 date=date,

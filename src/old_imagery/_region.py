@@ -13,7 +13,8 @@ from collections.abc import Iterable, Sequence
 from typing import Protocol, TypeVar
 
 from affine import Affine
-from shapely.geometry import MultiPolygon, box
+from shapely import make_valid
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 from shapely.prepared import prep
@@ -29,6 +30,39 @@ MERCATOR_EQUATOR = 40075016.68557849
 MERCATOR_MAX_LAT = 85.051128779806589
 
 _G = TypeVar("_G", bound=BaseGeometry)
+
+
+def _polygonal_only(geometry: BaseGeometry | None) -> Polygon | MultiPolygon | None:
+    """Repair a geometry and retain only its positive-area polygonal parts.
+
+    ``make_valid`` may preserve collapsed lines and points alongside repaired
+    polygons.  Those lower-dimensional remnants are useful in a general
+    geometry repair, but they are not meaningful as imagery footprints.
+    """
+    if geometry is None or geometry.is_empty:
+        return None
+    if not geometry.is_valid:
+        geometry = make_valid(geometry)
+
+    polygons: list[Polygon] = []
+
+    def collect(value: BaseGeometry) -> None:
+        if value.is_empty:
+            return
+        if isinstance(value, Polygon):
+            polygons.append(value)
+        elif isinstance(value, (MultiPolygon, GeometryCollection)):
+            for part in value.geoms:
+                collect(part)
+
+    collect(geometry)
+    if not polygons:
+        return None
+
+    result = unary_union(polygons)
+    if isinstance(result, (Polygon, MultiPolygon)) and not result.is_empty and result.area > 0.0:
+        return result
+    return None
 
 
 def normalize_aoi(geometry: _G) -> _G:

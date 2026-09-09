@@ -8,12 +8,14 @@ import json
 import sqlite3
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import pytest
 import rasterio
+from rasterio.errors import NotGeoreferencedWarning
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, box
 
 import old_imagery
@@ -64,7 +66,8 @@ class StubBackend:
 def _encode_jpeg(arr: np.ndarray) -> bytes:
     from rasterio.io import MemoryFile
 
-    with MemoryFile(ext=".jpg") as mem:
+    with MemoryFile(ext=".jpg") as mem, api._BARE_TILE_WARNING_LOCK, warnings.catch_warnings():
+        warnings.simplefilter("ignore", NotGeoreferencedWarning)
         with mem.open(
             driver="JPEG", width=arr.shape[2], height=arr.shape[1], count=3, dtype="uint8"
         ) as dst:
@@ -341,6 +344,40 @@ def test_download_tiles_is_strict_when_a_payload_is_invalid(stub) -> None:
 
     with pytest.raises(ValueError, match="invalid image payload"):
         old_imagery.download_tiles(AOI.centroid, ZOOM, D1)
+
+
+def test_bare_tile_warning_filters_are_serialized(monkeypatch) -> None:
+    """Concurrent decoders must not overlap process-global warning filters."""
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+
+    raw = _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
+    real_catch_warnings = warnings.catch_warnings
+    counter_lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    @contextmanager
+    def tracked_catch_warnings():
+        nonlocal active, peak
+        with counter_lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            # Give the other workers time to enter if the production lock is absent.
+            time.sleep(0.01)
+            with real_catch_warnings():
+                yield
+        finally:
+            with counter_lock:
+                active -= 1
+
+    monkeypatch.setattr(warnings, "catch_warnings", tracked_catch_warnings)
+    operations = [api._inspect_tile_payload, api._decode_image] * 4
+    with ThreadPoolExecutor(max_workers=len(operations)) as pool:
+        list(pool.map(lambda operation: operation(raw), operations))
+
+    assert peak == 1
 
 
 def test_download_tiles_writes_nothing_when_cache_is_disabled(stub, tmp_path, monkeypatch) -> None:
@@ -1013,6 +1050,17 @@ def test_region_query_clips_to_the_aoi(stub) -> None:
     assert gdf["coverage"].iloc[0] == pytest.approx(1.0)
 
 
+def test_region_query_discards_boundary_only_geometry(stub) -> None:
+    inside = box(-122.4000, 37.7920, -122.3980, 37.7950)
+    touching = box(-122.3960, 37.7930, -122.3950, 37.7940)
+    stub(RegionBackend([(D1, inside), (D1, touching)]))
+
+    gdf = old_imagery.availability(AOI, REGION_ZOOM, provider="esri", max_tiles=10_000)
+
+    assert gdf.geometry.iloc[0].geom_type == "Polygon"
+    assert gdf.geometry.iloc[0].equals(inside)
+
+
 def test_region_query_unions_footprints_sharing_a_date(stub) -> None:
     left = box(-122.4000, 37.7920, -122.3985, 37.7950)
     right = box(-122.3975, 37.7920, -122.3960, 37.7950)
@@ -1215,7 +1263,8 @@ def test_mosaic_returns_one_row_per_zoom_and_date(stub) -> None:
 
     assert list(gdf.columns) == api.ESRI_MOSAIC_COLUMNS
     assert gdf.crs == "EPSG:4326"
-    assert list(gdf["capture_date"]) == [pd.Timestamp(D2), pd.Timestamp(D1)]  # newest first within a zoom
+    # Newest first within a zoom.
+    assert list(gdf["capture_date"]) == [pd.Timestamp(D2), pd.Timestamp(D1)]
     assert str(gdf["capture_date"].dtype) == "datetime64[ns]"
     assert set(gdf["zoom"]) == {18}
     assert (gdf["release_id"] == "WB_2014_R01").all()
@@ -1248,6 +1297,16 @@ def test_mosaic_dissolves_footprints_sharing_a_zoom_and_date(stub) -> None:
 
     assert len(gdf) == 1
     assert gdf.geometry.iloc[0].area == pytest.approx(AOI.area, rel=1e-9)
+
+
+def test_mosaic_discards_boundary_only_geometry(stub) -> None:
+    touching = box(-122.3960, 37.7930, -122.3950, 37.7940)
+    stub(MosaicBackend({18: [(D1, LEFT), (D1, touching)]}))
+
+    gdf = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    assert gdf.geometry.iloc[0].geom_type == "Polygon"
+    assert gdf.geometry.iloc[0].equals(LEFT)
 
 
 def test_mosaic_preserves_distinct_sources_sharing_a_capture_date(stub) -> None:

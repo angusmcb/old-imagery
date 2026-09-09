@@ -27,10 +27,16 @@ from shapely.ops import unary_union
 from ._concurrency import adaptive_metadata_map, adaptive_tile_map, workers_for
 from ._dbroot import Database, DbRoot
 from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, RequestFailed
-from ._region import TILE_PX, dissolve, normalize_aoi, sort_by_nearest_date
+from ._region import TILE_PX, _polygonal_only, dissolve, normalize_aoi, sort_by_nearest_date
 
 WGS84 = "EPSG:4326"
 MERCATOR = "EPSG:3857"
+
+# Rasterio's warnings filter is process-global, while tile validation and
+# decoding run in worker threads. Serialize the tiny warning-suppressed opens
+# for deliberately bare provider tiles so one thread cannot overwrite another
+# thread's temporary filter.
+_BARE_TILE_WARNING_LOCK = threading.Lock()
 
 DateLike = _dt.date | str
 TileGeometry = Point | MultiPoint | Polygon | MultiPolygon
@@ -394,8 +400,8 @@ def _availability_by_region(backend, aoi, tiles, zoom, provider, min_d, max_d) -
 
     geometry_by_date: dict[_dt.date, shapely.geometry.base.BaseGeometry] = {}
     for date, geoms in by_date.items():
-        clipped = unary_union(geoms).intersection(aoi)
-        if not clipped.is_empty:
+        clipped = _polygonal_only(unary_union(geoms).intersection(aoi))
+        if clipped is not None:
             geometry_by_date[date] = clipped
 
     if not geometry_by_date:
@@ -627,8 +633,8 @@ def esri_mosaic_as_of(
 
             out = []
             for (date, source), geoms in by_source.items():
-                clipped = unary_union(geoms).intersection(aoi)
-                if not clipped.is_empty:
+                clipped = _polygonal_only(unary_union(geoms).intersection(aoi))
+                if clipped is not None:
                     out.append((z, date, source, clipped))
             return out
 
@@ -805,7 +811,7 @@ def _source_metadata(backend, candidate, provider: str) -> SourceMetadata | None
 def _inspect_tile_payload(raw: bytes) -> tuple[str, str]:
     """Validate a native tile entirely in memory without changing its bytes."""
     try:
-        with warnings.catch_warnings():
+        with _BARE_TILE_WARNING_LOCK, warnings.catch_warnings():
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
             with MemoryFile(raw) as memory, memory.open() as source:
                 driver = str(source.driver).upper()
@@ -1240,7 +1246,7 @@ def _source_as_dict(source) -> dict:
 def _decode_image(raw: bytes) -> np.ndarray | None:
     """Decode tile bytes into a ``(3, TILE_PX, TILE_PX)`` uint8 array."""
     try:
-        with warnings.catch_warnings():
+        with _BARE_TILE_WARNING_LOCK, warnings.catch_warnings():
             # Bare tiles carry no geotransform; we supply one when mosaicking.
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
             with MemoryFile(raw, ext=".jpg") as mem, mem.open() as src:
