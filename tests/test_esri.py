@@ -367,7 +367,7 @@ class RegionClient:
         token = url[url.index(marker) + len(marker) :].split("/")[0]
         return int(token.split("_r")[-1])
 
-    def post(self, url, data, *, max_age=None):
+    def post(self, url, data, *, max_age=None, accept_response=None):
         self.post_ages.append(max_age)
         layer_id = self._layer_id_from(url)
         if data.get("returnGeometry") == "true":
@@ -382,7 +382,10 @@ class RegionClient:
         if data.get("returnIdsOnly") == "true":
             self.date_queries.append(layer_id)
             self.id_requests.append(dict(data))
-            return json.dumps({"objectIds": [oid for _date, oid in rows]}).encode()
+            response = json.dumps({"objectIds": [oid for _date, oid in rows]}).encode()
+            if accept_response is not None and not accept_response(response):
+                raise RequestFailed("unacceptable response")
+            return response
 
         oids = tuple(int(token) for token in data["objectIds"].split(","))
         self.attribute_requests.append((layer_id, oids))
@@ -526,9 +529,9 @@ def test_fetch_geometries_uses_fixed_ten_metre_tolerance() -> None:
     forms = []
     real_post = client.post
 
-    def recording(url, data, *, max_age=None):
+    def recording(url, data, *, max_age=None, accept_response=None):
         forms.append(dict(data))
-        return real_post(url, data, max_age=max_age)
+        return real_post(url, data, max_age=max_age, accept_response=accept_response)
 
     client.post = recording
     wb._fetch_geometries(layers[0], 17, [11])
@@ -592,12 +595,12 @@ def test_fetch_geometries_drops_only_the_failing_batch() -> None:
     real_post = client.post
     calls: list[int] = []
 
-    def flaky(url, data, *, max_age=None):
+    def flaky(url, data, *, max_age=None, accept_response=None):
         if data.get("returnGeometry") == "true":
             calls.append(1)
             if len(calls) == 1:
                 raise RequestFailed("first batch is broken")
-        return real_post(url, data, max_age=max_age)
+        return real_post(url, data, max_age=max_age, accept_response=accept_response)
 
     client.post = flaky
     rows = wb._fetch_geometries(layers[0], 17, oids)
@@ -667,7 +670,7 @@ def test_query_layer_reports_incomplete_when_the_request_fails() -> None:
     layers = [_layer(1, "2014-02-20")]
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
 
-    def broken(url, data, *, max_age=None):
+    def broken(url, data, *, max_age=None, accept_response=None):
         raise RequestFailed("service down")
 
     client.post = broken
@@ -680,8 +683,11 @@ def test_query_layer_reports_incomplete_on_an_error_payload() -> None:
     layers = [_layer(1, "2014-02-20")]
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
 
-    def errored(url, data, *, max_age=None):
-        return json.dumps({"error": {"code": 500, "message": "boom"}}).encode()
+    def errored(url, data, *, max_age=None, accept_response=None):
+        response = json.dumps({"error": {"code": 500, "message": "boom"}}).encode()
+        if accept_response is not None and not accept_response(response):
+            raise RequestFailed("unacceptable response")
+        return response
 
     client.post = errored
     rows, complete = wb._query_layer(layers[0], AOI, 17)
@@ -718,8 +724,8 @@ def test_query_layer_splits_a_truncated_attribute_batch() -> None:
     )
     real_post = client.post
 
-    def limited(url, data, *, max_age=None):
-        raw = real_post(url, data, max_age=max_age)
+    def limited(url, data, *, max_age=None, accept_response=None):
+        raw = real_post(url, data, max_age=max_age, accept_response=accept_response)
         if data.get("returnIdsOnly") == "true":
             return raw
         payload = json.loads(raw)
@@ -741,9 +747,9 @@ def test_query_layer_reports_incomplete_when_one_record_cannot_be_fetched() -> N
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
     real_post = client.post
 
-    def truncated(url, data, *, max_age=None):
+    def truncated(url, data, *, max_age=None, accept_response=None):
         if data.get("returnIdsOnly") == "true":
-            return real_post(url, data, max_age=max_age)
+            return real_post(url, data, max_age=max_age, accept_response=accept_response)
         return json.dumps({"features": [], "exceededTransferLimit": True}).encode()
 
     client.post = truncated
@@ -758,8 +764,8 @@ def test_query_layer_reports_incomplete_on_duplicate_attribute_records() -> None
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
     real_post = client.post
 
-    def duplicated(url, data, *, max_age=None):
-        raw = real_post(url, data, max_age=max_age)
+    def duplicated(url, data, *, max_age=None, accept_response=None):
+        raw = real_post(url, data, max_age=max_age, accept_response=accept_response)
         if data.get("returnIdsOnly") == "true":
             return raw
         payload = json.loads(raw)
@@ -851,9 +857,9 @@ def test_release_footprints_asks_the_metadata_layer_for_the_given_zoom() -> None
     seen: list[str] = []
     real_post = client.post
 
-    def recording(url, data, *, max_age=None):
+    def recording(url, data, *, max_age=None, accept_response=None):
         seen.append(url)
-        return real_post(url, data, max_age=max_age)
+        return real_post(url, data, max_age=max_age, accept_response=accept_response)
 
     client.post = recording
     wb.release_footprints(layers[0], AOI, 19)
@@ -872,7 +878,7 @@ def test_release_footprints_refuses_a_truncated_feature_list() -> None:
     layers = [_layer(1, "2014-02-20")]
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
 
-    def broken(url, data, *, max_age=None):
+    def broken(url, data, *, max_age=None, accept_response=None):
         raise RequestFailed("metadata service down")
 
     client.post = broken

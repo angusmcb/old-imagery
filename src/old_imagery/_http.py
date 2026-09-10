@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -411,14 +412,34 @@ class CachedHttpClient:
         self._write_cache(url, data)
         return data
 
-    def post(self, url: str, data: dict[str, str], *, max_age: float | None = None) -> bytes:
+    def post(
+        self,
+        url: str,
+        data: dict[str, str],
+        *,
+        max_age: float | None = None,
+        accept_response: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
         key = url + "\0" + repr(sorted(data.items()))
         cached = self._read_cache(key, max_age)
-        if cached is not None:
+        if cached is not None and (accept_response is None or accept_response(cached)):
             return cached
-        body = self._send("POST", url, data)
-        self._write_cache(key, body)
-        return body
+
+        # Some services return a transient application-level error in an HTTP
+        # 200 response.  A caller that can recognise a valid body may reject
+        # such a cached response and retry it without giving the bad body an
+        # indefinite cache lifetime.
+        for attempt in range(self.retries + 1):
+            body = self._send("POST", url, data)
+            if accept_response is None or accept_response(body):
+                self._write_cache(key, body)
+                return body
+            if attempt < self.retries:
+                time.sleep(_BACKOFF * (2**attempt))
+        raise RequestFailed(
+            f"POST {url} returned an unacceptable response after "
+            f"{self.retries + 1} attempts"
+        )
 
     def close(self) -> None:
         try:

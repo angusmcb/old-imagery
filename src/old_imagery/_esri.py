@@ -63,6 +63,23 @@ _ORGANIZE_POLYGONS_WARNING = (
     r"as a collection\."
 )
 
+
+def _complete_object_id_response(raw: bytes) -> bool:
+    """Whether an Esri ID response is complete enough to cache indefinitely."""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload, dict) or "error" in payload:
+        return False
+    if "objectIds" not in payload:
+        return False
+    object_ids = payload["objectIds"]
+    return (
+        (object_ids is None or isinstance(object_ids, list))
+        and not payload.get("exceededTransferLimit", False)
+    )
+
 # Above this many tiles, stop narrowing the release list with tilemap probes and
 # just ask every release.
 #
@@ -686,7 +703,12 @@ class WayBack:
             }
             try:
                 payload = json.loads(
-                    self._client.post(url, form, max_age=_METADATA_MAX_AGE)
+                    self._client.post(
+                        url,
+                        form,
+                        max_age=_METADATA_MAX_AGE,
+                        accept_response=_complete_object_id_response,
+                    )
                 )
             except (RequestFailed, OSError, ValueError):
                 return sorted(object_ids), False

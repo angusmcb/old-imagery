@@ -26,7 +26,8 @@ class FakeTransport(httpx.BaseTransport):
         item = self.script.pop(0) if self.script else self.script_default()
         if isinstance(item, Exception):
             raise item
-        return httpx.Response(item, content=b"payload", request=request)
+        status, content = item if isinstance(item, tuple) else (item, b"payload")
+        return httpx.Response(status, content=content, request=request)
 
     @staticmethod
     def script_default():
@@ -134,6 +135,23 @@ def test_post_bodies_key_the_cache_separately(client) -> None:
     assert c._transport.calls == 2
     c.post(URL, {"a": "1"})
     assert c._transport.calls == 2  # first body now cached
+
+
+@pytest.mark.parametrize("backend", ["file", "sqlite"])
+def test_post_retries_and_replaces_an_unacceptable_cached_response(client, backend) -> None:
+    c = client([(200, b"bad"), (200, b"good")], backend=backend)
+    assert c.post(URL, {"a": "1"}) == b"bad"
+    assert c.post(URL, {"a": "1"}, accept_response=lambda body: body == b"good") == b"good"
+    assert c._transport.calls == 2
+    assert c.post(URL, {"a": "1"}, accept_response=lambda body: body == b"good") == b"good"
+    assert c._transport.calls == 2
+
+
+def test_post_does_not_cache_persistently_unacceptable_responses(client) -> None:
+    c = client([(200, b"bad")] * 4 + [(200, b"good")])
+    with pytest.raises(RequestFailed, match="unacceptable response"):
+        c.post(URL, {"a": "1"}, accept_response=lambda body: body == b"good")
+    assert c.post(URL, {"a": "1"}, accept_response=lambda body: body == b"good") == b"good"
 
 
 def test_cache_can_be_disabled(client, tmp_path) -> None:
