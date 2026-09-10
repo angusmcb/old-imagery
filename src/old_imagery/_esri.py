@@ -12,12 +12,13 @@ import json
 import math
 import re
 import threading
+import warnings
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ._concurrency import adaptive_metadata_map, workers_for
+from ._concurrency import _WARNING_FILTER_LOCK, adaptive_metadata_map, workers_for
 from ._http import CachedHttpClient, RequestFailed
 from ._region import MERCATOR_EQUATOR, TILE_PX, MercatorGrid, MercatorTile, _polygonal_only
 
@@ -51,6 +52,11 @@ _QUERY_GEOMETRY_MAX_BYTES = 256_000
 # (the ids travel in a POST body).
 _GEOMETRY_BATCH = 100
 _SOURCE_FIELDS = "OBJECTID,SRC_DATE2,SRC_RES,SRC_ACC,NICE_NAME,NICE_DESC,MinMapLevel,MaxMapLevel"
+_ORGANIZE_POLYGONS_WARNING = (
+    r"organizePolygons\(\) received an unexpected geometry\.  Either a polygon with interior "
+    r"rings, or a polygon with less than 4 points, or a non-Polygon geometry\.  Return arguments "
+    r"as a collection\."
+)
 
 # Above this many tiles, stop narrowing the release list with tilemap probes and
 # just ask every release.
@@ -825,7 +831,14 @@ class WayBack:
         if "error" in payload or not payload.get("features"):
             return []
         try:
-            frame = gpd.read_file(io.BytesIO(raw))
+            with _WARNING_FILTER_LOCK, warnings.catch_warnings():
+                # GDAL emits this while converting malformed Esri polygon rings
+                # to a GeometryCollection. _rows_to_dated_geometries repairs and
+                # extracts their polygonal parts immediately afterward.
+                warnings.filterwarnings(
+                    "ignore", message=_ORGANIZE_POLYGONS_WARNING, category=RuntimeWarning
+                )
+                frame = gpd.read_file(io.BytesIO(raw))
         except Exception:  # noqa: BLE001
             # Deliberately broad: read_file dispatches to GDAL/pyogrio drivers
             # whose failure modes on unexpected bytes are not a stable, listable

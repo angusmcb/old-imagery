@@ -38,6 +38,11 @@ from typing import TypeVar
 _Input = TypeVar("_Input")
 _Output = TypeVar("_Output")
 
+# Python's warnings filter is process-global on the supported interpreters.
+# Every temporary filter in worker-capable code must therefore share one lock;
+# separate per-module locks would still permit overlapping save/restore cycles.
+_WARNING_FILTER_LOCK = threading.Lock()
+
 
 # Fixed pools remain only where adaptation would measure the wrong thing: the
 # outer multi-zoom coordinator and the handful of large geometry payloads.

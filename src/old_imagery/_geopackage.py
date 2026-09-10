@@ -19,6 +19,7 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
+from ._concurrency import _WARNING_FILTER_LOCK
 from ._region import MERCATOR_EQUATOR, TILE_PX
 
 _RESERVED_TABLES = {
@@ -148,7 +149,7 @@ def _overview_factors(width: int, height: int, geopackage_zoom: int) -> tuple[in
 
 def _rgba_tile(payload: bytes) -> np.ndarray:
     """Decode one native or overview payload to an RGBA uint8 tile."""
-    with warnings.catch_warnings():
+    with _WARNING_FILTER_LOCK, warnings.catch_warnings():
         warnings.simplefilter("ignore", NotGeoreferencedWarning)
         with MemoryFile(payload) as memory, memory.open() as source:
             data = source.read()
@@ -201,7 +202,7 @@ def _encode_rgba_tile(rgba: np.ndarray) -> bytes:
     driver = "JPEG" if opaque else "PNG"
     extension = ".jpg" if opaque else ".png"
     data = rgba[:3] if opaque else rgba
-    with warnings.catch_warnings():
+    with _WARNING_FILTER_LOCK, warnings.catch_warnings():
         warnings.simplefilter("ignore", NotGeoreferencedWarning)
         with MemoryFile(ext=extension) as memory:
             with memory.open(

@@ -66,7 +66,7 @@ class StubBackend:
 def _encode_jpeg(arr: np.ndarray) -> bytes:
     from rasterio.io import MemoryFile
 
-    with MemoryFile(ext=".jpg") as mem, api._BARE_TILE_WARNING_LOCK, warnings.catch_warnings():
+    with MemoryFile(ext=".jpg") as mem, api._WARNING_FILTER_LOCK, warnings.catch_warnings():
         warnings.simplefilter("ignore", NotGeoreferencedWarning)
         with mem.open(
             driver="JPEG", width=arr.shape[2], height=arr.shape[1], count=3, dtype="uint8"

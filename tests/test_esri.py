@@ -766,6 +766,34 @@ def test_repaired_footprints_keep_only_polygonal_components() -> None:
     assert rows[0].geometry.area == pytest.approx(4.0)
 
 
+def test_geometry_decode_suppresses_only_the_known_gdal_warning(monkeypatch) -> None:
+    import warnings
+
+    import geopandas as gpd
+
+    layers = [_layer(1, "2014-02-20")]
+    wb, _client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    real_read_file = gpd.read_file
+    organize_polygons = (
+        "organizePolygons() received an unexpected geometry.  Either a polygon with interior "
+        "rings, or a polygon with less than 4 points, or a non-Polygon geometry.  Return "
+        "arguments as a collection."
+    )
+
+    def noisy_read_file(*args, **kwargs):
+        warnings.warn(organize_polygons, RuntimeWarning, stacklevel=2)
+        warnings.warn("another geometry warning", RuntimeWarning, stacklevel=2)
+        return real_read_file(*args, **kwargs)
+
+    monkeypatch.setattr(gpd, "read_file", noisy_read_file)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        rows = wb.release_footprints(layers[0], AOI, 17)
+
+    assert rows
+    assert [str(item.message) for item in caught] == ["another geometry warning"]
+
+
 def test_release_footprints_asks_the_metadata_layer_for_the_given_zoom() -> None:
     """Wayback composes per scale, so zoom picks a different metadata layer."""
     layers = [_layer(1, "2014-02-20")]
