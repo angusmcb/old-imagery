@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -127,10 +129,11 @@ def test_tilemap_requests_use_a_long_refresh_window() -> None:
     assert all(age == _TILEMAP_MAX_AGE for age in client.requested_ages)
 
 
-def test_source_metadata_requests_use_a_daily_refresh_window() -> None:
+def test_source_metadata_requests_do_not_expire() -> None:
     wb, client = _wayback({})
     wb._tile_metadata(wb.layers[0], TILE)
-    assert client.requested_ages == [_METADATA_MAX_AGE]
+    assert _METADATA_MAX_AGE is None
+    assert client.requested_ages == [None]
 
 
 def test_dated_tiles_omits_imagery_without_capture_metadata() -> None:
@@ -515,6 +518,26 @@ def test_fetch_geometries_batches_ids_into_one_request() -> None:
     assert all(row.date == CAPTURE and not row.geometry.is_empty for row in rows)
 
 
+def test_fetch_geometries_uses_fixed_ten_metre_tolerance() -> None:
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
+    forms = []
+    real_post = client.post
+
+    def recording(url, data, *, max_age=None):
+        forms.append(dict(data))
+        return real_post(url, data, max_age=max_age)
+
+    client.post = recording
+    wb._fetch_geometries(layers[0], 17, [11])
+
+    geometry_form = next(form for form in forms if form.get("returnGeometry") == "true")
+    assert geometry_form["maxAllowableOffset"] == str(_esri._FOOTPRINT_TOLERANCE_M)
+    assert geometry_form["geometryPrecision"] == "0"
+
+
 def test_fetch_geometries_chunks_beyond_the_batch_size() -> None:
     from old_imagery import _esri
 
@@ -529,6 +552,33 @@ def test_fetch_geometries_chunks_beyond_the_batch_size() -> None:
     assert len(client.geometry_requests) == 2
     assert len(client.geometry_requests[0][1]) == _esri._GEOMETRY_BATCH
     assert len(client.geometry_requests[1][1]) == 5
+
+
+def test_fetch_geometries_processes_batches_concurrently(monkeypatch) -> None:
+    from old_imagery import _esri
+
+    wb = WayBack.__new__(WayBack)
+    layer = _layer(1, "2014-02-20")
+    in_flight = 0
+    peak_in_flight = 0
+    lock = threading.Lock()
+
+    def fetch(_layer, _zoom, _batch):
+        nonlocal in_flight, peak_in_flight
+        with lock:
+            in_flight += 1
+            peak_in_flight = max(peak_in_flight, in_flight)
+        try:
+            time.sleep(0.01)
+            return []
+        finally:
+            with lock:
+                in_flight -= 1
+
+    monkeypatch.setattr(wb, "_fetch_geometry_batch", fetch)
+    wb._fetch_geometries(layer, 17, list(range(_esri._GEOMETRY_BATCH * 3)))
+
+    assert 1 < peak_in_flight <= 3
 
 
 def test_fetch_geometries_drops_only_the_failing_batch() -> None:

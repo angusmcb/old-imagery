@@ -31,6 +31,7 @@ from ._concurrency import (
     workers_for,
 )
 from ._dbroot import Database, DbRoot
+from ._esri import EsriSource
 from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, RequestFailed
 from ._region import TILE_PX, _polygonal_only, dissolve, normalize_aoi, sort_by_nearest_date
 
@@ -578,8 +579,9 @@ def esri_mosaic_as_of(
             Esri's scale range for this source, reported as provenance only.
             These values never change or cap the requested zoom.
         ``geometry``
-            The area displaying that capture date, clipped to the AOI.  Real
-            capture-footprint boundaries, not tile edges.
+            The area displaying that capture date, clipped to the AOI. Real
+            capture-footprint boundaries, not tile edges, generalised to a
+            fixed 10-metre tolerance in Esri's projected metadata service.
 
         ``gdf.attrs`` records ``release_id``, ``release_date`` (the publication
         date), ``release_title``, ``as_of`` and ``zooms``.
@@ -626,22 +628,30 @@ def esri_mosaic_as_of(
 
         def work(z: int) -> list[tuple]:
             footprints = backend.release_footprints(layer, aoi, z, max_footprints=max_footprints)
-            by_source: dict[tuple[_dt.date, object], list] = defaultdict(list)
+            by_source: dict[tuple[_dt.date, EsriSource], list] = defaultdict(list)
             for footprint in footprints:
                 by_source[(footprint.date, footprint.source)].append(footprint.geometry)
 
-            out = []
-            for (date, source), geoms in by_source.items():
-                clipped = _polygonal_only(unary_union(geoms).intersection(aoi))
-                if clipped is not None:
-                    out.append((z, date, source, clipped))
+            def dissolve_group(item):
+                (date, source), geoms = item
+                merged = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+                dissolved = _polygonal_only(merged.intersection(aoi))
+                if dissolved is not None:
+                    return z, date, source, dissolved
+                return None
+
+            items = list(by_source.items())
+            if len(items) <= 1:
+                dissolved_rows = map(dissolve_group, items)
+                out = [row for row in dissolved_rows if row is not None]
+            else:
+                with ThreadPoolExecutor(max_workers=workers_for("esri", len(items))) as pool:
+                    out = [row for row in pool.map(dissolve_group, items) if row is not None]
             return out
 
-        # One worker per zoom, capped: release_footprints issues its requests
-        # serially, so this bounds requests in flight against Wayback to the
-        # measured cap rather than multiplying it by the number of zooms.
-        with ThreadPoolExecutor(max_workers=workers_for("esri", len(zooms))) as pool:
-            found = [row for rows in pool.map(work, zooms) for row in rows]
+        # Geometry batches within one zoom are parallel. Process zooms serially
+        # so nested pools cannot multiply Esri's measured request ceiling.
+        found = [row for z in zooms for row in work(z)]
     finally:
         client.close()
 

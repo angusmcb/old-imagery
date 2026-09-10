@@ -44,6 +44,12 @@ def _polygonal_only(geometry: BaseGeometry | None) -> Polygon | MultiPolygon | N
     if not geometry.is_valid:
         geometry = make_valid(geometry)
 
+    # The overwhelmingly common case is already polygonal.  unary_union on a
+    # one-element list still invokes GEOS topology machinery and becomes very
+    # expensive when repeated for tens of thousands of Esri footprints.
+    if isinstance(geometry, (Polygon, MultiPolygon)):
+        return geometry if geometry.area > 0.0 else None
+
     polygons: list[Polygon] = []
 
     def collect(value: BaseGeometry) -> None:

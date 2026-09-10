@@ -49,7 +49,7 @@ from .api import (
     esri_wayback_releases,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # Deliberately narrow: the documented functions, the constants and option
 # types their signatures name, the exceptions they raise, and the version.

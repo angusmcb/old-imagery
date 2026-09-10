@@ -1466,21 +1466,12 @@ def test_mosaic_closes_the_client_even_when_a_zoom_fails(stub) -> None:
     assert stub.holder.get("closed") is True
 
 
-def test_mosaic_never_exceeds_the_wayback_concurrency_cap(stub) -> None:
-    """The cap is on requests in flight, so it must not multiply per zoom."""
-    from old_imagery._concurrency import workers_for
-
-    cap = workers_for("esri", 10_000)  # the policy's ceiling for Esri
-    # More zooms than the cap, or the assertion could not fail: with only `cap`
-    # tasks a capped pool and an uncapped one are indistinguishable.
+def test_mosaic_processes_zooms_serially_to_avoid_multiplying_batch_pools(stub) -> None:
     zooms = list(range(0, 21))  # every zoom Esri publishes imagery for
-    assert len(zooms) > cap
     backend = stub(MosaicBackend({z: [(D1, AOI)] for z in zooms}))
 
     old_imagery.esri_mosaic_as_of(AOI, zooms, RELEASE_DATE)
-    assert backend.peak_in_flight <= cap
-    # And the work really did overlap, so the bound above means something.
-    assert backend.peak_in_flight > 1
+    assert backend.peak_in_flight == 1
     assert sorted(backend.asked_zooms) == zooms
 
 

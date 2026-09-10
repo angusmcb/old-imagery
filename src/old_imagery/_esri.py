@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from ._concurrency import _WARNING_FILTER_LOCK, adaptive_metadata_map, workers_for
 from ._http import CachedHttpClient, RequestFailed
-from ._region import MERCATOR_EQUATOR, TILE_PX, MercatorGrid, MercatorTile, _polygonal_only
+from ._region import MercatorGrid, MercatorTile, _polygonal_only
 
 WMTS_CAPABILITIES = (
     "https://wayback.maptiles.arcgis.com/arcgis/rest/services/world_imagery/"
@@ -30,8 +30,9 @@ _CAPS_MAX_AGE = 7 * 24 * 3600
 # A tilemap is tied to one immutable Wayback release id. Keep a long refresh
 # window in case Esri repairs or reindexes the historical service.
 _TILEMAP_MAX_AGE = 30 * 24 * 3600
-# Source metadata can be corrected independently of the imagery release.
-_METADATA_MAX_AGE = 24 * 3600
+# Metadata queries are tied to an immutable Wayback release identifier. Keep
+# them indefinitely, just like other content-addressed archive responses.
+_METADATA_MAX_AGE = None
 # Esri serves these with an https scheme, which is unusual for XML namespaces;
 # accept either so the parser does not hinge on that detail.
 _OWS_NAMESPACES = ("https://www.opengis.net/ows/1.1", "http://www.opengis.net/ows/1.1")
@@ -51,6 +52,10 @@ _QUERY_GEOMETRY_MAX_BYTES = 256_000
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
 _GEOMETRY_BATCH = 100
+# Capture-footprint boundaries describe acquisition provenance, not imagery
+# pixels.  Ten-metre generalisation retains meaningful seam detail while
+# keeping country-scale responses and topology work tractable.
+_FOOTPRINT_TOLERANCE_M = 10.0
 _SOURCE_FIELDS = "OBJECTID,SRC_DATE2,SRC_RES,SRC_ACC,NICE_NAME,NICE_DESC,MinMapLevel,MaxMapLevel"
 _ORGANIZE_POLYGONS_WARNING = (
     r"organizePolygons\(\) received an unexpected geometry\.  Either a polygon with interior "
@@ -597,8 +602,8 @@ class WayBack:
         """Capture footprints displayed by one exact release at one zoom.
 
         Returns source-attributed footprints in EPSG:4326 -- the seam map of a
-        single published snapshot, at the resolution Esri actually records
-        rather than quantised to whole tiles.
+        single published snapshot, generalised to a 10-metre tolerance rather
+        than quantised to whole tiles.
 
         ``zoom`` matters: :meth:`Layer.metadata_query_url` selects a metadata
         layer per scale, so the same ground in the same release can carry a
@@ -770,10 +775,22 @@ class WayBack:
         A batch whose request or decode fails is dropped, so a single bad
         response costs its own footprints rather than the whole call.
         """
+        batches = [
+            object_ids[start : start + _GEOMETRY_BATCH]
+            for start in range(0, len(object_ids), _GEOMETRY_BATCH)
+        ]
+        if len(batches) == 1:
+            return self._fetch_geometry_batch(layer, zoom, batches[0])
+
+        def fetch_batch(batch: Sequence[int]) -> list[EsriFootprint]:
+            return self._fetch_geometry_batch(layer, zoom, batch)
+
         out: list[EsriFootprint] = []
-        for start in range(0, len(object_ids), _GEOMETRY_BATCH):
-            batch = object_ids[start : start + _GEOMETRY_BATCH]
-            out.extend(self._fetch_geometry_batch(layer, zoom, batch))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers_for("esri", len(batches))
+        ) as pool:
+            for rows in pool.map(fetch_batch, batches):
+                out.extend(rows)
         return out
 
     def _fetch_geometry_batch(
@@ -781,44 +798,19 @@ class WayBack:
     ) -> list[EsriFootprint]:
         import geopandas as gpd
 
-        # Ask the service to generalise, rather than downloading centimetre
-        # detail and throwing it away. A capture footprint is a big polygon --
-        # one sampled had 3,660 vertices -- and that payload, not the request
-        # count, is what makes this path expensive over a wide area.
-        #
-        # Both bounds are tied to the caller's zoom, so nothing they could
-        # perceive at that zoom is lost: vertices are dropped only where they
-        # deviate by under half a pixel, and coordinates are rounded to a tenth
-        # of one.
-        #
-        # How much that saves depends entirely on the zoom, because a footprint's
-        # own detail sits at the 10-50 m scale. Measured on one polygon, varying
-        # only maxAllowableOffset:
-        #
-        #     none    71.9 KiB   3,660 vertices
-        #     0.6 m   86.0 KiB   3,652 vertices    <- half a pixel at z17
-        #     50 m     2.9 KiB     125 vertices
-        #     500 m    0.7 KiB      15 vertices
-        #
-        # So at fine zooms this does nothing for vertex count -- half a pixel is
-        # far below the spacing the data actually has -- and the win there comes
-        # from geometryPrecision alone (~1.2x end to end). At coarse zooms, where
-        # an AOI covers far more ground and the payload actually hurts, half a
-        # pixel is tens of metres and the saving is large: ~38 m at z11.
-        #
-        # Generalising harder would cut fine-zoom payloads too, but those
-        # vertices are the real acquisition boundary, and a caller who asked for
-        # z19 asked to see it. There is no server-side clip on ArcGIS `query`,
-        # so the rest of a regional polygon is downloaded and discarded either
-        # way.
-        pixel_m = _pixel_metres(zoom)
+        # Esri cannot clip returned features to the query AOI, so country-scale
+        # queries otherwise download and repair millions of vertices lying far
+        # outside the final seams. The fixed tolerance reflects the provenance
+        # precision of acquisition boundaries rather than the requested imagery
+        # pixel size. Coordinates are rounded to whole metres, one tenth of the
+        # permitted deviation.
         form = {
             "f": "json",
             "outFields": _SOURCE_FIELDS,
             "objectIds": ",".join(str(oid) for oid in object_ids),
             "returnGeometry": "true",
-            "maxAllowableOffset": f"{pixel_m / 2:.6g}",
-            "geometryPrecision": str(max(0, math.ceil(-math.log10(pixel_m / 10)))),
+            "maxAllowableOffset": str(_FOOTPRINT_TOLERANCE_M),
+            "geometryPrecision": "0",
             "outSR": "3857",
         }
         try:
@@ -853,11 +845,6 @@ class WayBack:
     def provider_copyright(self, provider_id: int) -> str | None:
         layer = self._by_id.get(provider_id)
         return layer.title if layer is not None else None
-
-
-def _pixel_metres(zoom: int) -> float:
-    """Ground size of one output pixel at ``zoom``, in EPSG:3857 metres."""
-    return MERCATOR_EQUATOR / (TILE_PX * (1 << zoom))
 
 
 def _query_string(params: dict[str, str]) -> str:
