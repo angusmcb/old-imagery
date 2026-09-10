@@ -21,6 +21,7 @@ from shapely.geometry import LineString, MultiPoint, MultiPolygon, box
 import old_imagery
 from old_imagery import api
 from old_imagery._esri import EsriFootprint, EsriSource
+from old_imagery._http import NotFound, RequestFailed
 from old_imagery._keyhole import KeyholeTile
 from old_imagery._region import KeyholeGrid, MercatorGrid
 
@@ -919,6 +920,48 @@ def test_download_tiles_can_skip_exact_release_metadata(stub) -> None:
     assert result.capture_date_at_center is None
     assert result.source_metadata_at_center is None
     assert backend.release_metadata_requests == [False]
+
+
+def test_esri_download_omits_definitively_missing_tiles_with_warning(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+    missing = selected[0]
+    real_download = backend.download_tile_image
+
+    def download(dated):
+        if dated.tile == missing:
+            raise NotFound("missing Esri tile")
+        return real_download(dated)
+
+    backend.download_tile_image = download
+    with pytest.warns(RuntimeWarning, match="Esri returned HTTP 404 for 1 selected"):
+        results = old_imagery.download_tiles(
+            AOI,
+            ZOOM,
+            provider="esri",
+            esri_wayback_release_id=backend.release.identifier,
+        )
+
+    assert len(results) == len(selected) - 1
+    assert (missing.column, missing.row) not in {
+        (result.column, result.row) for result in results
+    }
+
+
+def test_esri_download_still_raises_on_network_failure(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+
+    def fail(_dated):
+        raise RequestFailed("network failed")
+
+    backend.download_tile_image = fail
+    with pytest.raises(RequestFailed, match="network failed"):
+        old_imagery.download_tiles(
+            AOI.centroid,
+            ZOOM,
+            provider="esri",
+            esri_wayback_release_id=backend.release.identifier,
+        )
 
 
 def test_download_no_longer_accepts_an_as_of_date(stub) -> None:

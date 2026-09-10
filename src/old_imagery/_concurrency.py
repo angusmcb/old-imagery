@@ -141,6 +141,8 @@ def adaptive_tile_map(
     provider: str,
     function: Callable[[_Input], _Output],
     items: Sequence[_Input],
+    *,
+    is_acceptable: Callable[[_Output], bool] | None = None,
 ) -> list[_Output]:
     """Map resolved raw-tile work with continuously adaptive concurrency.
 
@@ -150,7 +152,7 @@ def adaptive_tile_map(
     measured so sustained degradation can back off and later recover.
     """
     windows = _RAW_TILE_WINDOWS.get(provider, _DEFAULT_RAW_TILE_WINDOWS)
-    return _adaptive_map(provider, function, items, windows)
+    return _adaptive_map(provider, function, items, windows, is_acceptable=is_acceptable)
 
 
 def _adaptive_map(

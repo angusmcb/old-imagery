@@ -388,9 +388,10 @@ The GeoPackage is first completed and reopened through GDAL at a temporary
 path, then published atomically. Existing outputs are refused unless
 `overwrite=True`.
 
-The tile selection is deliberately as strict as `download_tiles`: one missing
-or invalid selected tile aborts the output. GeoPackage improves portability; it
-does not change the imagery owner's terms or grant redistribution rights.
+The tile selection follows `download_tiles`: network failures and invalid image
+payloads abort the output, while definitive Esri 404 coverage gaps produce a
+warning and a sparse GeoPackage. GeoPackage improves portability; it does not
+change the imagery owner's terms or grant redistribution rights.
 
 ### `download`
 
@@ -480,11 +481,13 @@ width. See
 `src/old_imagery/_concurrency.py` for the measured GCE/Baobab rationale and the
 adaptation thresholds.
 
-Transient HTTP failures are retried. `download_tiles` is strict and aborts on
-any failed selected tile. The mosaic and availability functions instead treat
-many individual tile, packet or release failures as missing data so one bad
-response does not usually abort the whole call. A failure while loading the
-initial Google dbRoot or Esri capabilities document raises
+Transient HTTP failures are retried. `download_tiles` aborts on network errors,
+invalid payloads, and missing Google tiles. A definitive HTTP 404 from Esri is
+treated as a genuine historical coverage gap: the tile is omitted from the
+sparse result and a warning reports the missing address. The mosaic and
+availability functions likewise treat many individual tile, packet or release
+failures as missing data so one bad response does not usually abort the whole
+call. A failure while loading the initial Google dbRoot or Esri capabilities document raises
 `old_imagery.RequestFailed`.
 
 ## Caching

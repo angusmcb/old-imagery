@@ -32,7 +32,7 @@ from ._concurrency import (
 )
 from ._dbroot import Database, DbRoot
 from ._esri import EsriSource
-from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, RequestFailed
+from ._http import DEFAULT_CACHE_DIR, CachedHttpClient, NotFound, RequestFailed
 from ._region import TILE_PX, _polygonal_only, dissolve, normalize_aoi, sort_by_nearest_date
 
 WGS84 = "EPSG:4326"
@@ -859,8 +859,11 @@ def download_tiles(
     ``Point`` and ``MultiPoint`` select the one provider-native tile containing
     each point. ``Polygon`` and ``MultiPolygon`` select every tile they
     intersect. Returned payloads are full, unclipped provider images in
-    deterministic row-major order. Any selected tile that is missing, fails to
-    download, or is not a supported 256x256 image aborts the whole call.
+    deterministic row-major order. Esri tiles that definitively return HTTP
+    404 are omitted with a warning because historical releases can contain
+    genuine coverage gaps. Network failures, other HTTP errors, and invalid
+    image payloads still abort the whole call; Google downloads remain strict
+    for every selected tile.
 
     Payloads remain in memory and are returned unchanged. This function never
     creates output or temporary files. The existing HTTP response cache is the
@@ -917,9 +920,14 @@ def download_tiles(
         else:
             resolved = adaptive_metadata_map(metadata_workload, resolve, tiles)
 
-        def fetch(resolved_tile) -> DownloadedTile:
+        def fetch(resolved_tile) -> DownloadedTile | None:
             tile, candidate = resolved_tile
-            raw = backend.download_tile_image(candidate)
+            try:
+                raw = backend.download_tile_image(candidate)
+            except NotFound:
+                if provider != "esri":
+                    raise
+                return None
             image_format, media_type = _inspect_tile_payload(raw)
             layer = getattr(candidate, "layer", None) or release_layer
             return DownloadedTile(
@@ -941,7 +949,27 @@ def download_tiles(
                 release_title=getattr(layer, "title", None),
             )
 
-        return adaptive_tile_map(provider, fetch, resolved)
+        downloaded = adaptive_tile_map(
+            provider, fetch, resolved, is_acceptable=lambda result: result is not None
+        )
+        missing = [
+            tile
+            for (tile, _candidate), result in zip(resolved, downloaded, strict=True)
+            if result is None
+        ]
+        if missing:
+            examples = ", ".join(
+                f"z{tile.level}/{tile.column}/{tile.row}" for tile in missing[:5]
+            )
+            suffix = "" if len(missing) <= 5 else f" (and {len(missing) - 5:,} more)"
+            warnings.warn(
+                f"Esri returned HTTP 404 for {len(missing):,} selected imagery "
+                f"tile{'s' if len(missing) != 1 else ''}; omitted from the sparse "
+                f"result: {examples}{suffix}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return [result for result in downloaded if result is not None]
     finally:
         client.close()
 
