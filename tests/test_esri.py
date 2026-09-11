@@ -360,6 +360,7 @@ class RegionClient:
         # One entry per HTTP request, so batching itself can be asserted on.
         self.geometry_requests: list[tuple[int, tuple[int, ...]]] = []
         self.post_ages: list[float | None] = []
+        self.cache: dict[str, bytes] = {}
 
     @staticmethod
     def _layer_id_from(url: str) -> int:
@@ -404,6 +405,15 @@ class RegionClient:
                 ]
             }
         ).encode()
+
+    def post_uncached(self, url, data, *, accept_response=None):
+        return self.post(url, data, accept_response=accept_response)
+
+    def _read_cache(self, key, max_age):
+        return self.cache.get(key)
+
+    def _write_cache(self, key, data):
+        self.cache[key] = data
 
     def get(self, url, *, max_age=None):  # pragma: no cover - unused here
         return SAMPLE
@@ -555,6 +565,25 @@ def test_fetch_geometries_chunks_beyond_the_batch_size() -> None:
     assert len(client.geometry_requests) == 2
     assert len(client.geometry_requests[0][1]) == _esri._GEOMETRY_BATCH
     assert len(client.geometry_requests[1][1]) == 5
+
+
+def test_fetch_geometries_reuses_features_across_different_batches() -> None:
+    """Overlap must hit per-feature cache even when the request batches differ."""
+    from old_imagery import _esri
+
+    layers = [_layer(1, "2014-02-20")]
+    oids = list(range(1, _esri._GEOMETRY_BATCH + 11))
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, oid) for oid in oids]})
+
+    first = wb._fetch_geometries(layers[0], 17, oids)
+    requests_after_first = len(client.geometry_requests)
+    overlapping = oids[25:105]
+    second = wb._fetch_geometries(layers[0], 17, overlapping)
+
+    assert len(first) == len(oids)
+    assert len(second) == len(overlapping)
+    assert len(client.geometry_requests) == requests_after_first
+    assert second[0].geometry.equals(first[25].geometry)
 
 
 def test_fetch_geometries_processes_batches_concurrently(monkeypatch) -> None:

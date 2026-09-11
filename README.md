@@ -498,6 +498,12 @@ batched by a background writer, and drained when the HTTP client closes. The
 original one-response-per-file backend remains available for comparison with
 `OLD_IMAGERY_CACHE_BACKEND=file`.
 
+Esri capture geometries are cached per metadata service and `OBJECTID`, rather
+than by the HTTP request's arbitrary batch of IDs. After one AOI has fetched a
+footprint, overlapping AOIs reuse that feature even when their polygon and
+batch composition differ. The small exact-polygon object-ID discovery query is
+still AOI-specific.
+
 | platform | default | |
 | --- | --- | --- |
 | Linux/BSD | `$XDG_CACHE_HOME/old-imagery` | falls back to `~/.cache/old-imagery` |

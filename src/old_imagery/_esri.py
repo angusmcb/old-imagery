@@ -56,6 +56,7 @@ _GEOMETRY_BATCH = 100
 # pixels.  Ten-metre generalisation retains meaningful seam detail while
 # keeping country-scale responses and topology work tractable.
 _FOOTPRINT_TOLERANCE_M = 10.0
+_FEATURE_CACHE_VERSION = 1
 _SOURCE_FIELDS = "OBJECTID,SRC_DATE2,SRC_RES,SRC_ACC,NICE_NAME,NICE_DESC,MinMapLevel,MaxMapLevel"
 _ORGANIZE_POLYGONS_WARNING = (
     r"organizePolygons\(\) received an unexpected geometry\.  Either a polygon with interior "
@@ -79,6 +80,23 @@ def _complete_object_id_response(raw: bytes) -> bool:
         (object_ids is None or isinstance(object_ids, list))
         and not payload.get("exceededTransferLimit", False)
     )
+
+
+def _feature_cache_key(url: str, object_id: int) -> str:
+    return f"esri-feature-v{_FEATURE_CACHE_VERSION}\0{url}\0{object_id}"
+
+
+def _cached_feature_matches(raw: bytes, object_id: int) -> bool:
+    try:
+        record = json.loads(raw)
+        feature = record["feature"]
+        return (
+            isinstance(record.get("spatialReference"), dict)
+            and int(feature["attributes"]["OBJECTID"]) == object_id
+            and "geometry" in feature
+        )
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+        return False
 
 # Above this many tiles, stop narrowing the release list with tilemap probes and
 # just ask every release.
@@ -790,9 +808,10 @@ class WayBack:
     ) -> list[EsriFootprint]:
         """Fetch capture footprints by OBJECTID, as EPSG:4326 geometries.
 
-        Batched: one request carries up to ``_GEOMETRY_BATCH`` ids, and the
-        capture date of each footprint is read back from the response's own
-        ``SRC_DATE2`` rather than being paired up by the caller.
+        Network requests carry up to ``_GEOMETRY_BATCH`` ids, but each returned
+        feature is cached independently. Overlapping AOIs therefore reuse a
+        footprint even when their request batches differ. The capture date of
+        each footprint is read from its own ``SRC_DATE2`` attribute.
 
         A batch whose request or decode fails is dropped, so a single bad
         response costs its own footprints rather than the whole call.
@@ -820,6 +839,56 @@ class WayBack:
     ) -> list[EsriFootprint]:
         import geopandas as gpd
 
+        url = layer.metadata_query_url(zoom)
+        cached: dict[int, bytes] = {}
+        missing: list[int] = []
+        for object_id in object_ids:
+            raw_feature = self._client._read_cache(
+                _feature_cache_key(url, object_id), _METADATA_MAX_AGE
+            )
+            if raw_feature is None or not _cached_feature_matches(raw_feature, object_id):
+                missing.append(object_id)
+            else:
+                cached[object_id] = raw_feature
+
+        if missing:
+            fetched = self._fetch_uncached_geometry_features(layer, zoom, missing)
+            for object_id, raw_feature in fetched.items():
+                self._client._write_cache(_feature_cache_key(url, object_id), raw_feature)
+            cached.update(fetched)
+
+        records = [json.loads(cached[object_id]) for object_id in object_ids if object_id in cached]
+        if not records:
+            return []
+        features = [record["feature"] for record in records]
+        raw = json.dumps(
+            {
+                "geometryType": "esriGeometryPolygon",
+                "spatialReference": records[0]["spatialReference"],
+                "features": features,
+            },
+            separators=(",", ":"),
+        ).encode()
+        try:
+            with _WARNING_FILTER_LOCK, warnings.catch_warnings():
+                # GDAL emits this while converting malformed Esri polygon rings
+                # to a GeometryCollection. _rows_to_dated_geometries repairs and
+                # extracts their polygonal parts immediately afterward.
+                warnings.filterwarnings(
+                    "ignore", message=_ORGANIZE_POLYGONS_WARNING, category=RuntimeWarning
+                )
+                frame = gpd.read_file(io.BytesIO(raw))
+        except Exception:  # noqa: BLE001
+            # Deliberately broad: read_file dispatches to GDAL/pyogrio drivers
+            # whose failure modes on unexpected bytes are not a stable, listable
+            # set. One unreadable batch degrades to [] rather than aborting the
+            # whole call.
+            return []
+        return _rows_to_dated_geometries(frame)
+
+    def _fetch_uncached_geometry_features(
+        self, layer: Layer, zoom: int, object_ids: Sequence[int]
+    ) -> dict[int, bytes]:
         # Esri cannot clip returned features to the query AOI, so country-scale
         # queries otherwise download and repair millions of vertices lying far
         # outside the final seams. The fixed tolerance reflects the provenance
@@ -836,30 +905,39 @@ class WayBack:
             "outSR": "3857",
         }
         try:
-            raw = self._client.post(
-                layer.metadata_query_url(zoom), form, max_age=_METADATA_MAX_AGE
-            )
+            raw = self._client.post_uncached(layer.metadata_query_url(zoom), form)
             payload = json.loads(raw)
         except (RequestFailed, OSError, ValueError):
-            return []
-        if "error" in payload or not payload.get("features"):
-            return []
-        try:
-            with _WARNING_FILTER_LOCK, warnings.catch_warnings():
-                # GDAL emits this while converting malformed Esri polygon rings
-                # to a GeometryCollection. _rows_to_dated_geometries repairs and
-                # extracts their polygonal parts immediately afterward.
-                warnings.filterwarnings(
-                    "ignore", message=_ORGANIZE_POLYGONS_WARNING, category=RuntimeWarning
-                )
-                frame = gpd.read_file(io.BytesIO(raw))
-        except Exception:  # noqa: BLE001
-            # Deliberately broad: read_file dispatches to GDAL/pyogrio drivers
-            # whose failure modes on unexpected bytes are not a stable, listable
-            # set.  One unreadable batch degrades to [] rather than aborting the
-            # whole call.
-            return []
-        return _rows_to_dated_geometries(frame)
+            return {}
+        features = payload.get("features")
+        if "error" in payload or not isinstance(features, list):
+            return {}
+
+        expected = set(object_ids)
+        by_id: dict[int, bytes] = {}
+        for feature in features:
+            try:
+                object_id = int(feature["attributes"]["OBJECTID"])
+            except (KeyError, TypeError, ValueError):
+                return {}
+            if object_id in by_id or object_id not in expected or "geometry" not in feature:
+                return {}
+            by_id[object_id] = json.dumps(
+                {
+                    "spatialReference": payload.get("spatialReference") or {"wkid": 3857},
+                    "feature": feature,
+                },
+                separators=(",", ":"),
+            ).encode()
+
+        if set(by_id) == expected and not payload.get("exceededTransferLimit", False):
+            return by_id
+        if len(object_ids) <= 1 or not set(by_id).issubset(expected):
+            return {}
+        middle = len(object_ids) // 2
+        left = self._fetch_uncached_geometry_features(layer, zoom, object_ids[:middle])
+        right = self._fetch_uncached_geometry_features(layer, zoom, object_ids[middle:])
+        return left | right
 
     def download_tile_image(self, dated: DatedEsriTile) -> bytes:
         return self._client.get(dated.asset_url)

@@ -137,6 +137,15 @@ def test_post_bodies_key_the_cache_separately(client) -> None:
     assert c._transport.calls == 2  # first body now cached
 
 
+def test_uncached_post_neither_reads_nor_writes_cache(client) -> None:
+    c = client([(200, b"first"), (200, b"second"), (200, b"third")])
+    assert c.post(URL, {"a": "1"}) == b"first"
+    assert c.post_uncached(URL, {"a": "1"}) == b"second"
+    assert c.post(URL, {"a": "1"}) == b"first"
+    assert c.post_uncached(URL, {"a": "2"}) == b"third"
+    assert c._transport.calls == 3
+
+
 @pytest.mark.parametrize("backend", ["file", "sqlite"])
 def test_post_retries_and_replaces_an_unacceptable_cached_response(client, backend) -> None:
     c = client([(200, b"bad"), (200, b"good")], backend=backend)

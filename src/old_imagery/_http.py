@@ -425,14 +425,29 @@ class CachedHttpClient:
         if cached is not None and (accept_response is None or accept_response(cached)):
             return cached
 
+        body = self.post_uncached(url, data, accept_response=accept_response)
+        self._write_cache(key, body)
+        return body
+
+    def post_uncached(
+        self,
+        url: str,
+        data: dict[str, str],
+        *,
+        accept_response: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        """POST without reading or writing the response cache.
+
+        Used when a batched transport response is decomposed into independently
+        reusable cache entries by the caller.
+        """
+
         # Some services return a transient application-level error in an HTTP
-        # 200 response.  A caller that can recognise a valid body may reject
-        # such a cached response and retry it without giving the bad body an
-        # indefinite cache lifetime.
+        # 200 response. A caller that can recognise a valid body may retry it
+        # without giving the bad body an indefinite cache lifetime.
         for attempt in range(self.retries + 1):
             body = self._send("POST", url, data)
             if accept_response is None or accept_response(body):
-                self._write_cache(key, body)
                 return body
             if attempt < self.retries:
                 time.sleep(_BACKOFF * (2**attempt))
