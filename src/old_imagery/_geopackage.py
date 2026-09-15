@@ -38,6 +38,8 @@ _RESERVED_TABLES = {
 _SQLITE_PAGE_SIZE = 16 * 1024
 _SQLITE_CACHE_SIZE_KIB = 256 * 1024
 _OVERVIEW_JPEG_QUALITY = 60
+_OVERVIEW_WEBP_QUALITY = 60
+_WEBP_EXTENSION_DEFINITION = "http://www.geopackage.org/spec/#extension_tiles_webp"
 
 
 def _quoted_identifier(value: str) -> str:
@@ -244,7 +246,7 @@ def _average_2x2(rgba: np.ndarray) -> np.ndarray:
 
 
 def _encode_rgba_tile(rgba: np.ndarray) -> bytes:
-    """Encode one derived overview tile as JPEG or transparent PNG."""
+    """Encode one derived overview tile as JPEG or alpha-preserving WebP."""
     opaque = bool(np.all(rgba[3] == 255))
     data = rgba[:3] if opaque else rgba
     image = Image.fromarray(data.transpose(1, 2, 0))
@@ -252,7 +254,7 @@ def _encode_rgba_tile(rgba: np.ndarray) -> bytes:
     if opaque:
         image.save(output, format="JPEG", quality=_OVERVIEW_JPEG_QUALITY)
     else:
-        image.save(output, format="PNG")
+        image.save(output, format="WEBP", quality=_OVERVIEW_WEBP_QUALITY)
     return output.getvalue()
 
 
@@ -378,6 +380,7 @@ def _overall_metadata(
             "resampling": "average",
             "factors": overview_factors,
             "jpeg_quality": _OVERVIEW_JPEG_QUALITY,
+            "webp_quality": _OVERVIEW_WEBP_QUALITY,
         },
     }
     return json.dumps(values, separators=(",", ":"), default=str)
@@ -495,6 +498,16 @@ def write_geopackage(
             connection.execute(f"PRAGMA cache_size = -{_SQLITE_CACHE_SIZE_KIB}")
             connection.execute("PRAGMA temp_store = MEMORY")
             connection.execute("PRAGMA foreign_keys = ON")
+            if overview_factors:
+                # WebP is an official GeoPackage tile encoding extension. It
+                # allows sparse overview tiles to retain alpha without the
+                # large lossless-PNG payloads produced by photographic data.
+                connection.execute(
+                    "INSERT OR REPLACE INTO gpkg_extensions "
+                    "(table_name, column_name, extension_name, definition, scope) "
+                    "VALUES (?, 'tile_data', 'gpkg_webp', ?, 'read-write')",
+                    (table_name, _WEBP_EXTENSION_DEFINITION),
+                )
             connection.execute(
                 "UPDATE gpkg_contents SET identifier = ?, description = ?, "
                 "last_change = ?, min_x = ?, min_y = ?, max_x = ?, max_y = ? "

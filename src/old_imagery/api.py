@@ -1006,7 +1006,8 @@ def download_geopackage(
     their bounding canvas. The source tile payloads remain byte-for-byte
     unchanged; overview tiles are derived locally and are described in the
     GeoPackage provenance metadata. Fully opaque overviews use quality-60 JPEG;
-    overviews containing transparent gaps use lossless PNG.
+    overviews containing transparent gaps use quality-60 alpha WebP through
+    GeoPackage's standard ``gpkg_webp`` extension.
     Dataset- and tile-level provenance is attached through GeoPackage's
     standard metadata extension. The complete file is validated through GDAL
     and published atomically; an error does not leave a partial destination

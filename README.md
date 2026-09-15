@@ -362,7 +362,8 @@ an overview tile is written only when it has at least one populated child tile;
 empty gaps in the selected tile layout are left transparent and are not
 materialized as overview tiles. Fully opaque derived tiles use quality-60 JPEG;
 this is intentionally lower than the Pillow default because these tiles are
-only used for zoomed-out display. Tiles with transparent gaps use PNG:
+only used for zoomed-out display. Tiles with transparent gaps use quality-60
+alpha WebP through GeoPackage's standard `gpkg_webp` extension:
 
 ```python
 path = old_imagery.download_geopackage(

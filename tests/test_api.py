@@ -461,6 +461,10 @@ def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> 
             "WHERE table_name = 'gpkg_spatial_ref_sys' "
             "AND column_name = 'definition_12_063'"
         ).fetchone()
+        webp_extension = connection.execute(
+            "SELECT column_name, definition, scope FROM gpkg_extensions "
+            "WHERE table_name = 'imagery' AND extension_name = 'gpkg_webp'"
+        ).fetchone()
         tile_metadata = [
             json.loads(row[0])
             for row in connection.execute(
@@ -519,9 +523,15 @@ def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> 
     assert metadata["overviews"]["resampling"] == "average"
     assert metadata["overviews"]["factors"]
     assert metadata["overviews"]["jpeg_quality"] == 60
+    assert metadata["overviews"]["webp_quality"] == 60
     assert matrix == (1 << ZOOM, 1 << (ZOOM - 1))
     assert crs_wkt is not None and crs_wkt[0].startswith("GEODCRS[")
     assert crs_extension == (1,)
+    assert webp_extension == (
+        "tile_data",
+        "http://www.geopackage.org/spec/#extension_tiles_webp",
+        "read-write",
+    )
 
     with rasterio.open(output) as dataset:
         assert dataset.crs == rasterio.CRS.from_epsg(4326)
@@ -643,6 +653,9 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
         assert overview.count == 4
         assert overview.read(4).min() == 0
 
+    with rasterio.open(output, ZOOM_LEVEL=source_zoom - 1) as overview_level:
+        assert overview_level.dataset_mask().min() == 0
+
 
 def test_download_geopackage_uses_optimized_sqlite_build(stub, tmp_path) -> None:
     stub(StubBackend([D1], colors={D1: 73}))
@@ -703,10 +716,14 @@ def test_download_geopackage_can_skip_overviews(stub, tmp_path) -> None:
                 "SELECT metadata FROM gpkg_metadata WHERE md_scope = 'dataset'"
             ).fetchone()[0]
         )
+        webp_extensions = connection.execute(
+            "SELECT COUNT(*) FROM gpkg_extensions WHERE extension_name = 'gpkg_webp'"
+        ).fetchone()[0]
 
     assert counts == {ZOOM - 1: len(backend.grid.tiles(AOI, ZOOM, 1_000))}
     assert metadata["overviews"]["enabled"] is False
     assert metadata["overviews"]["factors"] == []
+    assert webp_extensions == 0
 
 
 def test_download_geopackage_overview_failure_leaves_no_output(
@@ -769,7 +786,9 @@ def test_geopackage_overview_sampling_averages_opaque_pixels_and_ignores_gaps() 
     sparse = opaque.copy()
     sparse[3, 0, 0] = 0
     assert _encode_rgba_tile(opaque).startswith(b"\xff\xd8")
-    assert _encode_rgba_tile(sparse).startswith(b"\x89PNG")
+    transparent = _encode_rgba_tile(sparse)
+    assert transparent.startswith(b"RIFF")
+    assert transparent[8:12] == b"WEBP"
 
 
 def test_download_geopackage_refuses_existing_output_before_downloading(stub, tmp_path) -> None:
