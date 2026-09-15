@@ -346,6 +346,7 @@ download_geopackage(
     provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     table_name: str = "imagery",
+    build_overviews: bool = True,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 10_000,
     include_metadata: bool = True,
@@ -359,8 +360,9 @@ are generated locally with average resampling, so zoomed-out QGIS rendering
 does not need to repeatedly resample the native tiles. For sparse selections,
 an overview tile is written only when it has at least one populated child tile;
 empty gaps in the selected tile layout are left transparent and are not
-materialized as overview tiles. Fully opaque derived tiles use JPEG; tiles with
-transparent gaps use PNG:
+materialized as overview tiles. Fully opaque derived tiles use quality-60 JPEG;
+this is intentionally lower than the Pillow default because these tiles are
+only used for zoomed-out display. Tiles with transparent gaps use PNG:
 
 ```python
 path = old_imagery.download_geopackage(
@@ -370,6 +372,10 @@ path = old_imagery.download_geopackage(
     output="historical-imagery.gpkg",
 )
 ```
+
+Pass `build_overviews=False` to store only the native tile level. This produces
+a smaller file more quickly, but QGIS must resample native tiles when viewing
+the layer zoomed out.
 
 Esri's native `WebMercatorQuad` addresses become the standard
 `GoogleMapsCompatible` EPSG:3857 matrix directly. Google's square plate-carree
@@ -387,6 +393,15 @@ native tile level remains byte-preserved; overview tiles are derived locally.
 The GeoPackage is first completed and reopened through GDAL at a temporary
 path, then published atomically. Existing outputs are refused unless
 `overwrite=True`.
+
+Overview decoding, resampling and encoding use the CPUs available to the
+current process. On Slurm this respects `SLURM_CPUS_PER_TASK`; CPU affinity and
+cgroup quotas provide additional limits, avoiding the physical-node CPU count
+reported by `os.cpu_count()`.
+
+SQLite construction uses 16 KiB pages and disposable-build journaling to
+reduce page writes. The temporary database remains beside the requested output
+so its final publication is atomic.
 
 The tile selection follows `download_tiles`: network failures and invalid image
 payloads abort the output, while definitive Esri 404 coverage gaps produce a

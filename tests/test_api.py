@@ -515,8 +515,10 @@ def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> 
     assert metadata["provider"] == "google"
     assert metadata["native_zoom"] == ZOOM
     assert metadata["geopackage_zoom"] == ZOOM - 1
+    assert metadata["overviews"]["enabled"] is True
     assert metadata["overviews"]["resampling"] == "average"
     assert metadata["overviews"]["factors"]
+    assert metadata["overviews"]["jpeg_quality"] == 60
     assert matrix == (1 << ZOOM, 1 << (ZOOM - 1))
     assert crs_wkt is not None and crs_wkt[0].startswith("GEODCRS[")
     assert crs_extension == (1,)
@@ -605,9 +607,7 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
     assert len(selected) == 2
     with sqlite3.connect(output) as connection:
         counts = dict(
-            connection.execute(
-                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
-            )
+            connection.execute("SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level")
         )
         source_zoom = ZOOM - 1
         source_payloads = connection.execute(
@@ -642,6 +642,107 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
         assert overview.width == overview.height == 256
         assert overview.count == 4
         assert overview.read(4).min() == 0
+
+
+def test_download_geopackage_uses_optimized_sqlite_build(stub, tmp_path) -> None:
+    stub(StubBackend([D1], colors={D1: 73}))
+    output = tmp_path / "optimized.gpkg"
+
+    old_imagery.download_geopackage(
+        AOI,
+        ZOOM,
+        D1,
+        output=output,
+        cache_dir=None,
+    )
+
+    with sqlite3.connect(output) as connection:
+        assert connection.execute("PRAGMA page_size").fetchone() == (16 * 1024,)
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_download_geopackage_rejects_invalid_build_overviews(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1]))
+
+    with pytest.raises(TypeError, match="build_overviews"):
+        old_imagery.download_geopackage(
+            AOI,
+            ZOOM,
+            D1,
+            output=tmp_path / "invalid.gpkg",
+            cache_dir=None,
+            build_overviews=0,  # type: ignore[arg-type]
+        )
+
+    assert backend.downloads == 0
+    assert not (tmp_path / "invalid.gpkg").exists()
+
+
+def test_download_geopackage_can_skip_overviews(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1], colors={D1: 73}))
+    output = tmp_path / "native-only.gpkg"
+
+    old_imagery.download_geopackage(
+        AOI,
+        ZOOM,
+        D1,
+        output=output,
+        cache_dir=None,
+        build_overviews=False,
+    )
+
+    with sqlite3.connect(output) as connection:
+        counts = dict(
+            connection.execute(
+                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
+            )
+        )
+        metadata = json.loads(
+            connection.execute(
+                "SELECT metadata FROM gpkg_metadata WHERE md_scope = 'dataset'"
+            ).fetchone()[0]
+        )
+
+    assert counts == {ZOOM - 1: len(backend.grid.tiles(AOI, ZOOM, 1_000))}
+    assert metadata["overviews"]["enabled"] is False
+    assert metadata["overviews"]["factors"] == []
+
+
+def test_download_geopackage_overview_failure_leaves_no_output(
+    stub, tmp_path, monkeypatch
+) -> None:
+    from old_imagery import _geopackage
+
+    stub(StubBackend([D1]))
+
+    def fail(_rgba):
+        raise RuntimeError("synthetic encoder failure")
+
+    monkeypatch.setattr(_geopackage, "_encode_rgba_tile", fail)
+    with pytest.raises(ValueError, match="Could not build an overview tile"):
+        old_imagery.download_geopackage(
+            AOI,
+            ZOOM,
+            D1,
+            output=tmp_path / "failed-overview.gpkg",
+            cache_dir=None,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_geopackage_cpu_count_respects_slurm_allocation(monkeypatch) -> None:
+    from old_imagery import _geopackage
+
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "4")
+    monkeypatch.setattr(_geopackage, "_cgroup_cpu_limit", lambda: None)
+    monkeypatch.setattr(
+        _geopackage.os, "sched_getaffinity", lambda _pid: set(range(64)), raising=False
+    )
+    monkeypatch.setattr(_geopackage.os, "cpu_count", lambda: 64)
+
+    assert _geopackage._available_cpu_count() == 4
 
 
 def test_geopackage_overview_sampling_averages_opaque_pixels_and_ignores_gaps() -> None:

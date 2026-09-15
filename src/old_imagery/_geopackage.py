@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import math
 import os
 import sqlite3
 import tempfile
-import warnings
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import rasterio
-from rasterio.errors import NotGeoreferencedWarning
-from rasterio.io import MemoryFile
+from PIL import Image
 from rasterio.transform import from_origin
 
-from ._concurrency import _WARNING_FILTER_LOCK
 from ._region import MERCATOR_EQUATOR, TILE_PX
 
 _RESERVED_TABLES = {
@@ -33,6 +34,10 @@ _RESERVED_TABLES = {
     "old_imagery_tile_metadata",
     "sqlite_sequence",
 }
+
+_SQLITE_PAGE_SIZE = 16 * 1024
+_SQLITE_CACHE_SIZE_KIB = 256 * 1024
+_OVERVIEW_JPEG_QUALITY = 60
 
 
 def _quoted_identifier(value: str) -> str:
@@ -147,30 +152,72 @@ def _overview_factors(width: int, height: int, geopackage_zoom: int) -> tuple[in
     return tuple(factors)
 
 
+def _positive_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _cgroup_cpu_limit() -> int | None:
+    """Return a whole-CPU cgroup quota when one is visible."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+
+    try:
+        quota_value = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period_value = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        if quota_value > 0:
+            return max(1, quota_value // period_value)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_cpu_count() -> int:
+    """Return CPUs available to this task, not CPUs installed on its host."""
+    limits: list[int] = []
+
+    # Slurm may leave the process affinity mask broad on some clusters. Its
+    # per-task allocation is therefore an independent upper bound.
+    slurm_limit = _positive_int(os.environ.get("SLURM_CPUS_PER_TASK"))
+    if slurm_limit is not None:
+        limits.append(slurm_limit)
+
+    if hasattr(os, "sched_getaffinity"):
+        with suppress(OSError):
+            limits.append(len(os.sched_getaffinity(0)))
+
+    cgroup_limit = _cgroup_cpu_limit()
+    if cgroup_limit is not None:
+        limits.append(cgroup_limit)
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    detected = process_cpu_count() if process_cpu_count is not None else os.cpu_count()
+    if detected is not None and detected > 0:
+        limits.append(detected)
+    return max(1, min(limits)) if limits else 1
+
+
 def _rgba_tile(payload: bytes) -> np.ndarray:
     """Decode one native or overview payload to an RGBA uint8 tile."""
-    with _WARNING_FILTER_LOCK, warnings.catch_warnings():
-        warnings.simplefilter("ignore", NotGeoreferencedWarning)
-        with MemoryFile(payload) as memory, memory.open() as source:
-            data = source.read()
-
-    if data.dtype != np.uint8:
-        data = np.clip(data, 0, 255).astype(np.uint8)
-    if data.shape[1:] != (TILE_PX, TILE_PX):
-        raise ValueError(
-            f"overview source payload is {data.shape[2]}x{data.shape[1]}; "
-            f"expected {TILE_PX}x{TILE_PX}"
-        )
-    if data.shape[0] == 1:
-        rgb = np.repeat(data, 3, axis=0)
-        alpha = np.full((TILE_PX, TILE_PX), 255, dtype=np.uint8)
-    elif data.shape[0] == 2:
-        rgb = np.repeat(data[:1], 3, axis=0)
-        alpha = data[1]
-    else:
-        rgb = data[:3]
-        alpha = data[3] if data.shape[0] >= 4 else np.full((TILE_PX, TILE_PX), 255, dtype=np.uint8)
-    return np.concatenate((rgb, alpha[None, ...]), axis=0)
+    with Image.open(io.BytesIO(payload)) as image:
+        if image.size != (TILE_PX, TILE_PX):
+            raise ValueError(
+                f"overview source payload is {image.width}x{image.height}; "
+                f"expected {TILE_PX}x{TILE_PX}"
+            )
+        data = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    if data.shape != (TILE_PX, TILE_PX, 4):
+        raise ValueError(f"decoded overview source has unexpected shape {data.shape!r}")
+    return data.transpose(2, 0, 1)
 
 
 def _average_2x2(rgba: np.ndarray) -> np.ndarray:
@@ -199,29 +246,59 @@ def _average_2x2(rgba: np.ndarray) -> np.ndarray:
 def _encode_rgba_tile(rgba: np.ndarray) -> bytes:
     """Encode one derived overview tile as JPEG or transparent PNG."""
     opaque = bool(np.all(rgba[3] == 255))
-    driver = "JPEG" if opaque else "PNG"
-    extension = ".jpg" if opaque else ".png"
     data = rgba[:3] if opaque else rgba
-    with _WARNING_FILTER_LOCK, warnings.catch_warnings():
-        warnings.simplefilter("ignore", NotGeoreferencedWarning)
-        with MemoryFile(ext=extension) as memory:
-            with memory.open(
-                driver=driver,
-                width=TILE_PX,
-                height=TILE_PX,
-                count=data.shape[0],
-                dtype="uint8",
-            ) as destination:
-                destination.write(data)
-            return memory.read()
+    image = Image.fromarray(data.transpose(1, 2, 0))
+    output = io.BytesIO()
+    if opaque:
+        image.save(output, format="JPEG", quality=_OVERVIEW_JPEG_QUALITY)
+    else:
+        image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _build_overview_parent(item) -> tuple[int, int, bytes]:
+    """Build one parent tile in a worker thread."""
+    (parent_column, parent_row), children = item
+    parent = np.zeros((4, TILE_PX, TILE_PX), dtype=np.uint8)
+    for column, row, payload in children:
+        reduced = _average_2x2(_rgba_tile(payload))
+        left = (column & 1) * (TILE_PX // 2)
+        top = (row & 1) * (TILE_PX // 2)
+        parent[:, top : top + TILE_PX // 2, left : left + TILE_PX // 2] = reduced
+    return parent_column, parent_row, _encode_rgba_tile(parent)
+
+
+def _bounded_parent_map(
+    pool: ThreadPoolExecutor,
+    items: Iterable[tuple[tuple[int, int], list[tuple[int, int, bytes]]]],
+    workers: int,
+) -> Iterator[tuple[int, int, bytes]]:
+    """Map in order without retaining a future and result for every tile."""
+    iterator = iter(items)
+    pending: deque[Future[tuple[int, int, bytes]]] = deque()
+    for _ in range(workers * 2):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        pending.append(pool.submit(_build_overview_parent, item))
+
+    while pending:
+        yield pending.popleft().result()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            continue
+        pending.append(pool.submit(_build_overview_parent, item))
 
 
 def _build_sparse_overviews(
-    path: Path,
+    connection: sqlite3.Connection,
     quoted_table: str,
     addresses: list[tuple[int, int, int]],
     payloads: list[bytes],
     overview_factors: tuple[int, ...],
+    workers: int,
 ) -> None:
     """Build overview rows only for parents of populated child tiles.
 
@@ -243,7 +320,8 @@ def _build_sparse_overviews(
         f"INSERT INTO {quoted_table} "
         "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)"
     )
-    with sqlite3.connect(path) as connection:
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
         for level, factor in enumerate(overview_factors, start=1):
             expected_factor = 1 << level
             if factor != expected_factor:
@@ -253,26 +331,30 @@ def _build_sparse_overviews(
                 parents.setdefault((column // 2, row // 2), []).append((column, row, payload))
 
             next_level: dict[tuple[int, int], bytes] = {}
-            for (parent_column, parent_row), children in sorted(parents.items()):
-                parent = np.zeros((4, TILE_PX, TILE_PX), dtype=np.uint8)
-                for column, row, payload in children:
-                    try:
-                        reduced = _average_2x2(_rgba_tile(payload))
-                    except Exception as error:
-                        raise ValueError(
-                            "Could not decode a tile while building overviews"
-                        ) from error
-                    left = (column & 1) * (TILE_PX // 2)
-                    top = (row & 1) * (TILE_PX // 2)
-                    parent[:, top : top + TILE_PX // 2, left : left + TILE_PX // 2] = reduced
-                encoded = _encode_rgba_tile(parent)
-                connection.execute(
-                    insert_sql,
-                    (zoom - level, parent_column, parent_row, sqlite3.Binary(encoded)),
+            try:
+                items = sorted(parents.items())
+                results = (
+                    _bounded_parent_map(pool, items, workers)
+                    if pool is not None
+                    else map(_build_overview_parent, items)
                 )
-                next_level[(parent_column, parent_row)] = encoded
+                for parent_column, parent_row, encoded in results:
+                    connection.execute(
+                        insert_sql,
+                        (
+                            zoom - level,
+                            parent_column,
+                            parent_row,
+                            sqlite3.Binary(encoded),
+                        ),
+                    )
+                    next_level[(parent_column, parent_row)] = encoded
+            except Exception as error:
+                raise ValueError("Could not build an overview tile") from error
             current = next_level
-        connection.commit()
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
 
 def _overall_metadata(
@@ -280,6 +362,7 @@ def _overall_metadata(
     selection: Mapping[str, object],
     geopackage_zoom: int,
     overview_factors: tuple[int, ...],
+    build_overviews: bool,
 ) -> str:
     first = tiles[0]
     values = {
@@ -290,7 +373,12 @@ def _overall_metadata(
         "geopackage_zoom": geopackage_zoom,
         "tile_count": len(tiles),
         "selection": selection,
-        "overviews": {"resampling": "average", "factors": overview_factors},
+        "overviews": {
+            "enabled": build_overviews,
+            "resampling": "average",
+            "factors": overview_factors,
+            "jpeg_quality": _OVERVIEW_JPEG_QUALITY,
+        },
     }
     return json.dumps(values, separators=(",", ":"), default=str)
 
@@ -321,8 +409,9 @@ def write_geopackage(
     table_name: str,
     selection: Mapping[str, object],
     overwrite: bool,
+    build_overviews: bool,
 ) -> Path:
-    """Write native tiles and local lower-resolution overviews atomically."""
+    """Write native tiles and optional lower-resolution overviews atomically."""
     if not tiles:
         raise ValueError("Cannot create a GeoPackage without tiles")
     quoted_table = _quoted_identifier(table_name)
@@ -344,13 +433,16 @@ def write_geopackage(
     bounds = _content_bounds(addresses, pixel_size, origin_x, origin_y)
     geopackage_zoom = addresses[0][0]
     content_width, content_height = _content_shape(addresses)
-    overview_factors = _overview_factors(content_width, content_height, geopackage_zoom)
+    overview_factors = (
+        _overview_factors(content_width, content_height, geopackage_zoom) if build_overviews else ()
+    )
 
     destination = Path(output)
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Output already exists: {destination}")
     if not destination.parent.exists():
         raise FileNotFoundError(f"Output directory does not exist: {destination.parent}")
+    workers = min(_available_cpu_count(), len(tiles)) if overview_factors else 1
 
     with tempfile.NamedTemporaryFile(
         prefix=f".{destination.name}.", suffix=".gpkg", dir=destination.parent, delete=False
@@ -388,6 +480,20 @@ def write_geopackage(
 
         connection = sqlite3.connect(temporary)
         try:
+            # GDAL has created only the small GeoPackage schema at this point,
+            # so changing from SQLite's 4 KiB default costs almost nothing.
+            # Larger pages turn large tile blobs into far fewer filesystem
+            # writes without the space inflation measured at 32/64 KiB.
+            connection.execute(f"PRAGMA page_size = {_SQLITE_PAGE_SIZE}")
+            connection.execute("VACUUM")
+            # This is an unpublished, reproducible build artifact. Keep its
+            # small rollback journal in memory and omit durable syncs; the
+            # completed database is checked before it is published.
+            connection.execute("PRAGMA journal_mode = MEMORY")
+            connection.execute("PRAGMA synchronous = OFF")
+            connection.execute("PRAGMA locking_mode = EXCLUSIVE")
+            connection.execute(f"PRAGMA cache_size = -{_SQLITE_CACHE_SIZE_KIB}")
+            connection.execute("PRAGMA temp_store = MEMORY")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute(
                 "UPDATE gpkg_contents SET identifier = ?, description = ?, "
@@ -419,7 +525,13 @@ def write_geopackage(
                 "VALUES ('dataset', ?, 'application/json', ?)",
                 (
                     standard_uri,
-                    _overall_metadata(tiles, selection, geopackage_zoom, overview_factors),
+                    _overall_metadata(
+                        tiles,
+                        selection,
+                        geopackage_zoom,
+                        overview_factors,
+                        build_overviews,
+                    ),
                 ),
             )
             overall_metadata_id = cursor.lastrowid
@@ -453,6 +565,19 @@ def write_geopackage(
                         overall_metadata_id,
                     ),
                 )
+            # Build lower-resolution raster tile matrices from the unchanged
+            # native tiles. CPU-heavy decoding and encoding run concurrently;
+            # this connection remains the sole SQLite writer.
+            if overview_factors:
+                _build_sparse_overviews(
+                    connection,
+                    quoted_table,
+                    addresses,
+                    [tile.content for tile in tiles],
+                    overview_factors,
+                    workers,
+                )
+
             connection.commit()
             foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
             if foreign_key_errors:
@@ -463,19 +588,11 @@ def write_geopackage(
         finally:
             connection.close()
 
-        # Build lower-resolution raster tile matrices from the unchanged native
-        # tiles. This is local resampling only: no provider payloads are
-        # replaced, and no additional network requests are made. The sparse
-        # builder inserts only overview tiles with at least one populated child
-        # tile; GDAL's dataset-level builder would scan the entire canvas.
-        if overview_factors:
-            _build_sparse_overviews(
-                temporary,
-                quoted_table,
-                addresses,
-                [tile.content for tile in tiles],
-                overview_factors,
-            )
+        # synchronous=OFF avoids repeated network-filesystem barriers while
+        # building. One explicit barrier makes the completed database durable
+        # before GDAL validates it and the path becomes public.
+        with temporary.open("rb") as completed:
+            os.fsync(completed.fileno())
 
         # Reopen through GDAL before publishing the file. This catches schema,
         # georeferencing and driver-compatibility errors that SQLite alone does

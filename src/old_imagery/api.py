@@ -984,6 +984,7 @@ def download_geopackage(
     provider: Literal["google", "esri"] = "google",
     esri_wayback_release_id: str | None = None,
     table_name: str = "imagery",
+    build_overviews: bool = True,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 10_000,
     include_metadata: bool = True,
@@ -997,25 +998,31 @@ def download_geopackage(
     ``z - 1`` and only the row address changes. Google zooms below 2 cannot be
     represented as complete CRS84 tiles and are rejected.
 
-    The GeoPackage contains the requested native zoom plus locally generated,
-    power-of-two lower-resolution overview tiles using average resampling. Only
-    overview tiles with populated native descendants are generated, so sparse
-    selections do not require scanning or storing the empty parts of their
-    bounding canvas. The source tile payloads remain byte-for-byte unchanged;
-    overview tiles are derived locally and are described in the GeoPackage
-    provenance metadata.
+    By default the GeoPackage contains the requested native zoom plus locally
+    generated, power-of-two lower-resolution overview tiles using average
+    resampling. Pass ``build_overviews=False`` to store only the native zoom.
+    Only overview tiles with populated native descendants are generated, so
+    sparse selections do not require scanning or storing the empty parts of
+    their bounding canvas. The source tile payloads remain byte-for-byte
+    unchanged; overview tiles are derived locally and are described in the
+    GeoPackage provenance metadata. Fully opaque overviews use quality-60 JPEG;
+    overviews containing transparent gaps use lossless PNG.
     Dataset- and tile-level provenance is attached through GeoPackage's
     standard metadata extension. The complete file is validated through GDAL
     and published atomically; an error does not leave a partial destination
     behind.
 
-    Parameters other than ``output``, ``table_name`` and ``overwrite`` have the
-    same selection meaning as :func:`download_tiles`. Existing outputs are
-    refused unless ``overwrite=True``.
+    Overview generation automatically uses the CPUs available to the current
+    process, including Slurm allocation, CPU-affinity and cgroup limits.
+    Parameters other than ``output``, ``table_name``, ``build_overviews`` and
+    ``overwrite`` have the same selection meaning as :func:`download_tiles`.
+    Existing outputs are refused unless ``overwrite=True``.
     """
     output_path = Path(output)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"Output already exists: {output_path}")
+    if not isinstance(build_overviews, bool):
+        raise TypeError("build_overviews must be a bool")
     if provider == "google" and zoom < 2:
         raise ValueError(
             "Google zooms 0 and 1 cannot be represented as complete CRS84 tiles "
@@ -1047,6 +1054,7 @@ def download_geopackage(
         table_name=table_name,
         selection=selection,
         overwrite=overwrite,
+        build_overviews=build_overviews,
     )
 
 
