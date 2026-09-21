@@ -845,27 +845,96 @@ def test_geopackage_overview_sampling_averages_opaque_pixels_and_ignores_gaps() 
     assert transparent[8:12] == b"WEBP"
 
 
-def test_download_geopackage_refuses_existing_output_before_downloading(stub, tmp_path) -> None:
+def test_download_geopackage_create_refuses_existing_output_before_downloading(
+    stub, tmp_path
+) -> None:
     backend = stub(StubBackend([D1]))
     output = tmp_path / "existing.gpkg"
     output.write_bytes(b"keep me")
 
     with pytest.raises(FileExistsError, match="already exists"):
-        old_imagery.download_geopackage(AOI, ZOOM, D1, output=output)
+        old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, mode="create")
 
     assert output.read_bytes() == b"keep me"
     assert backend.downloads == 0
 
 
-def test_download_geopackage_can_atomically_overwrite(stub, tmp_path) -> None:
+def test_download_geopackage_can_atomically_replace(stub, tmp_path) -> None:
     stub(StubBackend([D1], colors={D1: 88}))
     output = tmp_path / "existing.gpkg"
     output.write_bytes(b"replace me")
 
-    old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None, overwrite=True)
+    old_imagery.download_geopackage(
+        AOI, ZOOM, D1, output=output, cache_dir=None, mode="replace"
+    )
 
     with rasterio.open(output) as dataset:
         assert dataset.read(1).mean() == pytest.approx(88, abs=2)
+
+
+def test_download_geopackage_appends_a_new_table_by_default(stub, tmp_path) -> None:
+    stub(StubBackend([D1], colors={D1: 88}))
+    output = tmp_path / "appended.gpkg"
+    old_imagery.download_geopackage(
+        AOI, ZOOM, D1, output=output, table_name="first", cache_dir=None
+    )
+
+    old_imagery.download_geopackage(
+        AOI, ZOOM, D1, output=output, table_name="second", cache_dir=None
+    )
+
+    with sqlite3.connect(output) as connection:
+        tables = connection.execute(
+            "SELECT table_name FROM gpkg_contents WHERE data_type = 'tiles' ORDER BY table_name"
+        ).fetchall()
+        assert tables == [("first",), ("second",)]
+        assert connection.execute("SELECT COUNT(*) FROM first").fetchone()[0] > 0
+        assert connection.execute("SELECT COUNT(*) FROM second").fetchone()[0] > 0
+
+
+def test_download_geopackage_append_refuses_an_existing_table_before_downloading(
+    stub, tmp_path
+) -> None:
+    backend = stub(StubBackend([D1]))
+    output = tmp_path / "duplicate.gpkg"
+    old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None)
+    downloads = backend.downloads
+
+    with pytest.raises(ValueError, match="table already exists"):
+        old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None)
+
+    assert backend.downloads == downloads
+    with sqlite3.connect(output) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_download_geopackage_failed_append_preserves_existing_package(
+    stub, tmp_path
+) -> None:
+    backend = stub(StubBackend([D1]))
+    output = tmp_path / "preserved.gpkg"
+    old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None)
+    original = output.read_bytes()
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+    backend.missing = {selected[0]}
+
+    with pytest.raises(ValueError, match="No imagery found for tile"):
+        old_imagery.download_geopackage(
+            AOI, ZOOM, D1, output=output, table_name="failed", cache_dir=None
+        )
+
+    assert output.read_bytes() == original
+
+
+def test_download_geopackage_rejects_invalid_mode_before_downloading(stub, tmp_path) -> None:
+    backend = stub(StubBackend([D1]))
+
+    with pytest.raises(ValueError, match="mode must be"):
+        old_imagery.download_geopackage(
+            AOI, ZOOM, D1, output=tmp_path / "invalid.gpkg", mode="invalid"  # type: ignore[arg-type]
+        )
+
+    assert backend.downloads == 0
 
 
 def test_download_geopackage_failure_leaves_no_output(stub, tmp_path) -> None:
@@ -1814,6 +1883,9 @@ def test_option_values_are_visible_in_the_signature() -> None:
 
     hints = typing.get_type_hints(old_imagery.download)
     assert typing.get_args(hints["date_match"]) == ("closest", "exact", "before", "after")
+
+    hints = typing.get_type_hints(old_imagery.download_geopackage)
+    assert typing.get_args(hints["mode"]) == ("create", "append", "replace")
 
     # And they are rendered literally, not as a name the reader must resolve.
     text = str(inspect.signature(old_imagery.availability))

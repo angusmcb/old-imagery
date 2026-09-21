@@ -15,7 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import rasterio
@@ -430,13 +430,16 @@ def write_geopackage_stream(
     *,
     table_name: str,
     selection: Mapping[str, object],
-    overwrite: bool,
+    mode: Literal["create", "append", "replace"],
     build_overviews: bool,
 ) -> Path:
     """Consume bounded tile batches into an atomic GeoPackage build."""
     quoted_table = _quoted_identifier(table_name)
     destination = Path(output)
-    if destination.exists() and not overwrite:
+    if mode not in {"create", "append", "replace"}:
+        raise ValueError("mode must be 'create', 'append' or 'replace'")
+    destination_exists = destination.exists()
+    if destination_exists and mode == "create":
         raise FileExistsError(f"Output already exists: {destination}")
     if not destination.parent.exists():
         raise FileNotFoundError(f"Output directory does not exist: {destination.parent}")
@@ -444,10 +447,26 @@ def write_geopackage_stream(
         prefix=f".{destination.name}.", suffix=".gpkg", dir=destination.parent, delete=False
     ) as temporary_file:
         temporary = Path(temporary_file.name)
-    # The GDAL GeoPackage driver creates rather than truncates its target.
-    temporary.unlink()
     connection: sqlite3.Connection | None = None
     try:
+        append_existing = mode == "append" and destination_exists
+        if append_existing:
+            # SQLite's backup API produces a consistent standalone copy even
+            # when the source uses a WAL. All changes remain private until the
+            # completed copy atomically replaces the destination.
+            with sqlite3.connect(destination) as source, sqlite3.connect(temporary) as target:
+                source.backup(target)
+            with sqlite3.connect(temporary) as existing:
+                table_exists = existing.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table_name,),
+                ).fetchone()
+            if table_exists:
+                raise ValueError(f"GeoPackage table already exists: {table_name!r}")
+        else:
+            # The GDAL GeoPackage driver creates rather than truncates its target.
+            temporary.unlink()
+
         first = None
         tile_count = 0
         geopackage_zoom = 0
@@ -474,6 +493,7 @@ def write_geopackage_stream(
                 RASTER_TABLE=table_name,
                 TILING_SCHEME=scheme,
                 TILE_FORMAT="PNG_JPEG",
+                APPEND_SUBDATASET="YES" if append_existing else "NO",
                 CRS_WKT_EXTENSION="YES",
                 METADATA_TABLES="YES",
                 width=width,
@@ -486,12 +506,12 @@ def write_geopackage_stream(
                 pass
 
             connection = sqlite3.connect(temporary)
-            # GDAL has created only the small GeoPackage schema at this point,
-            # so changing from SQLite's 4 KiB default costs almost nothing.
-            # Larger pages turn large tile blobs into far fewer filesystem
-            # writes without the space inflation measured at 32/64 KiB.
-            connection.execute(f"PRAGMA page_size = {_SQLITE_PAGE_SIZE}")
-            connection.execute("VACUUM")
+            if not append_existing:
+                # GDAL has created only the small GeoPackage schema at this
+                # point, so changing from SQLite's 4 KiB default costs almost
+                # nothing. Preserve an existing package's chosen page size.
+                connection.execute(f"PRAGMA page_size = {_SQLITE_PAGE_SIZE}")
+                connection.execute("VACUUM")
             # This is an unpublished, reproducible build artifact. Keep its
             # small rollback journal in memory and omit durable syncs; the
             # completed database is checked before it is published.
@@ -660,11 +680,17 @@ def write_geopackage_stream(
         # Reopen through GDAL before publishing the file. This catches schema,
         # georeferencing and driver-compatibility errors that SQLite alone does
         # not know how to identify.
-        with rasterio.open(temporary) as dataset:
+        validation_target: str | Path = temporary
+        if append_existing:
+            # A multi-table GeoPackage opens as a subdataset container, which
+            # intentionally has no raster dimensions of its own. Address the
+            # table just added when validating an append.
+            validation_target = f"GPKG:{temporary}:{table_name}"
+        with rasterio.open(validation_target) as dataset:
             if dataset.crs is None or dataset.width <= 0 or dataset.height <= 0:
                 raise ValueError("GDAL could not validate the completed GeoPackage")
 
-        if overwrite:
+        if destination_exists and mode in {"append", "replace"}:
             os.replace(temporary, destination)
         else:
             # A hard link publishes without the check-then-replace race that
@@ -684,7 +710,7 @@ def write_geopackage(
     *,
     table_name: str,
     selection: Mapping[str, object],
-    overwrite: bool,
+    mode: Literal["create", "append", "replace"],
     build_overviews: bool,
 ) -> Path:
     """Write an existing tile sequence through the streaming writer."""
@@ -697,6 +723,6 @@ def write_geopackage(
         output,
         table_name=table_name,
         selection=selection,
-        overwrite=overwrite,
+        mode=mode,
         build_overviews=build_overviews,
     )

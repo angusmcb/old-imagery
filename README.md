@@ -350,7 +350,7 @@ download_geopackage(
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 10_000,
     include_metadata: bool = True,
-    overwrite: bool = False,
+    mode: Literal["create", "append", "replace"] = "append",
 ) -> pathlib.Path
 ```
 
@@ -392,8 +392,10 @@ overall selection and overview factors, and row-referenced tile metadata
 records both address systems plus capture, source and release provenance. The
 native tile level remains byte-preserved; overview tiles are derived locally.
 The GeoPackage is first completed and reopened through GDAL at a temporary
-path, then published atomically. Existing outputs are refused unless
-`overwrite=True`.
+path, then published atomically. The default `mode="append"` creates the file
+when absent or adds a new tile table to an existing GeoPackage. Use
+`mode="create"` to fail if the output already exists, or `mode="replace"` to
+replace the entire GeoPackage.
 
 Overview decoding, resampling and encoding use the CPUs available to the
 current process. On Slurm this respects `SLURM_CPUS_PER_TASK`; CPU affinity and

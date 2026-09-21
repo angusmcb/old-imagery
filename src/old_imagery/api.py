@@ -1049,7 +1049,7 @@ def download_geopackage(
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 10_000,
     include_metadata: bool = True,
-    overwrite: bool = False,
+    mode: Literal["create", "append", "replace"] = "append",
 ) -> Path:
     """Download native image tiles into an OGC GeoPackage without reprojection.
 
@@ -1081,11 +1081,15 @@ def download_geopackage(
     Overview generation automatically uses the CPUs available to the current
     process, including Slurm allocation, CPU-affinity and cgroup limits.
     Parameters other than ``output``, ``table_name``, ``build_overviews`` and
-    ``overwrite`` have the same selection meaning as :func:`download_tiles`.
-    Existing outputs are refused unless ``overwrite=True``.
+    ``mode`` have the same selection meaning as :func:`download_tiles`.
+    ``mode="append"`` creates a new GeoPackage or adds a new table to an
+    existing one. ``mode="create"`` refuses an existing output, while
+    ``mode="replace"`` atomically replaces the entire GeoPackage.
     """
     output_path = Path(output)
-    if output_path.exists() and not overwrite:
+    if mode not in {"create", "append", "replace"}:
+        raise ValueError("mode must be 'create', 'append' or 'replace'")
+    if output_path.exists() and mode == "create":
         raise FileExistsError(f"Output already exists: {output_path}")
     if not isinstance(build_overviews, bool):
         raise TypeError("build_overviews must be a bool")
@@ -1123,7 +1127,7 @@ def download_geopackage(
         output_path,
         table_name=table_name,
         selection=selection,
-        overwrite=overwrite,
+        mode=mode,
         build_overviews=build_overviews,
     )
 

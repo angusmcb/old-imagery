@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "old-imagery"
-version = "0.3.0"
+version = "0.3.1"
 description = "Historical aerial imagery from Google Earth and Esri Wayback, as shapely-in / rasterio-out Python functions"
 readme = "README.md"
 requires-python = ">=3.10"
