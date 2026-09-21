@@ -10,11 +10,12 @@ import os
 import sqlite3
 import tempfile
 from collections import deque
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import rasterio
@@ -297,8 +298,7 @@ def _bounded_parent_map(
 def _build_sparse_overviews(
     connection: sqlite3.Connection,
     quoted_table: str,
-    addresses: list[tuple[int, int, int]],
-    payloads: list[bytes],
+    zoom: int,
     overview_factors: tuple[int, ...],
     workers: int,
 ) -> None:
@@ -308,19 +308,21 @@ def _build_sparse_overviews(
     canvas, which is particularly expensive when the native tile set is
     sparse. The tile matrix is a quadtree, so a two-to-one pass can derive the
     same pyramid while touching only occupied child tiles. Transparent pixels
-    represent gaps and are excluded from the average.
+    represent gaps and are excluded from the average. Child payloads are read
+    back from SQLite in groups of at most four rather than retaining a whole
+    source level in process memory.
     """
     if not overview_factors:
         return
 
-    zoom = addresses[0][0]
-    current = {
-        (column, row): payload
-        for (_, column, row), payload in zip(addresses, payloads, strict=True)
-    }
     insert_sql = (
         f"INSERT INTO {quoted_table} "
         "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)"
+    )
+    child_sql = (
+        f"SELECT tile_column, tile_row, tile_data FROM {quoted_table} "
+        "WHERE zoom_level = ? AND tile_column BETWEEN ? AND ? "
+        "AND tile_row BETWEEN ? AND ? ORDER BY tile_column, tile_row"
     )
     pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
     try:
@@ -328,13 +330,31 @@ def _build_sparse_overviews(
             expected_factor = 1 << level
             if factor != expected_factor:
                 raise ValueError("Overview factors must be consecutive powers of two")
-            parents: dict[tuple[int, int], list[tuple[int, int, bytes]]] = {}
-            for (column, row), payload in current.items():
-                parents.setdefault((column // 2, row // 2), []).append((column, row, payload))
-
-            next_level: dict[tuple[int, int], bytes] = {}
             try:
-                items = sorted(parents.items())
+                child_zoom = zoom - level + 1
+                parent_cursor = connection.execute(
+                    f"SELECT DISTINCT tile_column / 2, tile_row / 2 "
+                    f"FROM {quoted_table} WHERE zoom_level = ? ORDER BY 1, 2",
+                    (child_zoom,),
+                )
+
+                def parent_items(parent_cursor=parent_cursor, child_zoom=child_zoom):
+                    for parent_column, parent_row in parent_cursor:
+                        children = list(
+                            connection.execute(
+                                child_sql,
+                                (
+                                    child_zoom,
+                                    parent_column * 2,
+                                    parent_column * 2 + 1,
+                                    parent_row * 2,
+                                    parent_row * 2 + 1,
+                                ),
+                            )
+                        )
+                        yield (parent_column, parent_row), children
+
+                items = parent_items()
                 results = (
                     _bounded_parent_map(pool, items, workers)
                     if pool is not None
@@ -350,30 +370,29 @@ def _build_sparse_overviews(
                             sqlite3.Binary(encoded),
                         ),
                     )
-                    next_level[(parent_column, parent_row)] = encoded
             except Exception as error:
                 raise ValueError("Could not build an overview tile") from error
-            current = next_level
+            connection.commit()
     finally:
         if pool is not None:
             pool.shutdown()
 
 
 def _overall_metadata(
-    tiles,
+    first,
+    tile_count: int,
     selection: Mapping[str, object],
     geopackage_zoom: int,
     overview_factors: tuple[int, ...],
     build_overviews: bool,
 ) -> str:
-    first = tiles[0]
     values = {
         "schema_version": 1,
         "provider": first.provider,
         "native_tile_scheme": first.tile_scheme,
         "native_zoom": first.zoom,
         "geopackage_zoom": geopackage_zoom,
-        "tile_count": len(tiles),
+        "tile_count": tile_count,
         "selection": selection,
         "overviews": {
             "enabled": build_overviews,
@@ -405,8 +424,8 @@ def _tile_metadata(tile, address: tuple[int, int, int]) -> str:
     return json.dumps(values, separators=(",", ":"), default=str)
 
 
-def write_geopackage(
-    tiles,
+def write_geopackage_stream(
+    produce: Callable[[Callable[[Sequence[Any]], None]], None],
     output: str | os.PathLike[str],
     *,
     table_name: str,
@@ -414,75 +433,59 @@ def write_geopackage(
     overwrite: bool,
     build_overviews: bool,
 ) -> Path:
-    """Write native tiles and optional lower-resolution overviews atomically."""
-    if not tiles:
-        raise ValueError("Cannot create a GeoPackage without tiles")
+    """Consume bounded tile batches into an atomic GeoPackage build."""
     quoted_table = _quoted_identifier(table_name)
-    first = tiles[0]
-    if any(
-        (tile.provider, tile.tile_scheme, tile.zoom)
-        != (first.provider, first.tile_scheme, first.zoom)
-        for tile in tiles
-    ):
-        raise ValueError("All GeoPackage tiles must share one provider, scheme and zoom")
-    formats = {tile.image_format for tile in tiles}
-    unsupported = formats - {"jpeg", "png"}
-    if unsupported:
-        names = ", ".join(sorted(unsupported))
-        raise ValueError(f"GeoPackage output does not support native tile format(s): {names}")
-
-    addresses = [_tile_address(tile) for tile in tiles]
-    scheme, crs, width, height, origin_x, origin_y, pixel_size = _grid(first)
-    bounds = _content_bounds(addresses, pixel_size, origin_x, origin_y)
-    geopackage_zoom = addresses[0][0]
-    content_width, content_height = _content_shape(addresses)
-    overview_factors = (
-        _overview_factors(content_width, content_height, geopackage_zoom) if build_overviews else ()
-    )
-
     destination = Path(output)
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Output already exists: {destination}")
     if not destination.parent.exists():
         raise FileNotFoundError(f"Output directory does not exist: {destination.parent}")
-    workers = min(_available_cpu_count(), len(tiles)) if overview_factors else 1
-
     with tempfile.NamedTemporaryFile(
         prefix=f".{destination.name}.", suffix=".gpkg", dir=destination.parent, delete=False
     ) as temporary_file:
         temporary = Path(temporary_file.name)
     # The GDAL GeoPackage driver creates rather than truncates its target.
     temporary.unlink()
+    connection: sqlite3.Connection | None = None
     try:
-        # Let GDAL create the normative GeoPackage core tables, constraints,
-        # triggers, application ID and version. No raster blocks are written;
-        # the unchanged provider payloads are inserted below.
-        with rasterio.open(
-            temporary,
-            "w",
-            driver="GPKG",
-            RASTER_TABLE=table_name,
-            TILING_SCHEME=scheme,
-            TILE_FORMAT="JPEG" if formats == {"jpeg"} else "PNG_JPEG",
-            # Baseline GeoPackage stores CRS definitions as legacy WKT1.
-            # Also write the official CRS-WKT extension: current QGIS builds
-            # prefer its unambiguous WKT2 definition for raster layers.
-            CRS_WKT_EXTENSION="YES",
-            # Provenance is attached through the standard GeoPackage metadata
-            # extension. Ad-hoc user tables make QGIS 4.2 discard the CRS of a
-            # raster in the same container.
-            METADATA_TABLES="YES",
-            width=width,
-            height=height,
-            count=3,
-            dtype="uint8",
-            crs=crs,
-            transform=from_origin(origin_x, origin_y, pixel_size, pixel_size),
-        ):
-            pass
+        first = None
+        tile_count = 0
+        geopackage_zoom = 0
+        min_column = min_row = max_column = max_row = 0
+        origin_x = origin_y = pixel_size = 0.0
+        overall_metadata_id = 0
+        standard_uri = "https://github.com/angusmcb/old-imagery#geopackage-provenance-v1"
 
-        connection = sqlite3.connect(temporary)
-        try:
+        def initialize(tile) -> None:
+            nonlocal connection, first, geopackage_zoom
+            nonlocal origin_x, origin_y, pixel_size, overall_metadata_id
+            first = tile
+            scheme, crs, width, height, origin_x, origin_y, pixel_size = _grid(tile)
+            geopackage_zoom, _column, _row = _tile_address(tile)
+
+            # Let GDAL create the normative GeoPackage core tables,
+            # constraints, triggers, application ID and version. PNG_JPEG
+            # permits either supported native encoding without needing to
+            # retain all tiles merely to discover their formats.
+            with rasterio.open(
+                temporary,
+                "w",
+                driver="GPKG",
+                RASTER_TABLE=table_name,
+                TILING_SCHEME=scheme,
+                TILE_FORMAT="PNG_JPEG",
+                CRS_WKT_EXTENSION="YES",
+                METADATA_TABLES="YES",
+                width=width,
+                height=height,
+                count=3,
+                dtype="uint8",
+                crs=crs,
+                transform=from_origin(origin_x, origin_y, pixel_size, pixel_size),
+            ):
+                pass
+
+            connection = sqlite3.connect(temporary)
             # GDAL has created only the small GeoPackage schema at this point,
             # so changing from SQLite's 4 KiB default costs almost nothing.
             # Larger pages turn large tile blobs into far fewer filesystem
@@ -498,7 +501,7 @@ def write_geopackage(
             connection.execute(f"PRAGMA cache_size = -{_SQLITE_CACHE_SIZE_KIB}")
             connection.execute("PRAGMA temp_store = MEMORY")
             connection.execute("PRAGMA foreign_keys = ON")
-            if overview_factors:
+            if build_overviews:
                 # WebP is an official GeoPackage tile encoding extension. It
                 # allows sparse overview tiles to retain alpha without the
                 # large lossless-PNG payloads produced by photographic data.
@@ -508,59 +511,59 @@ def write_geopackage(
                     "VALUES (?, 'tile_data', 'gpkg_webp', ?, 'read-write')",
                     (table_name, _WEBP_EXTENSION_DEFINITION),
                 )
-            connection.execute(
-                "UPDATE gpkg_contents SET identifier = ?, description = ?, "
-                "last_change = ?, min_x = ?, min_y = ?, max_x = ?, max_y = ? "
-                "WHERE table_name = ?",
-                (
-                    table_name,
-                    "Historical imagery downloaded by old-imagery",
-                    dt.datetime.now(dt.timezone.utc)
-                    .isoformat(timespec="milliseconds")
-                    .replace("+00:00", "Z"),
-                    *bounds,
-                    table_name,
-                ),
-            )
-            connection.executemany(
-                f"INSERT INTO {quoted_table} "
-                "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-                # sqlite3.Binary makes the byte-preservation intent explicit.
-                [
-                    (*address, sqlite3.Binary(tile.content))
-                    for tile, address in zip(tiles, addresses, strict=True)
-                ],
-            )
-            standard_uri = "https://github.com/angusmcb/old-imagery#geopackage-provenance-v1"
             cursor = connection.execute(
                 "INSERT INTO gpkg_metadata "
                 "(md_scope, md_standard_uri, mime_type, metadata) "
-                "VALUES ('dataset', ?, 'application/json', ?)",
-                (
-                    standard_uri,
-                    _overall_metadata(
-                        tiles,
-                        selection,
-                        geopackage_zoom,
-                        overview_factors,
-                        build_overviews,
-                    ),
-                ),
+                "VALUES ('dataset', ?, 'application/json', '{}')",
+                (standard_uri,),
             )
-            overall_metadata_id = cursor.lastrowid
+            inserted_id = cursor.lastrowid
+            if inserted_id is None:  # pragma: no cover - SQLite always supplies a row id
+                raise ValueError("GeoPackage metadata insert did not return a row id")
+            overall_metadata_id = inserted_id
             connection.execute(
                 "INSERT INTO gpkg_metadata_reference "
                 "(reference_scope, table_name, md_file_id) VALUES ('table', ?, ?)",
                 (table_name, overall_metadata_id),
             )
 
-            tile_ids = {
-                (zoom, column, row): tile_id
-                for tile_id, zoom, column, row in connection.execute(
-                    f"SELECT id, zoom_level, tile_column, tile_row FROM {quoted_table}"
+        def consume(batch: Sequence[Any]) -> None:
+            nonlocal first, tile_count, connection
+            nonlocal min_column, min_row, max_column, max_row
+            for tile in batch:
+                if tile.image_format not in {"jpeg", "png"}:
+                    raise ValueError(
+                        "GeoPackage output does not support native tile format "
+                        f"{tile.image_format!r}"
+                    )
+                if first is None:
+                    initialize(tile)
+                assert first is not None and connection is not None
+                if (tile.provider, tile.tile_scheme, tile.zoom) != (
+                    first.provider,
+                    first.tile_scheme,
+                    first.zoom,
+                ):
+                    raise ValueError(
+                        "All GeoPackage tiles must share one provider, scheme and zoom"
+                    )
+                address = _tile_address(tile)
+                if tile_count == 0:
+                    _, min_column, min_row = address
+                    max_column, max_row = min_column, min_row
+                else:
+                    _, column, row = address
+                    min_column = min(min_column, column)
+                    max_column = max(max_column, column)
+                    min_row = min(min_row, row)
+                    max_row = max(max_row, row)
+
+                cursor = connection.execute(
+                    f"INSERT INTO {quoted_table} "
+                    "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                    (*address, sqlite3.Binary(tile.content)),
                 )
-            }
-            for tile, address in zip(tiles, addresses, strict=True):
+                tile_id = cursor.lastrowid
                 cursor = connection.execute(
                     "INSERT INTO gpkg_metadata "
                     "(md_scope, md_standard_uri, mime_type, metadata) "
@@ -571,35 +574,82 @@ def write_geopackage(
                     "INSERT INTO gpkg_metadata_reference "
                     "(reference_scope, table_name, row_id_value, md_file_id, md_parent_id) "
                     "VALUES ('row', ?, ?, ?, ?)",
-                    (
-                        table_name,
-                        tile_ids[address],
-                        cursor.lastrowid,
-                        overall_metadata_id,
-                    ),
+                    (table_name, tile_id, cursor.lastrowid, overall_metadata_id),
                 )
-            # Build lower-resolution raster tile matrices from the unchanged
-            # native tiles. CPU-heavy decoding and encoding run concurrently;
-            # this connection remains the sole SQLite writer.
-            if overview_factors:
-                _build_sparse_overviews(
-                    connection,
-                    quoted_table,
-                    addresses,
-                    [tile.content for tile in tiles],
-                    overview_factors,
-                    workers,
-                )
+                tile_count += 1
+            # The temporary path is not public, so committing bounded batches
+            # preserves atomic publication while releasing SQLite transaction
+            # state during long-running downloads.
+            if connection is not None:
+                connection.commit()
 
-            connection.commit()
-            foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-            if foreign_key_errors:
-                raise ValueError("GeoPackage validation found a broken foreign key")
-            integrity = connection.execute("PRAGMA integrity_check").fetchone()
-            if integrity != ("ok",):
-                raise ValueError("GeoPackage SQLite integrity check failed")
-        finally:
-            connection.close()
+        produce(consume)
+        if first is None or connection is None:
+            raise ValueError("Cannot create a GeoPackage without tiles")
+
+        addresses = [
+            (geopackage_zoom, min_column, min_row),
+            (geopackage_zoom, max_column, max_row),
+        ]
+        bounds = _content_bounds(addresses, pixel_size, origin_x, origin_y)
+        content_width, content_height = _content_shape(addresses)
+        overview_factors = (
+            _overview_factors(content_width, content_height, geopackage_zoom)
+            if build_overviews
+            else ()
+        )
+        workers = min(_available_cpu_count(), tile_count) if overview_factors else 1
+
+        connection.execute(
+            "UPDATE gpkg_contents SET identifier = ?, description = ?, "
+            "last_change = ?, min_x = ?, min_y = ?, max_x = ?, max_y = ? "
+            "WHERE table_name = ?",
+            (
+                table_name,
+                "Historical imagery downloaded by old-imagery",
+                dt.datetime.now(dt.timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+                *bounds,
+                table_name,
+            ),
+        )
+        connection.execute(
+            "UPDATE gpkg_metadata SET metadata = ? WHERE id = ?",
+            (
+                _overall_metadata(
+                    first,
+                    tile_count,
+                    selection,
+                    geopackage_zoom,
+                    overview_factors,
+                    build_overviews,
+                ),
+                overall_metadata_id,
+            ),
+        )
+
+        # Build each lower-resolution level from the preceding level already
+        # stored in SQLite. Only bounded groups of four child payloads and the
+        # bounded worker queue are resident at once.
+        if overview_factors:
+            _build_sparse_overviews(
+                connection,
+                quoted_table,
+                geopackage_zoom,
+                overview_factors,
+                workers,
+            )
+
+        connection.commit()
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise ValueError("GeoPackage validation found a broken foreign key")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity != ("ok",):
+            raise ValueError("GeoPackage SQLite integrity check failed")
+        connection.close()
+        connection = None
 
         # synchronous=OFF avoids repeated network-filesystem barriers while
         # building. One explicit barrier makes the completed database durable
@@ -623,4 +673,30 @@ def write_geopackage(
             temporary.unlink()
         return destination
     finally:
+        if connection is not None:
+            connection.close()
         temporary.unlink(missing_ok=True)
+
+
+def write_geopackage(
+    tiles,
+    output: str | os.PathLike[str],
+    *,
+    table_name: str,
+    selection: Mapping[str, object],
+    overwrite: bool,
+    build_overviews: bool,
+) -> Path:
+    """Write an existing tile sequence through the streaming writer."""
+
+    def produce(consume: Callable[[Sequence[Any]], None]) -> None:
+        consume(tiles)
+
+    return write_geopackage_stream(
+        produce,
+        output,
+        table_name=table_name,
+        selection=selection,
+        overwrite=overwrite,
+        build_overviews=build_overviews,
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import inspect
 import json
 import sqlite3
@@ -655,6 +656,59 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
 
     with rasterio.open(output, ZOOM_LEVEL=source_zoom - 1) as overview_level:
         assert overview_level.dataset_mask().min() == 0
+
+
+def test_download_geopackage_releases_native_tiles_before_overviews(
+    stub, tmp_path, monkeypatch
+) -> None:
+    from old_imagery import _geopackage
+
+    payload = _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
+    backend = StubBackend([D1])
+    backend.download_tile_image = lambda _dated: payload
+    stub(backend)
+    points = MultiPoint(
+        [KeyholeTile.from_row_col(50_000, 20_000 + column, ZOOM).center for column in range(160)]
+    )
+
+    real_tile_type = api.DownloadedTile
+
+    class TrackedTile(real_tile_type):
+        live = 0
+        peak = 0
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            type(self).live += 1
+            type(self).peak = max(type(self).peak, type(self).live)
+
+        def __del__(self):
+            type(self).live -= 1
+
+    monkeypatch.setattr(api, "DownloadedTile", TrackedTile)
+    real_build = _geopackage._build_sparse_overviews
+
+    def checked_build(*args, **kwargs):
+        gc.collect()
+        # The writer retains one representative tile for dataset metadata, but
+        # every native payload batch must have been released before overviews.
+        assert TrackedTile.live == 1
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(_geopackage, "_build_sparse_overviews", checked_build)
+
+    old_imagery.download_geopackage(
+        points,
+        ZOOM,
+        D1,
+        output=tmp_path / "bounded.gpkg",
+        cache_dir=None,
+    )
+
+    # Google batches contain at most 64 results. During a batch hand-off the
+    # preceding results may coexist with the next batch, plus the one retained
+    # representative tile.
+    assert TrackedTile.peak <= 129
 
 
 def test_download_geopackage_uses_optimized_sqlite_build(stub, tmp_path) -> None:

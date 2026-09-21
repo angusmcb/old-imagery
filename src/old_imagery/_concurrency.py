@@ -155,6 +155,32 @@ def adaptive_tile_map(
     return _adaptive_map(provider, function, items, windows, is_acceptable=is_acceptable)
 
 
+def adaptive_tile_consume(
+    provider: str,
+    function: Callable[[_Input], _Output],
+    items: Sequence[_Input],
+    consume: Callable[[Sequence[_Output]], None],
+    *,
+    is_acceptable: Callable[[_Output], bool] | None = None,
+) -> None:
+    """Adaptively process raw tiles without retaining all results.
+
+    ``consume`` is called synchronously with each completed calibration or
+    monitoring batch.  Its return releases that batch before more payloads are
+    produced, while retaining the same adaptive measurements and request
+    ordering as :func:`adaptive_tile_map`.
+    """
+    windows = _RAW_TILE_WINDOWS.get(provider, _DEFAULT_RAW_TILE_WINDOWS)
+    _adaptive_map(
+        provider,
+        function,
+        items,
+        windows,
+        is_acceptable=is_acceptable,
+        result_sink=consume,
+    )
+
+
 def _adaptive_map(
     state_key: str,
     function: Callable[[_Input], _Output],
@@ -162,6 +188,7 @@ def _adaptive_map(
     windows: tuple[int, ...],
     *,
     is_acceptable: Callable[[_Output], bool] | None = None,
+    result_sink: Callable[[Sequence[_Output]], None] | None = None,
 ) -> list[_Output]:
     if not items:
         return []
@@ -169,13 +196,19 @@ def _adaptive_map(
     state = _get_learned_state(state_key, windows)
     if state is not None:
         if len(items) < _MIN_MONITORING_TASKS:
-            return _fixed_map(function, items, state.workers)
+            return _fixed_map_or_consume(function, items, state.workers, result_sink)
         return _map_with_feedback(
-            state_key, function, items, windows, state, is_acceptable=is_acceptable
+            state_key,
+            function,
+            items,
+            windows,
+            state,
+            is_acceptable=is_acceptable,
+            result_sink=result_sink,
         )
 
     if len(windows) < 2 or len(items) < _minimum_calibration_tasks(windows):
-        return _fixed_map(function, items, windows[0])
+        return _fixed_map_or_consume(function, items, windows[0], result_sink)
 
     outputs: list[_Output] = []
     next_item = 0
@@ -194,7 +227,7 @@ def _adaptive_map(
                 batch = items[next_item : next_item + observation_size]
                 results, observation = _run_observed_batch(pool, function, batch, workers)
                 observation = _with_acceptability(observation, results, is_acceptable)
-                outputs.extend(results)
+                _deliver_results(outputs, results, result_sink)
                 observations.append(observation)
                 next_item += observation_size
 
@@ -241,10 +274,11 @@ def _adaptive_map(
                     windows,
                     state,
                     is_acceptable=is_acceptable,
+                    result_sink=result_sink,
                 )
             )
         else:
-            outputs.extend(_fixed_map(function, rest, best.workers))
+            outputs.extend(_fixed_map_or_consume(function, rest, best.workers, result_sink))
     return outputs
 
 
@@ -256,6 +290,7 @@ def _map_with_feedback(
     state: _LearnedState,
     *,
     is_acceptable: Callable[[_Output], bool] | None = None,
+    result_sink: Callable[[Sequence[_Output]], None] | None = None,
 ) -> list[_Output]:
     outputs: list[_Output] = []
     next_item = 0
@@ -274,7 +309,7 @@ def _map_with_feedback(
             batch = items[next_item : next_item + sample_size]
             results, observation = _run_observed_batch(pool, function, batch, active_workers)
             observation = _with_acceptability(observation, results, is_acceptable)
-            outputs.extend(results)
+            _deliver_results(outputs, results, result_sink)
             next_item += sample_size
 
             # A short tail completes at the selected width but is too noisy to
@@ -289,6 +324,34 @@ def _map_with_feedback(
             _store_state(state_key, state)
 
     return outputs
+
+
+def _deliver_results(
+    outputs: list[_Output],
+    results: list[_Output],
+    result_sink: Callable[[Sequence[_Output]], None] | None,
+) -> None:
+    if result_sink is None:
+        outputs.extend(results)
+    else:
+        result_sink(results)
+
+
+def _fixed_map_or_consume(
+    function: Callable[[_Input], _Output],
+    items: Sequence[_Input],
+    workers: int,
+    result_sink: Callable[[Sequence[_Output]], None] | None,
+) -> list[_Output]:
+    if result_sink is None:
+        return _fixed_map(function, items, workers)
+
+    # A fixed-width tail can be arbitrarily large after a rejected calibration
+    # window. Keep its retained results bounded just like monitored batches.
+    batch_size = max(_MIN_MONITORING_TASKS, workers * _MONITORING_WAVES)
+    for start in range(0, len(items), batch_size):
+        result_sink(_fixed_map(function, items[start : start + batch_size], workers))
+    return []
 
 
 def _apply_regular_observation(

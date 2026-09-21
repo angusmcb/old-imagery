@@ -300,6 +300,36 @@ def test_parallel_map_never_exceeds_its_active_window() -> None:
     assert 1 < peak <= 8
 
 
+def test_adaptive_tile_consumer_releases_bounded_batches(monkeypatch) -> None:
+    values = list(range(500))
+    batch_sizes = []
+    consumed = []
+
+    def run_batch(pool, function, items, workers):
+        return [function(item) for item in items], _concurrency._Observation(
+            workers, float(workers), 0.1
+        )
+
+    def consume(batch):
+        batch_sizes.append(len(batch))
+        consumed.extend(batch)
+
+    monkeypatch.setattr(_concurrency, "_run_observed_batch", run_batch)
+    _concurrency.adaptive_tile_consume(
+        "google",
+        lambda value: value,
+        values,
+        consume,
+    )
+
+    assert consumed == values
+    assert max(batch_sizes) < len(values)
+    assert max(batch_sizes) <= max(
+        _concurrency._MIN_MONITORING_TASKS,
+        max(_concurrency._RAW_TILE_WINDOWS["google"]) * _concurrency._MONITORING_WAVES,
+    )
+
+
 def test_public_download_functions_do_not_expose_a_concurrency_override() -> None:
     for function in (old_imagery.download, old_imagery.download_tiles):
         parameters = inspect.signature(function).parameters

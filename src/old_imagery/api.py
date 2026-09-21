@@ -8,11 +8,11 @@ import os
 import threading
 import warnings
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import geopandas as gpd
 import numpy as np
@@ -27,6 +27,7 @@ from shapely.ops import unary_union
 from ._concurrency import (
     _WARNING_FILTER_LOCK,
     adaptive_metadata_map,
+    adaptive_tile_consume,
     adaptive_tile_map,
     workers_for,
 )
@@ -842,7 +843,7 @@ def _inspect_tile_payload(raw: bytes) -> tuple[str, str]:
         raise ValueError(f"provider returned unsupported image format {driver!r}") from error
 
 
-def download_tiles(
+def _download_tiles_to(
     geometry: TileGeometry,
     zoom: int,
     date: DateLike | None = None,
@@ -853,8 +854,9 @@ def download_tiles(
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 10_000,
     include_metadata: bool = True,
-) -> list[DownloadedTile]:
-    """Download complete native image tiles selected by a WGS84 geometry.
+    consume: Callable[[Sequence[DownloadedTile]], None],
+) -> None:
+    """Download complete native tiles into a synchronous bounded consumer.
 
     ``Point`` and ``MultiPoint`` select the one provider-native tile containing
     each point. ``Polygon`` and ``MultiPolygon`` select every tile they
@@ -865,14 +867,9 @@ def download_tiles(
     image payloads still abort the whole call; Google downloads remain strict
     for every selected tile.
 
-    Payloads remain in memory and are returned unchanged. This function never
-    creates output or temporary files. The existing HTTP response cache is the
-    only possible disk write; pass ``cache_dir=None`` for a fully diskless call.
-
-    Date and release selection have exactly the same meaning as in
-    :func:`download`. Esri capture and source metadata are sampled at each
-    tile's centre and therefore need not describe every pixel where a source
-    footprint seam crosses the tile.
+    Metadata is resolved before raw payload adaptation, as for the public tile
+    API. Raw results are retained only until ``consume`` returns for their
+    bounded calibration or monitoring batch.
     """
     _validate_zoom(zoom, provider)
     target = _validate_download_selection(provider, date, date_match, esri_wayback_release_id)
@@ -949,29 +946,93 @@ def download_tiles(
                 release_title=getattr(layer, "title", None),
             )
 
-        downloaded = adaptive_tile_map(
-            provider, fetch, resolved, is_acceptable=lambda result: result is not None
+        missing_count = 0
+        missing_examples: list[str] = []
+        next_result = 0
+
+        def consume_results(results: Sequence[DownloadedTile | None]) -> None:
+            nonlocal missing_count, next_result
+            present: list[DownloadedTile] = []
+            for result in results:
+                tile, _candidate = resolved[next_result]
+                next_result += 1
+                if result is None:
+                    missing_count += 1
+                    if len(missing_examples) < 5:
+                        missing_examples.append(f"z{tile.level}/{tile.column}/{tile.row}")
+                else:
+                    present.append(result)
+            if present:
+                consume(present)
+
+        adaptive_tile_consume(
+            provider,
+            fetch,
+            resolved,
+            consume_results,
+            is_acceptable=lambda result: result is not None,
         )
-        missing = [
-            tile
-            for (tile, _candidate), result in zip(resolved, downloaded, strict=True)
-            if result is None
-        ]
-        if missing:
-            examples = ", ".join(
-                f"z{tile.level}/{tile.column}/{tile.row}" for tile in missing[:5]
-            )
-            suffix = "" if len(missing) <= 5 else f" (and {len(missing) - 5:,} more)"
+        if missing_count:
+            examples = ", ".join(missing_examples)
+            suffix = "" if missing_count <= 5 else f" (and {missing_count - 5:,} more)"
             warnings.warn(
-                f"Esri returned HTTP 404 for {len(missing):,} selected imagery "
-                f"tile{'s' if len(missing) != 1 else ''}; omitted from the sparse "
+                f"Esri returned HTTP 404 for {missing_count:,} selected imagery "
+                f"tile{'s' if missing_count != 1 else ''}; omitted from the sparse "
                 f"result: {examples}{suffix}",
                 RuntimeWarning,
                 stacklevel=2,
             )
-        return [result for result in downloaded if result is not None]
     finally:
         client.close()
+
+
+def download_tiles(
+    geometry: TileGeometry,
+    zoom: int,
+    date: DateLike | None = None,
+    *,
+    date_match: Literal["closest", "exact", "before", "after"] = "closest",
+    provider: Literal["google", "esri"] = "google",
+    esri_wayback_release_id: str | None = None,
+    cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
+    max_tiles: int = 10_000,
+    include_metadata: bool = True,
+) -> list[DownloadedTile]:
+    """Download complete native image tiles selected by a WGS84 geometry.
+
+    ``Point`` and ``MultiPoint`` select the one provider-native tile containing
+    each point. ``Polygon`` and ``MultiPolygon`` select every tile they
+    intersect. Returned payloads are full, unclipped provider images in
+    deterministic row-major order. Esri tiles that definitively return HTTP
+    404 are omitted with a warning because historical releases can contain
+    genuine coverage gaps. Network failures, other HTTP errors, and invalid
+    image payloads still abort the whole call; Google downloads remain strict
+    for every selected tile.
+
+    Payloads remain in memory and are returned unchanged. This function never
+    creates output or temporary files. The existing HTTP response cache is the
+    only possible disk write; pass ``cache_dir=None`` for a fully diskless call.
+
+    Date and release selection have exactly the same meaning as in
+    :func:`download`. Esri capture and source metadata are sampled at each
+    tile's centre and therefore need not describe every pixel where a source
+    footprint seam crosses the tile. GeoPackage output uses the same selection
+    machinery through a bounded streaming consumer instead.
+    """
+    downloaded: list[DownloadedTile] = []
+    _download_tiles_to(
+        geometry,
+        zoom,
+        date,
+        date_match=date_match,
+        provider=provider,
+        esri_wayback_release_id=esri_wayback_release_id,
+        cache_dir=cache_dir,
+        max_tiles=max_tiles,
+        include_metadata=include_metadata,
+        consume=downloaded.extend,
+    )
+    return downloaded
 
 
 def download_geopackage(
@@ -1013,6 +1074,10 @@ def download_geopackage(
     and published atomically; an error does not leave a partial destination
     behind.
 
+    Native payloads are written and released in bounded download batches.
+    Overview generation reads each group of child tiles back from the
+    GeoPackage, so neither phase retains the complete imagery set in memory.
+
     Overview generation automatically uses the CPUs available to the current
     process, including Slurm allocation, CPU-affinity and cgroup limits.
     Parameters other than ``output``, ``table_name``, ``build_overviews`` and
@@ -1029,18 +1094,7 @@ def download_geopackage(
             "Google zooms 0 and 1 cannot be represented as complete CRS84 tiles "
             "without cutting or combining native images; use zoom 2 or greater"
         )
-    tiles = download_tiles(
-        aoi,
-        zoom,
-        date,
-        date_match=date_match,
-        provider=provider,
-        esri_wayback_release_id=esri_wayback_release_id,
-        cache_dir=cache_dir,
-        max_tiles=max_tiles,
-        include_metadata=include_metadata,
-    )
-    from ._geopackage import write_geopackage
+    from ._geopackage import write_geopackage_stream
 
     target = _as_date(date)
     selection = {
@@ -1049,8 +1103,23 @@ def download_geopackage(
         "esri_wayback_release_id": esri_wayback_release_id,
         "include_metadata": include_metadata,
     }
-    return write_geopackage(
-        tiles,
+
+    def produce(consume: Callable[[Sequence[Any]], None]) -> None:
+        _download_tiles_to(
+            aoi,
+            zoom,
+            date,
+            date_match=date_match,
+            provider=provider,
+            esri_wayback_release_id=esri_wayback_release_id,
+            cache_dir=cache_dir,
+            max_tiles=max_tiles,
+            include_metadata=include_metadata,
+            consume=consume,
+        )
+
+    return write_geopackage_stream(
+        produce,
         output_path,
         table_name=table_name,
         selection=selection,
