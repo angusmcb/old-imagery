@@ -100,25 +100,33 @@ def test_persistent_server_error_becomes_request_failed(client) -> None:
         c.get(URL)
 
 
-def test_404_is_not_found_and_not_retried(client) -> None:
-    c = client([404, 200])
+def test_404_is_retried_then_not_found(client) -> None:
+    c = client([404] * 4)
     with pytest.raises(NotFound):
         c.get(URL)
-    assert c._transport.calls == 1
+    assert c._transport.calls == 4
 
 
 def test_not_found_is_a_request_failed(client) -> None:
     """So a single `except RequestFailed` covers every failure mode."""
-    c = client([404])
+    c = client([404] * 4)
     with pytest.raises(RequestFailed):
         c.get(URL)
 
 
-def test_client_errors_are_not_retried(client) -> None:
-    c = client([400, 200])
-    with pytest.raises(RequestFailed):
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 418])
+def test_client_errors_are_retried(client, status) -> None:
+    c = client([status, 200])
+    assert c.get(URL) == b"payload"
+    assert c._transport.calls == 2
+
+
+def test_persistent_403_is_not_cached(client) -> None:
+    c = client([403] * 4 + [200])
+    with pytest.raises(RequestFailed, match="403 Forbidden"):
         c.get(URL)
-    assert c._transport.calls == 1
+    assert c.get(URL) == b"payload"
+    assert c._transport.calls == 5
 
 
 def test_failures_are_not_cached(client) -> None:

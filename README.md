@@ -319,9 +319,10 @@ source-footprint seam can cross a tile, so those values do not claim to
 describe every pixel. Exact-release results also carry the release ID,
 publication date and title separately from capture metadata.
 
-This function is deliberately strict: if any selected tile is missing, cannot
-be downloaded, or is not a supported 256×256 image, the whole call raises and
-returns no partial list. Payloads are validated with Rasterio's in-memory
+Google downloads are strict: a missing or failed tile aborts the call. Esri
+image requests that still fail after HTTP retries are omitted with a warning,
+leaving gaps in the returned list. Unsupported or invalid 256×256 image
+payloads still abort the call. Payloads are validated with Rasterio's in-memory
 `MemoryFile` and returned byte-for-byte unchanged. No output, temporary or
 sidecar file is created. The existing HTTP cache is the only possible disk
 write; pass `cache_dir=None` to make the call fully diskless.
@@ -406,9 +407,9 @@ SQLite construction uses 16 KiB pages and disposable-build journaling to
 reduce page writes. The temporary database remains beside the requested output
 so its final publication is atomic.
 
-The tile selection follows `download_tiles`: network failures and invalid image
-payloads abort the output, while definitive Esri 404 coverage gaps produce a
-warning and a sparse GeoPackage. GeoPackage improves portability; it does not
+The tile selection follows `download_tiles`: persistent Esri image request
+failures produce a warning and a sparse GeoPackage, while invalid image
+payloads still abort the output. GeoPackage improves portability; it does not
 change the imagery owner's terms or grant redistribution rights.
 
 ### `download`
@@ -499,10 +500,12 @@ width. See
 `src/old_imagery/_concurrency.py` for the measured GCE/Baobab rationale and the
 adaptation thresholds.
 
-Transient HTTP failures are retried. `download_tiles` aborts on network errors,
-invalid payloads, and missing Google tiles. A definitive HTTP 404 from Esri is
-treated as a genuine historical coverage gap: the tile is omitted from the
-sparse result and a warning reports the missing address. The mosaic and
+All HTTP error statuses are retried up to three times, with backoff. Failed
+responses are not cached. `download_tiles` aborts on invalid payloads and
+missing or failed Google tiles. Persistently failed Esri image requests are
+omitted from the sparse result, with a warning reporting the count and example
+tile addresses. Tile downloads show a tqdm progress bar, including cache hits
+and omitted tiles. The mosaic and
 availability functions likewise treat many individual tile, packet or release
 failures as missing data so one bad response does not usually abort the whole
 call. A failure while loading the initial Google dbRoot or Esri capabilities document raises

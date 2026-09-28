@@ -1191,19 +1191,59 @@ def test_esri_download_omits_definitively_missing_tiles_with_warning(stub) -> No
     }
 
 
-def test_esri_download_still_raises_on_network_failure(stub) -> None:
+def test_esri_download_omits_persistently_failed_tile_with_warning(stub) -> None:
     backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+    failed = selected[0]
+    real_download = backend.download_tile_image
 
-    def fail(_dated):
-        raise RequestFailed("network failed")
+    def download(dated):
+        if dated.tile == failed:
+            raise RequestFailed("HTTP 403 Forbidden")
+        return real_download(dated)
 
-    backend.download_tile_image = fail
-    with pytest.raises(RequestFailed, match="network failed"):
-        old_imagery.download_tiles(
-            AOI.centroid,
+    backend.download_tile_image = download
+    with pytest.warns(RuntimeWarning) as caught:
+        results = old_imagery.download_tiles(
+            AOI,
             ZOOM,
             provider="esri",
             esri_wayback_release_id=backend.release.identifier,
+        )
+
+    assert any("failed after retries for 1 selected" in str(item.message) for item in caught)
+    assert len(results) == len(selected) - 1
+    assert (failed.column, failed.row) not in {
+        (result.column, result.row) for result in results
+    }
+
+
+def test_esri_geopackage_keeps_successful_tiles_after_request_failure(stub, tmp_path) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+    selected = backend.grid.tiles(AOI, ZOOM, 1_000)
+    failed = selected[0]
+    real_download = backend.download_tile_image
+
+    def download(dated):
+        if dated.tile == failed:
+            raise RequestFailed("HTTP 403 Forbidden")
+        return real_download(dated)
+
+    backend.download_tile_image = download
+    output = tmp_path / "sparse-esri.gpkg"
+    with pytest.warns(RuntimeWarning, match="failed after retries"):
+        old_imagery.download_geopackage(
+            AOI,
+            ZOOM,
+            output=output,
+            provider="esri",
+            esri_wayback_release_id=backend.release.identifier,
+            build_overviews=False,
+        )
+
+    with sqlite3.connect(output) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM imagery").fetchone() == (
+            len(selected) - 1,
         )
 
 

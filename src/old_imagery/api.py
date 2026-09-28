@@ -23,6 +23,7 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from shapely import MultiPoint, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
+from tqdm.auto import tqdm
 
 from ._concurrency import (
     _WARNING_FILTER_LOCK,
@@ -861,10 +862,9 @@ def _download_tiles_to(
     ``Point`` and ``MultiPoint`` select the one provider-native tile containing
     each point. ``Polygon`` and ``MultiPolygon`` select every tile they
     intersect. Returned payloads are full, unclipped provider images in
-    deterministic row-major order. Esri tiles that definitively return HTTP
-    404 are omitted with a warning because historical releases can contain
-    genuine coverage gaps. Network failures, other HTTP errors, and invalid
-    image payloads still abort the whole call; Google downloads remain strict
+    deterministic row-major order. Esri image requests that still fail after
+    retries are omitted with a warning, leaving gaps in the sparse result.
+    Invalid image payloads still abort the call; Google downloads remain strict
     for every selected tile.
 
     Metadata is resolved before raw payload adaptation, as for the public tile
@@ -917,14 +917,14 @@ def _download_tiles_to(
         else:
             resolved = adaptive_metadata_map(metadata_workload, resolve, tiles)
 
-        def fetch(resolved_tile) -> DownloadedTile | None:
+        def fetch(resolved_tile) -> DownloadedTile | RequestFailed:
             tile, candidate = resolved_tile
             try:
                 raw = backend.download_tile_image(candidate)
-            except NotFound:
+            except RequestFailed as error:
                 if provider != "esri":
                     raise
-                return None
+                return error
             image_format, media_type = _inspect_tile_payload(raw)
             layer = getattr(candidate, "layer", None) or release_layer
             return DownloadedTile(
@@ -948,36 +948,62 @@ def _download_tiles_to(
 
         missing_count = 0
         missing_examples: list[str] = []
+        failed_count = 0
+        failed_examples: list[str] = []
         next_result = 0
 
-        def consume_results(results: Sequence[DownloadedTile | None]) -> None:
-            nonlocal missing_count, next_result
+        def consume_results(results: Sequence[DownloadedTile | RequestFailed]) -> None:
+            nonlocal missing_count, failed_count, next_result
             present: list[DownloadedTile] = []
             for result in results:
                 tile, _candidate = resolved[next_result]
                 next_result += 1
-                if result is None:
+                address = f"z{tile.level}/{tile.column}/{tile.row}"
+                if isinstance(result, NotFound):
                     missing_count += 1
                     if len(missing_examples) < 5:
-                        missing_examples.append(f"z{tile.level}/{tile.column}/{tile.row}")
+                        missing_examples.append(address)
+                elif isinstance(result, RequestFailed):
+                    failed_count += 1
+                    if len(failed_examples) < 5:
+                        failed_examples.append(f"{address} ({result})")
+                    if failed_count == 1:
+                        warnings.warn(
+                            f"Esri imagery tile {address} failed after retries and will be "
+                            f"omitted: {result}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                 else:
                     present.append(result)
             if present:
                 consume(present)
+            progress.update(len(results))
 
-        adaptive_tile_consume(
-            provider,
-            fetch,
-            resolved,
-            consume_results,
-            is_acceptable=lambda result: result is not None,
-        )
+        with tqdm(total=len(resolved), desc="Downloading tiles", unit="tile") as progress:
+            adaptive_tile_consume(
+                provider,
+                fetch,
+                resolved,
+                consume_results,
+                is_acceptable=lambda result: isinstance(result, DownloadedTile),
+            )
         if missing_count:
             examples = ", ".join(missing_examples)
             suffix = "" if missing_count <= 5 else f" (and {missing_count - 5:,} more)"
             warnings.warn(
                 f"Esri returned HTTP 404 for {missing_count:,} selected imagery "
                 f"tile{'s' if missing_count != 1 else ''}; omitted from the sparse "
+                f"result: {examples}{suffix}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if failed_count:
+            examples = ", ".join(failed_examples)
+            suffix = "" if failed_count <= 5 else f" (and {failed_count - 5:,} more)"
+            warnings.warn(
+                f"Esri imagery requests failed after retries for {failed_count:,} selected "
+                f"tile{'s' if failed_count != 1 else ''}; omitted from the sparse "
                 f"result: {examples}{suffix}",
                 RuntimeWarning,
                 stacklevel=2,
@@ -1003,10 +1029,9 @@ def download_tiles(
     ``Point`` and ``MultiPoint`` select the one provider-native tile containing
     each point. ``Polygon`` and ``MultiPolygon`` select every tile they
     intersect. Returned payloads are full, unclipped provider images in
-    deterministic row-major order. Esri tiles that definitively return HTTP
-    404 are omitted with a warning because historical releases can contain
-    genuine coverage gaps. Network failures, other HTTP errors, and invalid
-    image payloads still abort the whole call; Google downloads remain strict
+    deterministic row-major order. Esri image requests that still fail after
+    retries are omitted with a warning, leaving gaps in the sparse result.
+    Invalid image payloads still abort the call; Google downloads remain strict
     for every selected tile.
 
     Payloads remain in memory and are returned unchanged. This function never

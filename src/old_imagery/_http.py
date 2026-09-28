@@ -54,7 +54,6 @@ def _default_cache_dir() -> Path:
 DEFAULT_CACHE_DIR = _default_cache_dir()
 
 _USER_AGENT = "old-imagery/0.1 (+https://github.com/angusmcb/old-imagery)"
-_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _BACKOFF = 0.5
 _CACHE_BACKEND_ENV = "OLD_IMAGERY_CACHE_BACKEND"
 _DEFAULT_CACHE_BACKEND = "sqlite"
@@ -385,14 +384,14 @@ class CachedHttpClient:
                     response = self._client.get(url)
                 else:
                     response = self._client.post(url, data=data)
-                if response.status_code == 404:
-                    raise NotFound(url)
-                if response.status_code in _RETRY_STATUS and attempt < self.retries:
+                if response.status_code >= 400 and attempt < self.retries:
                     last = httpx.HTTPStatusError(
                         f"HTTP {response.status_code}", request=response.request, response=response
                     )
                     time.sleep(_BACKOFF * (2**attempt))
                     continue
+                if response.status_code == 404:
+                    raise NotFound(url)
                 response.raise_for_status()
                 return response.content
             except httpx.TransportError as exc:
