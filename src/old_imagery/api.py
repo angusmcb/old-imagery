@@ -919,13 +919,26 @@ def _download_tiles_to(
 
         def fetch(resolved_tile) -> DownloadedTile | RequestFailed:
             tile, candidate = resolved_tile
+            inspected: tuple[str, str] | None = None
+
+            def valid_image(body: bytes) -> bool:
+                nonlocal inspected
+                try:
+                    inspected = _inspect_tile_payload(body)
+                except ValueError:
+                    return False
+                return True
+
             try:
-                raw = backend.download_tile_image(candidate)
+                if provider == "esri":
+                    raw = backend.download_tile_image(candidate, accept_response=valid_image)
+                else:
+                    raw = backend.download_tile_image(candidate)
             except RequestFailed as error:
                 if provider != "esri":
                     raise
                 return error
-            image_format, media_type = _inspect_tile_payload(raw)
+            image_format, media_type = inspected or _inspect_tile_payload(raw)
             layer = getattr(candidate, "layer", None) or release_layer
             return DownloadedTile(
                 content=raw,

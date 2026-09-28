@@ -162,6 +162,22 @@ def test_failures_are_not_cached(client) -> None:
     assert c.get(URL) == b"payload"
 
 
+def test_get_retries_and_replaces_invalid_cached_body(client) -> None:
+    c = client([(200, b'{"data":[1]}'), (200, b"valid image")])
+    assert c.get(URL) == b'{"data":[1]}'
+    assert c.get(URL, accept_response=lambda body: body == b"valid image") == b"valid image"
+    assert c.get(URL, accept_response=lambda body: body == b"valid image") == b"valid image"
+    assert c._transport.calls == 2
+
+
+def test_get_does_not_cache_persistently_invalid_body(client) -> None:
+    c = client([(200, b"invalid")] * 4 + [(200, b"valid")])
+    with pytest.raises(RequestFailed, match="unacceptable response"):
+        c.get(URL, accept_response=lambda body: body == b"valid")
+    assert c.get(URL, accept_response=lambda body: body == b"valid") == b"valid"
+    assert c._transport.calls == 5
+
+
 def test_post_bodies_key_the_cache_separately(client) -> None:
     c = client([200, 200])
     c.post(URL, {"a": "1"})

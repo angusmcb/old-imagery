@@ -55,7 +55,7 @@ class StubBackend:
             return []
         return [StubDated(tile, d, 7, self.source) for d in self.dates]
 
-    def download_tile_image(self, dated):
+    def download_tile_image(self, dated, *, accept_response=None):
         self.downloads += 1
         value = self.colors.get(dated.date, 128)
         arr = np.full((3, 256, 256), value, dtype=np.uint8)
@@ -549,9 +549,7 @@ def test_download_geopackage_preserves_google_tiles_in_crs84(stub, tmp_path) -> 
 
     with sqlite3.connect(output) as connection:
         overview_counts = dict(
-            connection.execute(
-                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
-            )
+            connection.execute("SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level")
         )
     assert overview_counts[ZOOM - 1] == len(selected)
     assert overview_counts[ZOOM - 2] > 0
@@ -592,9 +590,7 @@ def test_download_geopackage_preserves_esri_web_mercator_tiles(stub, tmp_path) -
 
     with sqlite3.connect(output) as connection:
         overview_counts = dict(
-            connection.execute(
-                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
-            )
+            connection.execute("SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level")
         )
     assert overview_counts[ZOOM] == len(selected)
     assert overview_counts[ZOOM - 1] > 0
@@ -610,9 +606,7 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
     )
     output = tmp_path / "sparse.gpkg"
 
-    old_imagery.download_geopackage(
-        sparse_aoi, ZOOM, D1, output=output, cache_dir=None
-    )
+    old_imagery.download_geopackage(sparse_aoi, ZOOM, D1, output=output, cache_dir=None)
 
     selected = backend.grid.tiles(sparse_aoi, ZOOM, 1_000)
     assert len(selected) == 2
@@ -642,9 +636,7 @@ def test_download_geopackage_pyramids_sparse_multipolygon(stub, tmp_path) -> Non
     }
     expected_counts = {source_zoom: len(expected_addresses)}
     for overview_zoom in range(source_zoom - 1, min(counts) - 1, -1):
-        expected_addresses = {
-            (column // 2, row // 2) for column, row in expected_addresses
-        }
+        expected_addresses = {(column // 2, row // 2) for column, row in expected_addresses}
         expected_counts[overview_zoom] = len(expected_addresses)
     assert counts == expected_counts
     expected_payload = _encode_jpeg(np.full((3, 256, 256), 73, dtype=np.uint8))
@@ -761,9 +753,7 @@ def test_download_geopackage_can_skip_overviews(stub, tmp_path) -> None:
 
     with sqlite3.connect(output) as connection:
         counts = dict(
-            connection.execute(
-                "SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level"
-            )
+            connection.execute("SELECT zoom_level, COUNT(*) FROM imagery GROUP BY zoom_level")
         )
         metadata = json.loads(
             connection.execute(
@@ -780,9 +770,7 @@ def test_download_geopackage_can_skip_overviews(stub, tmp_path) -> None:
     assert webp_extensions == 0
 
 
-def test_download_geopackage_overview_failure_leaves_no_output(
-    stub, tmp_path, monkeypatch
-) -> None:
+def test_download_geopackage_overview_failure_leaves_no_output(stub, tmp_path, monkeypatch) -> None:
     from old_imagery import _geopackage
 
     stub(StubBackend([D1]))
@@ -864,9 +852,7 @@ def test_download_geopackage_can_atomically_replace(stub, tmp_path) -> None:
     output = tmp_path / "existing.gpkg"
     output.write_bytes(b"replace me")
 
-    old_imagery.download_geopackage(
-        AOI, ZOOM, D1, output=output, cache_dir=None, mode="replace"
-    )
+    old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None, mode="replace")
 
     with rasterio.open(output) as dataset:
         assert dataset.read(1).mean() == pytest.approx(88, abs=2)
@@ -908,9 +894,7 @@ def test_download_geopackage_append_refuses_an_existing_table_before_downloading
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
-def test_download_geopackage_failed_append_preserves_existing_package(
-    stub, tmp_path
-) -> None:
+def test_download_geopackage_failed_append_preserves_existing_package(stub, tmp_path) -> None:
     backend = stub(StubBackend([D1]))
     output = tmp_path / "preserved.gpkg"
     old_imagery.download_geopackage(AOI, ZOOM, D1, output=output, cache_dir=None)
@@ -931,7 +915,11 @@ def test_download_geopackage_rejects_invalid_mode_before_downloading(stub, tmp_p
 
     with pytest.raises(ValueError, match="mode must be"):
         old_imagery.download_geopackage(
-            AOI, ZOOM, D1, output=tmp_path / "invalid.gpkg", mode="invalid"  # type: ignore[arg-type]
+            AOI,
+            ZOOM,
+            D1,
+            output=tmp_path / "invalid.gpkg",
+            mode="invalid",  # type: ignore[arg-type]
         )
 
     assert backend.downloads == 0
@@ -1165,16 +1153,39 @@ def test_download_tiles_can_skip_exact_release_metadata(stub) -> None:
     assert backend.release_metadata_requests == [False]
 
 
+def test_esri_download_validates_image_before_accepting_it(stub) -> None:
+    backend = stub(ReleaseBackend(RELEASE_DATE, D1))
+    real_download = backend.download_tile_image
+    checked = []
+
+    def download(dated, *, accept_response=None):
+        assert accept_response is not None
+        assert not accept_response(b'{"data":[1]}')
+        raw = real_download(dated)
+        assert accept_response(raw)
+        checked.append(dated.tile)
+        return raw
+
+    backend.download_tile_image = download
+    results = old_imagery.download_tiles(
+        AOI.centroid,
+        ZOOM,
+        provider="esri",
+        esri_wayback_release_id=backend.release.identifier,
+    )
+    assert len(results) == len(checked) == 1
+
+
 def test_esri_download_omits_definitively_missing_tiles_with_warning(stub) -> None:
     backend = stub(ReleaseBackend(RELEASE_DATE, D1))
     selected = backend.grid.tiles(AOI, ZOOM, 1_000)
     missing = selected[0]
     real_download = backend.download_tile_image
 
-    def download(dated):
+    def download(dated, *, accept_response=None):
         if dated.tile == missing:
             raise NotFound("missing Esri tile")
-        return real_download(dated)
+        return real_download(dated, accept_response=accept_response)
 
     backend.download_tile_image = download
     with pytest.warns(RuntimeWarning, match="Esri returned HTTP 404 for 1 selected"):
@@ -1186,9 +1197,7 @@ def test_esri_download_omits_definitively_missing_tiles_with_warning(stub) -> No
         )
 
     assert len(results) == len(selected) - 1
-    assert (missing.column, missing.row) not in {
-        (result.column, result.row) for result in results
-    }
+    assert (missing.column, missing.row) not in {(result.column, result.row) for result in results}
 
 
 def test_esri_download_omits_persistently_failed_tile_with_warning(stub) -> None:
@@ -1197,10 +1206,10 @@ def test_esri_download_omits_persistently_failed_tile_with_warning(stub) -> None
     failed = selected[0]
     real_download = backend.download_tile_image
 
-    def download(dated):
+    def download(dated, *, accept_response=None):
         if dated.tile == failed:
             raise RequestFailed("HTTP 403 Forbidden")
-        return real_download(dated)
+        return real_download(dated, accept_response=accept_response)
 
     backend.download_tile_image = download
     with pytest.warns(RuntimeWarning) as caught:
@@ -1213,9 +1222,7 @@ def test_esri_download_omits_persistently_failed_tile_with_warning(stub) -> None
 
     assert any("failed after retries for 1 selected" in str(item.message) for item in caught)
     assert len(results) == len(selected) - 1
-    assert (failed.column, failed.row) not in {
-        (result.column, result.row) for result in results
-    }
+    assert (failed.column, failed.row) not in {(result.column, result.row) for result in results}
 
 
 def test_esri_geopackage_keeps_successful_tiles_after_request_failure(stub, tmp_path) -> None:
@@ -1224,10 +1231,10 @@ def test_esri_geopackage_keeps_successful_tiles_after_request_failure(stub, tmp_
     failed = selected[0]
     real_download = backend.download_tile_image
 
-    def download(dated):
+    def download(dated, *, accept_response=None):
         if dated.tile == failed:
             raise RequestFailed("HTTP 403 Forbidden")
-        return real_download(dated)
+        return real_download(dated, accept_response=accept_response)
 
     backend.download_tile_image = download
     output = tmp_path / "sparse-esri.gpkg"
@@ -1242,9 +1249,7 @@ def test_esri_geopackage_keeps_successful_tiles_after_request_failure(stub, tmp_
         )
 
     with sqlite3.connect(output) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM imagery").fetchone() == (
-            len(selected) - 1,
-        )
+        assert connection.execute("SELECT COUNT(*) FROM imagery").fetchone() == (len(selected) - 1,)
 
 
 def test_download_no_longer_accepts_an_as_of_date(stub) -> None:

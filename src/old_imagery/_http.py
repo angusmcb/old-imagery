@@ -255,8 +255,7 @@ class _SqliteCache:
                 batch_bytes = len(first.data)
                 deadline = time.monotonic() + _SQLITE_BATCH_WAIT
                 while (
-                    len(batch) < _SQLITE_BATCH_MAX_ITEMS
-                    and batch_bytes < _SQLITE_BATCH_MAX_BYTES
+                    len(batch) < _SQLITE_BATCH_MAX_ITEMS and batch_bytes < _SQLITE_BATCH_MAX_BYTES
                 ):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -370,6 +369,7 @@ class CachedHttpClient:
                 max_keepalive_connections=RAW_TILE_CONNECTION_LIMIT,
             ),
         )
+
     # -- cache helpers -----------------------------------------------------
     def _read_cache(self, key: str, max_age: float | None) -> bytes | None:
         if self.cache_dir is None:
@@ -414,13 +414,29 @@ class CachedHttpClient:
                 raise RequestFailed(f"{method} {url} failed: {exc}") from exc
         raise RequestFailed(f"{method} {url} failed after {self.retries} retries: {last}") from last
 
-    def get(self, url: str, *, max_age: float | None = None) -> bytes:
+    def get(
+        self,
+        url: str,
+        *,
+        max_age: float | None = None,
+        accept_response: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
         cached = self._read_cache(url, max_age)
-        if cached is not None:
+        if cached is not None and (accept_response is None or accept_response(cached)):
             return cached
-        data = self._send("GET", url, None)
-        self._write_cache(url, data)
-        return data
+
+        # A service can send a non-image body with HTTP 200. Validate it before
+        # writing to the cache so future runs can repair a bad cached response.
+        for attempt in range(self.retries + 1):
+            body = self._send("GET", url, None)
+            if accept_response is None or accept_response(body):
+                self._write_cache(url, body)
+                return body
+            if attempt < self.retries:
+                time.sleep(_BACKOFF * (2**attempt))
+        raise RequestFailed(
+            f"GET {url} returned an unacceptable response after {self.retries + 1} attempts"
+        )
 
     def post(
         self,
@@ -462,8 +478,7 @@ class CachedHttpClient:
             if attempt < self.retries:
                 time.sleep(_BACKOFF * (2**attempt))
         raise RequestFailed(
-            f"POST {url} returned an unacceptable response after "
-            f"{self.retries + 1} attempts"
+            f"POST {url} returned an unacceptable response after {self.retries + 1} attempts"
         )
 
     def close(self) -> None:

@@ -15,7 +15,7 @@ import threading
 import warnings
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from ._concurrency import _WARNING_FILTER_LOCK, adaptive_metadata_map, workers_for
@@ -76,9 +76,8 @@ def _complete_object_id_response(raw: bytes) -> bool:
     if "objectIds" not in payload:
         return False
     object_ids = payload["objectIds"]
-    return (
-        (object_ids is None or isinstance(object_ids, list))
-        and not payload.get("exceededTransferLimit", False)
+    return (object_ids is None or isinstance(object_ids, list)) and not payload.get(
+        "exceededTransferLimit", False
     )
 
 
@@ -97,6 +96,7 @@ def _cached_feature_matches(raw: bytes, object_id: int) -> bool:
         )
     except (KeyError, TypeError, ValueError, UnicodeDecodeError):
         return False
+
 
 # Above this many tiles, stop narrowing the release list with tilemap probes and
 # just ask every release.
@@ -668,9 +668,7 @@ class WayBack:
             return []
         return self._fetch_geometries(layer, zoom, object_ids)
 
-    def _query_layer(
-        self, layer: Layer, aoi, zoom: int
-    ) -> tuple[list[tuple[_dt.date, int]], bool]:
+    def _query_layer(self, layer: Layer, aoi, zoom: int) -> tuple[list[tuple[_dt.date, int]], bool]:
         """Return ``([(capture_date, object_id), ...], complete)`` for one release.
 
         Deliberately requests no geometry.  Capture footprints are large -- one
@@ -703,9 +701,7 @@ class WayBack:
             out.extend(rows)
         return out, complete
 
-    def _query_object_ids(
-        self, layer: Layer, aoi, zoom: int
-    ) -> tuple[list[int], bool]:
+    def _query_object_ids(self, layer: Layer, aoi, zoom: int) -> tuple[list[int], bool]:
         """Return IDs intersecting the exact AOI and whether every query completed."""
         url = layer.metadata_query_url(zoom)
         object_ids: set[int] = set()
@@ -758,9 +754,7 @@ class WayBack:
         }
         try:
             payload = json.loads(
-                self._client.post(
-                    layer.metadata_query_url(zoom), form, max_age=_METADATA_MAX_AGE
-                )
+                self._client.post(layer.metadata_query_url(zoom), form, max_age=_METADATA_MAX_AGE)
             )
         except (RequestFailed, OSError, ValueError):
             return None
@@ -783,11 +777,7 @@ class WayBack:
 
         expected = set(object_ids)
         if set(by_id) == expected and not payload.get("exceededTransferLimit", False):
-            return [
-                (date, oid)
-                for oid in object_ids
-                if (date := by_id[oid]) is not None
-            ]
+            return [(date, oid) for oid in object_ids if (date := by_id[oid]) is not None]
 
         # Some services enforce a smaller feature limit than advertised.  Split
         # and retry instead of baking another service-specific ceiling into the
@@ -939,8 +929,13 @@ class WayBack:
         right = self._fetch_uncached_geometry_features(layer, zoom, object_ids[middle:])
         return left | right
 
-    def download_tile_image(self, dated: DatedEsriTile) -> bytes:
-        return self._client.get(dated.asset_url)
+    def download_tile_image(
+        self,
+        dated: DatedEsriTile,
+        *,
+        accept_response: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        return self._client.get(dated.asset_url, accept_response=accept_response)
 
     def provider_copyright(self, provider_id: int) -> str | None:
         layer = self._by_id.get(provider_id)
@@ -985,10 +980,7 @@ def _polygon_queries_3857(aoi) -> list[str]:
         oriented = orient(polygon, sign=-1.0)
         rings = [oriented.exterior, *oriented.interiors]
         encoded_parts.append(
-            [
-                json.dumps(list(ring.coords), separators=(",", ":"))
-                for ring in rings
-            ]
+            [json.dumps(list(ring.coords), separators=(",", ":")) for ring in rings]
         )
 
     prefix = '{"rings":['
