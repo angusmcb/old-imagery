@@ -55,6 +55,32 @@ def client(tmp_path, monkeypatch):
 URL = "https://example.invalid/asset"
 
 
+def test_browser_user_agent(tmp_path) -> None:
+    c = CachedHttpClient(tmp_path)
+    try:
+        agent = c._client.headers["User-Agent"]
+        assert agent.startswith("Mozilla/5.0 ")
+        assert "Chrome/" in agent
+        assert "old-imagery" not in agent
+    finally:
+        c.close()
+
+
+def test_sqlite_read_connections_are_bounded_across_worker_pools(tmp_path) -> None:
+    c = CachedHttpClient(tmp_path, cache_backend="sqlite")
+    try:
+        for batch in range(20):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(
+                    pool.map(
+                        lambda i, batch=batch: c._read_cache(f"{URL}/{batch}/{i}", None), range(16)
+                    )
+                )
+        assert len(c._cache._read_connections) <= RAW_TILE_CONNECTION_LIMIT
+    finally:
+        c.close()
+
+
 def test_successful_request_is_cached(client) -> None:
     c = client([200])
     assert c.get(URL) == b"payload"

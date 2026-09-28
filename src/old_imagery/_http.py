@@ -53,7 +53,10 @@ def _default_cache_dir() -> Path:
 
 DEFAULT_CACHE_DIR = _default_cache_dir()
 
-_USER_AGENT = "old-imagery/0.1 (+https://github.com/angusmcb/old-imagery)"
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 _BACKOFF = 0.5
 _CACHE_BACKEND_ENV = "OLD_IMAGERY_CACHE_BACKEND"
 _DEFAULT_CACHE_BACKEND = "sqlite"
@@ -127,7 +130,8 @@ class _SqliteCache:
         self._pending_lock = threading.Lock()
         self._read_connections: list[sqlite3.Connection] = []
         self._read_connections_lock = threading.Lock()
-        self._local = threading.local()
+        self._available_read_connections: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue()
+        self._read_connection_slots = threading.BoundedSemaphore(RAW_TILE_CONNECTION_LIMIT)
         self._closing = False
         self._close_lock = threading.Lock()
 
@@ -175,13 +179,13 @@ class _SqliteCache:
         return hashlib.sha256(key.encode()).digest()
 
     def _read_connection(self) -> sqlite3.Connection:
-        connection = getattr(self._local, "connection", None)
-        if connection is None:
+        try:
+            return self._available_read_connections.get_nowait()
+        except queue.Empty:
             connection = self._connect()
-            self._local.connection = connection
             with self._read_connections_lock:
                 self._read_connections.append(connection)
-        return connection
+            return connection
 
     def read(self, key: str, max_age: float | None) -> bytes | None:
         digest = self._digest(key)
@@ -192,13 +196,20 @@ class _SqliteCache:
                 return pending.data
             return None
 
+        self._read_connection_slots.acquire()
         try:
-            row = self._read_connection().execute(
-                "SELECT body, fetched_at FROM responses WHERE key = ?",
-                (sqlite3.Binary(digest),),
-            ).fetchone()
+            connection = self._read_connection()
+            try:
+                row = connection.execute(
+                    "SELECT body, fetched_at FROM responses WHERE key = ?",
+                    (sqlite3.Binary(digest),),
+                ).fetchone()
+            finally:
+                self._available_read_connections.put(connection)
         except sqlite3.Error:  # pragma: no cover - best-effort cache
             return None
+        finally:
+            self._read_connection_slots.release()
         if row is None:
             return None
         if max_age is not None and (time.time() - float(row[1])) > max_age:
