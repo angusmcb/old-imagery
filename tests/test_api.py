@@ -11,17 +11,20 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
 import rasterio
+import shapely
 from rasterio.errors import NotGeoreferencedWarning
-from shapely.geometry import LineString, MultiPoint, MultiPolygon, box
+from shapely.geometry import LineString, MultiPoint, MultiPolygon, Polygon, box
 
 import old_imagery
 from old_imagery import api
-from old_imagery._esri import EsriFootprint, EsriSource
+from old_imagery._esri import EsriFootprint, EsriSource, _rows_to_dated_geometries
 from old_imagery._http import NotFound, RequestFailed
 from old_imagery._keyhole import KeyholeTile
 from old_imagery._region import KeyholeGrid, MercatorGrid
@@ -1628,6 +1631,133 @@ def test_mosaic_dissolves_footprints_sharing_a_zoom_and_date(stub) -> None:
 
     assert len(gdf) == 1
     assert gdf.geometry.iloc[0].area == pytest.approx(AOI.area, rel=1e-9)
+
+
+def test_mosaic_simplifies_shared_edges_without_changing_coverage(stub) -> None:
+    seam = [(500 + (2 if index % 2 else -2), y) for index, y in enumerate(range(0, 1001, 20))]
+    original = gpd.GeoSeries(
+        [
+            Polygon([(0, 0), *seam, (0, 1000)]),
+            Polygon([*reversed(seam), (1000, 0), (1000, 1000)]),
+        ],
+        crs="EPSG:3857",
+    )
+    footprints = original.to_crs(4326)
+    aoi = gpd.GeoSeries([box(0, 0, 1000, 1000)], crs="EPSG:3857").to_crs(4326).iloc[0]
+    stub(MosaicBackend({18: [(D1, footprints.iloc[0]), (D2, footprints.iloc[1])]}))
+
+    result = old_imagery.esri_mosaic_as_of(aoi, 18, RELEASE_DATE).to_crs(3857)
+
+    assert shapely.coverage_is_valid(result.geometry.array)
+    assert shapely.get_num_coordinates(result.geometry.array).sum() < (
+        shapely.get_num_coordinates(original.array).sum()
+    )
+    expected_union = original.union_all()
+    assert result.geometry.union_all().symmetric_difference(expected_union).area < 1e-6
+    assert result.area.sum() == pytest.approx(expected_union.area, abs=1e-6)
+    assert set(result.capture_date) == {pd.Timestamp(D1), pd.Timestamp(D2)}
+
+
+def test_mosaic_simplification_preserves_genuine_holes(stub) -> None:
+    hole = box(-122.3990, 37.7930, -122.3985, 37.7940)
+    stub(MosaicBackend({18: [(D1, LEFT.difference(hole)), (D2, RIGHT)]}))
+
+    result = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    assert result.geometry.union_all().symmetric_difference(AOI.difference(hole)).area < 1e-15
+    assert result.geometry.union_all().intersection(hole).area < 1e-15
+
+
+@pytest.mark.parametrize("neck_width", [0.01, 0.1, 1.0, 10.0])
+def test_mosaic_simplification_does_not_split_thin_necks_into_islands(stub, neck_width) -> None:
+    aoi_metric = box(0, 0, 1000, 1000)
+    # Two large lobes joined by a bridge narrower than the simplification
+    # tolerance. Breaking that bridge would create a disconnected island.
+    connected = shapely.union_all(
+        [
+            box(100, 100, 400, 900),
+            box(600, 100, 900, 900),
+            box(400, 500 - neck_width / 2, 600, 500 + neck_width / 2),
+        ]
+    )
+    original = gpd.GeoSeries([connected, aoi_metric.difference(connected)], crs=3857)
+    footprints = original.to_crs(4326)
+    aoi = gpd.GeoSeries([aoi_metric], crs=3857).to_crs(4326).iloc[0]
+    stub(MosaicBackend({18: [(D1, footprints.iloc[0]), (D2, footprints.iloc[1])]}))
+
+    result = old_imagery.esri_mosaic_as_of(aoi, 18, RELEASE_DATE).to_crs(3857)
+
+    assert shapely.coverage_is_valid(result.geometry.array)
+    assert result.geometry.union_all().symmetric_difference(aoi_metric).area < 1e-6
+    assert result.area.sum() == pytest.approx(aoi_metric.area, abs=1e-6)
+    assert (shapely.get_num_geometries(result.geometry.array) == 1).all()
+    assert (shapely.area(shapely.get_parts(result.geometry.array)) > 100).all()
+
+
+@pytest.mark.parametrize("island_width", [0.1, 1.0, 10.0])
+def test_mosaic_simplification_preserves_real_source_islands(stub, island_width) -> None:
+    aoi_metric = box(0, 0, 1000, 1000)
+    island = box(750, 500, 750 + island_width, 500 + island_width)
+    original = gpd.GeoSeries(
+        [
+            MultiPolygon([box(0, 0, 500, 1000), island]),
+            aoi_metric.difference(shapely.union_all([box(0, 0, 500, 1000), island])),
+        ],
+        crs=3857,
+    )
+    footprints = original.to_crs(4326)
+    aoi = gpd.GeoSeries([aoi_metric], crs=3857).to_crs(4326).iloc[0]
+    stub(MosaicBackend({18: [(D1, footprints.iloc[0]), (D2, footprints.iloc[1])]}))
+
+    result = old_imagery.esri_mosaic_as_of(aoi, 18, RELEASE_DATE).to_crs(3857)
+
+    assert shapely.coverage_is_valid(result.geometry.array)
+    assert result.geometry.union_all().symmetric_difference(aoi_metric).area < 1e-6
+    assert result.area.sum() == pytest.approx(aoi_metric.area, abs=1e-6)
+    by_date = result.set_index("capture_date")
+    parts = shapely.get_parts(by_date.loc[pd.Timestamp(D1), "geometry"])
+    assert len(parts) == 2
+    # The island's shared boundary can move, but it must remain present and
+    # must not break into extra parts. Area is not a topology invariant.
+    assert 0 < min(shapely.area(parts)) <= island.area
+
+
+def test_mosaic_simplifies_recorded_rubkona_seam(stub) -> None:
+    # Three original WB_2026_R05 z17 metadata features, clipped to the 1 km
+    # Rubkona probe at 29.78711252 E, 9.32080381 N. Independent Esri 10 m
+    # generalisation left a 3,572 m² gap here; the original coverage has none.
+    path = Path(__file__).parent / "data" / "esri_rubkona_original_footprints.json"
+    original = gpd.read_file(path)
+    footprints = _rows_to_dated_geometries(original)
+    aoi = gpd.GeoSeries([original.geometry.union_all()], crs=original.crs).to_crs(4326).iloc[0]
+    stub(MosaicBackend({17: footprints}))
+
+    result = old_imagery.esri_mosaic_as_of(aoi, 17, RELEASE_DATE).to_crs(3857)
+
+    assert len(result) == 3
+    assert shapely.coverage_is_valid(result.geometry.array)
+    assert shapely.get_num_coordinates(result.geometry.array).sum() < (
+        shapely.get_num_coordinates(original.geometry.array).sum()
+    )
+    union = original.geometry.union_all()
+    assert result.geometry.union_all().symmetric_difference(union).area < 1e-6
+    assert result.area.sum() == pytest.approx(union.area, abs=1e-6)
+    # Each source is connected here: simplification must not leave detached
+    # slivers, even though the smallest genuine capture area is only 411 m².
+    assert (shapely.get_num_geometries(result.geometry.array) == 1).all()
+    assert min(shapely.area(shapely.get_parts(result.geometry.array))) > 100
+
+
+def test_mosaic_keeps_overlapping_source_geometry_unsimplified(stub) -> None:
+    overlapping = box(-122.3990, 37.7920, -122.3960, 37.7950)
+    stub(MosaicBackend({18: [(D1, LEFT), (D2, overlapping)]}))
+
+    with pytest.warns(RuntimeWarning, match="returning unsimplified geometry"):
+        result = old_imagery.esri_mosaic_as_of(AOI, 18, RELEASE_DATE)
+
+    by_date = result.set_index("capture_date")
+    assert by_date.loc[pd.Timestamp(D1), "geometry"].equals(LEFT)
+    assert by_date.loc[pd.Timestamp(D2), "geometry"].equals(overlapping)
 
 
 def test_mosaic_discards_boundary_only_geometry(stub) -> None:

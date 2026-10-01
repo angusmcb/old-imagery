@@ -531,9 +531,7 @@ def test_fetch_geometries_batches_ids_into_one_request() -> None:
     assert all(row.date == CAPTURE and not row.geometry.is_empty for row in rows)
 
 
-def test_fetch_geometries_uses_fixed_ten_metre_tolerance() -> None:
-    from old_imagery import _esri
-
+def test_fetch_geometries_requests_original_vertices() -> None:
     layers = [_layer(1, "2014-02-20")]
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
     forms = []
@@ -547,8 +545,28 @@ def test_fetch_geometries_uses_fixed_ten_metre_tolerance() -> None:
     wb._fetch_geometries(layers[0], 17, [11])
 
     geometry_form = next(form for form in forms if form.get("returnGeometry") == "true")
-    assert geometry_form["maxAllowableOffset"] == str(_esri._FOOTPRINT_TOLERANCE_M)
-    assert geometry_form["geometryPrecision"] == "0"
+    assert "maxAllowableOffset" not in geometry_form
+    assert "geometryPrecision" not in geometry_form
+
+
+def test_original_geometry_cache_ignores_legacy_simplified_features() -> None:
+    from old_imagery import _esri
+
+    layer = _layer(1, "2014-02-20")
+    wb, client = _wayback_with([layer], {1: [(CAPTURE, 11)]})
+    payload = json.loads(_esrijson([(11, CAPTURE)]))
+    record = {"spatialReference": payload["spatialReference"], "feature": payload["features"][0]}
+    legacy_key = f"esri-feature-v1\0{layer.metadata_query_url(17)}\0{11}"
+    client.cache[legacy_key] = json.dumps(record).encode()
+
+    wb._fetch_geometries(layer, 17, [11])
+    assert client.geometry_queries == [(1, 11)]  # v1 must not satisfy this request
+    key = _esri._feature_cache_key(layer.metadata_query_url(17), 11)
+    assert key != legacy_key
+    assert json.loads(client.cache[key]) == record
+
+    wb._fetch_geometries(layer, 17, [11])
+    assert client.geometry_queries == [(1, 11)]  # original geometry is reusable
 
 
 def test_fetch_geometries_chunks_beyond_the_batch_size() -> None:
@@ -652,9 +670,7 @@ def test_query_layer_sends_the_exact_polygon_with_esri_ring_orientation() -> Non
     layers = [_layer(1, "2014-02-20")]
     polygon = Polygon(
         [(-122.4, 37.79), (-122.39, 37.79), (-122.39, 37.80), (-122.4, 37.80)],
-        holes=[
-            [(-122.398, 37.792), (-122.392, 37.792), (-122.392, 37.798), (-122.398, 37.798)]
-        ],
+        holes=[[(-122.398, 37.792), (-122.392, 37.792), (-122.392, 37.798), (-122.398, 37.798)]],
     )
     wb, client = _wayback_with(layers, {1: [(CAPTURE, 11)]})
 
@@ -730,9 +746,7 @@ def test_query_layer_has_no_artificial_feature_limit() -> None:
 
     layers = [_layer(1, "2014-02-20")]
     count = 34_840
-    wb, client = _wayback_with(
-        layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]}
-    )
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]})
     rows, complete = wb._query_layer(layers[0], AOI, 17)
 
     assert complete is True
@@ -748,9 +762,7 @@ def test_query_layer_splits_a_truncated_attribute_batch() -> None:
 
     layers = [_layer(1, "2014-02-20")]
     count = _esri._ATTRIBUTE_BATCH
-    wb, client = _wayback_with(
-        layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]}
-    )
+    wb, client = _wayback_with(layers, {1: [(CAPTURE, oid) for oid in range(1, count + 1)]})
     real_post = client.post
 
     def limited(url, data, *, max_age=None, accept_response=None):

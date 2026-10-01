@@ -2176,7 +2176,7 @@ wheels = [
 
 [[package]]
 name = "old-imagery"
-version = "0.4.1"
+version = "0.4.2"
 source = { editable = "." }
 dependencies = [
     { name = "affine" },
@@ -2241,7 +2241,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=9.1" },
     { name = "protobuf", specifier = ">=4.21" },
     { name = "rasterio", specifier = ">=1.3" },
-    { name = "shapely", specifier = ">=2.0" },
+    { name = "shapely", specifier = ">=2.1" },
     { name = "tqdm", specifier = ">=4.60" },
 ]
 provides-extras = ["examples"]

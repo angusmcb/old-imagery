@@ -39,6 +39,7 @@ from ._region import TILE_PX, _polygonal_only, dissolve, normalize_aoi, sort_by_
 
 WGS84 = "EPSG:4326"
 MERCATOR = "EPSG:3857"
+_ESRI_COVERAGE_TOLERANCE_M = 10.0
 
 DateLike = _dt.date | str
 TileGeometry = Point | MultiPoint | Polygon | MultiPolygon
@@ -582,8 +583,12 @@ def esri_mosaic_as_of(
             These values never change or cap the requested zoom.
         ``geometry``
             The area displaying that capture date, clipped to the AOI. Real
-            capture-footprint boundaries, not tile edges, generalised to a
-            fixed 10-metre tolerance in Esri's projected metadata service.
+            capture-footprint boundaries, not tile edges. Shared edges are
+            simplified together in EPSG:3857 with a coverage-simplification
+            tolerance of 10; this is not a maximum displacement bound. The AOI
+            boundary and existing holes are preserved. Source geometry that
+            does not form a valid coverage is returned unsimplified with a
+            RuntimeWarning.
 
         ``gdf.attrs`` records ``release_id``, ``release_date`` (the publication
         date), ``release_title``, ``as_of`` and ``zooms``.
@@ -637,7 +642,11 @@ def esri_mosaic_as_of(
             def dissolve_group(item):
                 (date, source), geoms = item
                 merged = geoms[0] if len(geoms) == 1 else unary_union(geoms)
-                dissolved = _polygonal_only(merged.intersection(aoi))
+                clipped = merged.intersection(aoi)
+                # Shapely's validity predicate temporarily suppresses warnings.
+                # Its process-global filter must not race across these groups.
+                with _WARNING_FILTER_LOCK:
+                    dissolved = _polygonal_only(clipped)
                 if dissolved is not None:
                     return z, date, source, dissolved
                 return None
@@ -649,7 +658,32 @@ def esri_mosaic_as_of(
             else:
                 with ThreadPoolExecutor(max_workers=workers_for("esri", len(items))) as pool:
                     out = [row for row in pool.map(dissolve_group, items) if row is not None]
-            return out
+            if len(out) <= 1:
+                return out
+
+            # Simplify the complete per-zoom coverage, never separate source
+            # groups or HTTP batches. Keeping outer boundaries fixed preserves
+            # both the AOI clip and genuine gaps in metadata coverage.
+            coverage = gpd.GeoSeries([row[3] for row in out], crs=WGS84).to_crs(MERCATOR)
+            coverage_geometries = coverage.to_numpy()
+            if not shapely.coverage_is_valid(coverage_geometries):
+                warnings.warn(
+                    f"Esri release {layer.identifier} at zoom {z} does not form an "
+                    "edge-matched, non-overlapping coverage; returning unsimplified geometry.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return out
+            simplified = shapely.coverage_simplify(
+                coverage_geometries,
+                tolerance=_ESRI_COVERAGE_TOLERANCE_M,
+                simplify_boundary=False,
+            )
+            geometries = gpd.GeoSeries(simplified, crs=MERCATOR).to_crs(WGS84)
+            return [
+                (zoom, date, source, geometry)
+                for (zoom, date, source, _original), geometry in zip(out, geometries, strict=True)
+            ]
 
         # Geometry batches within one zoom are parallel. Process zooms serially
         # so nested pools cannot multiply Esri's measured request ceiling.

@@ -52,11 +52,10 @@ _QUERY_GEOMETRY_MAX_BYTES = 256_000
 # so this trades request count against response size rather than URL length
 # (the ids travel in a POST body).
 _GEOMETRY_BATCH = 100
-# Capture-footprint boundaries describe acquisition provenance, not imagery
-# pixels.  Ten-metre generalisation retains meaningful seam detail while
-# keeping country-scale responses and topology work tractable.
-_FOOTPRINT_TOLERANCE_M = 10.0
-_FEATURE_CACHE_VERSION = 1
+# Cache original geometry: per-feature server generalisation breaks shared
+# boundaries. Release maps simplify the assembled coverage instead. Version 2
+# must not reuse the independently generalised geometry in version 1.
+_FEATURE_CACHE_VERSION = 2
 _SOURCE_FIELDS = "OBJECTID,SRC_DATE2,SRC_RES,SRC_ACC,NICE_NAME,NICE_DESC,MinMapLevel,MaxMapLevel"
 _ORGANIZE_POLYGONS_WARNING = (
     r"organizePolygons\(\) received an unexpected geometry\.  Either a polygon with interior "
@@ -637,8 +636,8 @@ class WayBack:
         """Capture footprints displayed by one exact release at one zoom.
 
         Returns source-attributed footprints in EPSG:4326 -- the seam map of a
-        single published snapshot, generalised to a 10-metre tolerance rather
-        than quantised to whole tiles.
+        single published snapshot, without server generalisation or coordinate
+        rounding. The public release-map API simplifies shared edges together.
 
         ``zoom`` matters: :meth:`Layer.metadata_query_url` selects a metadata
         layer per scale, so the same ground in the same release can carry a
@@ -879,19 +878,14 @@ class WayBack:
     def _fetch_uncached_geometry_features(
         self, layer: Layer, zoom: int, object_ids: Sequence[int]
     ) -> dict[int, bytes]:
-        # Esri cannot clip returned features to the query AOI, so country-scale
-        # queries otherwise download and repair millions of vertices lying far
-        # outside the final seams. The fixed tolerance reflects the provenance
-        # precision of acquisition boundaries rather than the requested imagery
-        # pixel size. Coordinates are rounded to whole metres, one tenth of the
-        # permitted deviation.
+        # Original vertices must reach the per-feature cache unchanged. Esri
+        # generalises each feature independently when maxAllowableOffset is
+        # supplied, creating gaps and overlaps along otherwise shared edges.
         form = {
             "f": "json",
             "outFields": _SOURCE_FIELDS,
             "objectIds": ",".join(str(oid) for oid in object_ids),
             "returnGeometry": "true",
-            "maxAllowableOffset": str(_FOOTPRINT_TOLERANCE_M),
-            "geometryPrecision": "0",
             "outSR": "3857",
         }
         try:

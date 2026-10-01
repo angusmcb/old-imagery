@@ -202,6 +202,20 @@ print(seams[["zoom", "capture_date", "area_fraction", "release_id"]])
 Source metadata remains attached when two footprints have the same capture
 date: only footprints with identical source metadata are dissolved together.
 
+Esri's original, unrounded vertices are cached per feature. After clipping and
+dissolving the requested release, its shared boundaries are simplified together
+in EPSG:3857 using Shapely coverage simplification with tolerance 10. This
+reduces output size without introducing gaps or overlaps into a valid coverage;
+the outer boundary and genuine holes remain unchanged. The tolerance controls
+the triangle area used by the simplifier, not a strict 10-metre displacement
+bound. If the source polygons overlap or their edges do not match, a
+`RuntimeWarning` is emitted and the geometry is returned unsimplified.
+
+This requires Shapely 2.1 and GEOS 3.12 or newer (included in current Shapely
+wheels). Original geometry costs more network traffic and cache space than
+server-generalised geometry. The feature-cache version has changed, so older
+simplified entries are not reused; already exported seam maps need rebuilding.
+
 `as_of` accepts either a date, selecting the catalogue release with the greatest
 date less than or equal to it, or an exact `release_id` from
 `esri_wayback_releases()`.
@@ -548,10 +562,11 @@ backends using a synthetic concurrent workload.
 
 - **Antimeridian.** AOIs must lie within longitude −180…180. Split geometries that cross it and query each half.
 - **Esri is slow.** Wayback exposes no bulk per-tile date query, so an availability call issues ~195 metadata queries plus one footprint fetch per capture date, and takes tens of seconds on a cold cache. Footprint payloads grow with AOI area — one sampled footprint had 3,520 vertices — so large AOIs are slower still. Google is far quicker.
-- **Esri footprint precision.** Capture-footprint boundaries are requested from
-  Esri with a fixed 10-metre generalisation tolerance. This preserves meaningful
-  acquisition seams without making country-scale metadata payloads and topology
-  work depend on sub-metre vertices.
+- **Esri footprint precision.** Original capture-footprint vertices are fetched
+  and cached without server generalisation. Release maps simplify shared edges
+  together with coverage tolerance 10, preserving the AOI boundary and holes.
+  Source geometry that is not a valid coverage is returned unsimplified with a
+  warning. Availability uses the original footprints.
 - **Zoom limits.** `availability`, `download` and `esri_mosaic_as_of` reject zooms above **21 for Google** and **20 for Esri Wayback** — the deepest levels at which each service actually publishes imagery, per [upstream's docs](https://github.com/Mbucari/GEHistoricalImagery/blob/master/docs/availability.md). Deeper levels return well-formed tiles carrying no imagery while costing 4× the requests per level, so they raise rather than fail quietly. The caps are readable as `old_imagery.MAX_IMAGERY_ZOOM`.
 - **Undated imagery.** Google tiles sometimes carry a provider's undated default imagery. It is excluded from `availability` but is used by `download` as a last-resort fallback, in which case it contributes nothing to the `dates` tag.
 - **Missing Esri capture metadata.** Capture-date searches omit an Esri imagery version when its metadata service does not provide a usable capture date. Exact release downloads retain its pixels and count the tile in `tiles_capture_date_unknown`.
