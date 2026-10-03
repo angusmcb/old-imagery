@@ -1118,6 +1118,7 @@ def download_geopackage(
     esri_wayback_release_id: str | None = None,
     table_name: str = "imagery",
     build_overviews: bool = True,
+    integrity_check: bool = True,
     cache_dir: str | os.PathLike[str] | None = DEFAULT_CACHE_DIR,
     max_tiles: int = 10_000,
     include_metadata: bool = True,
@@ -1146,13 +1147,17 @@ def download_geopackage(
     and published atomically; an error does not leave a partial destination
     behind.
 
+    Pass ``integrity_check=False`` to skip the full SQLite integrity scan.
+    Foreign-key checks, GDAL validation and atomic publication still run.
+
     Native payloads are written and released in bounded download batches.
     Overview generation reads each group of child tiles back from the
     GeoPackage, so neither phase retains the complete imagery set in memory.
 
     Overview generation automatically uses the CPUs available to the current
     process, including Slurm allocation, CPU-affinity and cgroup limits.
-    Parameters other than ``output``, ``table_name``, ``build_overviews`` and
+    Parameters other than ``output``, ``table_name``, ``build_overviews``,
+    ``integrity_check`` and
     ``mode`` have the same selection meaning as :func:`download_tiles`.
     ``mode="append"`` creates a new GeoPackage or adds a new table to an
     existing one. ``mode="create"`` refuses an existing output, while
@@ -1165,6 +1170,8 @@ def download_geopackage(
         raise FileExistsError(f"Output already exists: {output_path}")
     if not isinstance(build_overviews, bool):
         raise TypeError("build_overviews must be a bool")
+    if not isinstance(integrity_check, bool):
+        raise TypeError("integrity_check must be a bool")
     if provider == "google" and zoom < 2:
         raise ValueError(
             "Google zooms 0 and 1 cannot be represented as complete CRS84 tiles "
@@ -1201,6 +1208,7 @@ def download_geopackage(
         selection=selection,
         mode=mode,
         build_overviews=build_overviews,
+        integrity_check=integrity_check,
     )
 
 

@@ -2078,3 +2078,26 @@ def test_aoi_annotation_names_where_the_type_comes_from() -> None:
         assert annotation == (
             "shapely.Polygon | shapely.MultiPolygon | shapely.GeometryCollection"
         ), fn.__name__
+
+@pytest.mark.parametrize("integrity_check", [True, False])
+def test_download_geopackage_integrity_scan_option(stub, tmp_path, monkeypatch, integrity_check):
+    stub(StubBackend([D1], colors={D1: 73}))
+    statements = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    output = tmp_path / "check-option.gpkg"
+    old_imagery.download_geopackage(
+        AOI, ZOOM, D1, output=output, cache_dir=None,
+        build_overviews=False, integrity_check=integrity_check,
+    )
+    assert ("PRAGMA integrity_check" in statements) is integrity_check
+    assert "PRAGMA foreign_key_check" in statements
+    with rasterio.open(output) as source:
+        assert source.crs is not None
+        assert source.read().size > 0

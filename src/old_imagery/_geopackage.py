@@ -432,6 +432,7 @@ def write_geopackage_stream(
     selection: Mapping[str, object],
     mode: Literal["create", "append", "replace"],
     build_overviews: bool,
+    integrity_check: bool = True,
 ) -> Path:
     """Consume bounded tile batches into an atomic GeoPackage build."""
     quoted_table = _quoted_identifier(table_name)
@@ -665,9 +666,10 @@ def write_geopackage_stream(
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
         if foreign_key_errors:
             raise ValueError("GeoPackage validation found a broken foreign key")
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()
-        if integrity != ("ok",):
-            raise ValueError("GeoPackage SQLite integrity check failed")
+        if integrity_check:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity != ("ok",):
+                raise ValueError("GeoPackage SQLite integrity check failed")
         connection.close()
         connection = None
 
@@ -712,6 +714,7 @@ def write_geopackage(
     selection: Mapping[str, object],
     mode: Literal["create", "append", "replace"],
     build_overviews: bool,
+    integrity_check: bool = True,
 ) -> Path:
     """Write an existing tile sequence through the streaming writer."""
 
@@ -725,4 +728,5 @@ def write_geopackage(
         selection=selection,
         mode=mode,
         build_overviews=build_overviews,
+        integrity_check=integrity_check,
     )
